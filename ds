@@ -5,20 +5,23 @@ Claude plans and reviews; DeepSeek (OpenCode agent "worker") executes.
 The bridge itself computes the diff from a shadow-git snapshot, so Claude
 only ever reads: the worker's short report + a capped diff.
 
-  ds run  [-C DIR] [-m MODEL] [-f FILE]... "task"   new job
+  ds run  [-C DIR] [-m MODEL] [-f FILE]... [--paths P ...] "task"   new job
   ds revise JOB "feedback"                         same session, keeps DeepSeek's context
   ds diff   JOB [--full] [PATH...]                 re-show diff (optionally full / per path)
   ds approve JOB                                   accept, drop snapshot
   ds reject  JOB                                   restore files to pre-job snapshot
   ds list                                          recent jobs
+
+--paths limits the snapshot/diff/reject scope to those paths, relative to -C.
 """
-import hashlib, json, os, subprocess, sys, time, argparse, shutil, queue, threading
+import hashlib, json, os, subprocess, sys, time, argparse, shutil, queue, threading, fcntl
 
 HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".local/share/ds-bridge")
 JOBS = os.path.join(STATE, "jobs")
 SHADOW = os.path.join(STATE, "shadow")
-PROGRESS = os.path.join(STATE, "progress.json")
+PROGRESS = os.path.join(STATE, "progress")
+RUNNING = os.path.join(STATE, "running")
 CONF = os.path.join(HOME, ".config/ds-bridge/config.json")
 DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
             "max_diff_lines": 250, "max_report_chars": 1500, "timeout_s": 1800,
@@ -43,29 +46,48 @@ def die(msg, code=2):
     sys.exit(code)
 
 
-def git(job_or_gd, wt, *args, check=True, capture=True):
+def git(job_or_gd, wt, *args, check=True, capture=True, index=None):
     gd = job_or_gd
+    env = os.environ.copy()
+    if index:
+        env["GIT_INDEX_FILE"] = index
     r = subprocess.run(["git", f"--git-dir={gd}", f"--work-tree={wt}", *args],
-                       capture_output=capture, text=True, cwd=wt)
+                       capture_output=capture, text=True, cwd=wt, env=env)
     if check and r.returncode:
         die(f"git {' '.join(args)} failed: {r.stderr.strip()[:500]}")
     return r.stdout if capture else ""
 
 
+def job_index(jid):
+    return os.path.join(JOBS, jid, "index")
+
+
 def shadow_for(d):
     gd = os.path.join(SHADOW, hashlib.sha1(d.encode()).hexdigest()[:16])
-    if not os.path.isdir(gd):
-        os.makedirs(gd)
-        subprocess.run(["git", "init", "-q", "--bare", gd], check=True)
-        for k, v in [("core.bare", "false"), ("user.name", "ds-bridge"),
-                     ("user.email", "ds-bridge@localhost"), ("core.autocrlf", "false"),
-                     ("gc.auto", "0")]:
-            subprocess.run(["git", f"--git-dir={gd}", "config", k, v], check=True)
-    os.makedirs(os.path.join(gd, "info"), exist_ok=True)
+    os.makedirs(SHADOW, exist_ok=True)
+    # Serialize first-time setup so two concurrent jobs cannot race git init.
+    with open(gd + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not os.path.isdir(gd):
+            os.makedirs(gd)
+            subprocess.run(["git", "init", "-q", "--bare", gd], check=True)
+            for k, v in [("core.bare", "false"), ("user.name", "ds-bridge"),
+                         ("user.email", "ds-bridge@localhost"), ("core.autocrlf", "false"),
+                         ("gc.auto", "0")]:
+                subprocess.run(["git", f"--git-dir={gd}", "config", k, v], check=True)
+        os.makedirs(os.path.join(gd, "info"), exist_ok=True)
     return gd
 
 
-def snapshot(d, gd, label):
+def write_exclude(gd, ex):
+    p = os.path.join(gd, "info/exclude")
+    tmp = p + f".tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write("\n".join(ex) + "\n")
+    os.replace(tmp, p)
+
+
+def snapshot(d, gd, label, index, jid, paths=None):
     c = cfg()
     ex = list(EXCLUDES)
     # skip big files so snapshots stay fast/small
@@ -73,13 +95,130 @@ def snapshot(d, gd, label):
                         "-size", f"+{c['big_file_mb']}M", "-print"],
                        capture_output=True, text=True, cwd=d)
     ex += ["/" + p[2:] for p in r.stdout.splitlines() if p.startswith("./")]
-    open(os.path.join(gd, "info/exclude"), "w").write("\n".join(ex) + "\n")
-    git(gd, d, "add", "-A")
-    n = len(git(gd, d, "ls-files").splitlines())
+    write_exclude(gd, ex)
+    if paths:
+        git(gd, d, "add", "-A", "--", *paths, index=index)
+    else:
+        git(gd, d, "add", "-A", index=index)
+    n = len(git(gd, d, "ls-files", index=index).splitlines())
     if n > c["max_files"]:
         die(f"{d} has {n} tracked files (> {c['max_files']}); run in a smaller directory")
-    git(gd, d, "commit", "-q", "--allow-empty", "--no-verify", "-m", label)
-    return git(gd, d, "rev-parse", "HEAD").strip()
+    tree = git(gd, d, "write-tree", index=index).strip()
+    commit = git(gd, d, "commit-tree", tree, "-m", label, index=index).strip()
+    git(gd, d, "update-ref", f"refs/ds/{jid}/{label.replace(' ', '')}", commit, index=index)
+    return commit
+
+
+def norm_paths(paths):
+    if not paths:
+        return None
+    out = []
+    for p in paths:
+        q = os.path.normpath(p).replace(os.sep, "/")
+        if os.path.isabs(q) or q == "." or q == ".." or q.startswith("../"):
+            die(f"--paths must be relative to the -C directory: {p}")
+        if q not in out:
+            out.append(q)
+    return out
+
+
+def pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def paths_overlap(a, b):
+    if a is None or b is None:
+        return True
+    for x in a:
+        for y in b:
+            x, y = x.rstrip("/"), y.rstrip("/")
+            if x == y or x.startswith(y + "/") or y.startswith(x + "/"):
+                return True
+    return False
+
+
+def check_overlap(d, paths):
+    os.makedirs(RUNNING, exist_ok=True)
+    for name in sorted(os.listdir(RUNNING)):
+        if not name.endswith(".json"):
+            continue
+        p = os.path.join(RUNNING, name)
+        try:
+            m = json.load(open(p))
+        except (OSError, ValueError):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            continue
+        if not pid_alive(m.get("pid")):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            continue
+        if os.path.realpath(m.get("dir", "")) == d and paths_overlap(m.get("paths"), paths):
+            other = name[:-5]
+            die(f"job {other} is already running in {d}; wait for it or use disjoint --paths")
+
+
+def write_marker(jid, d, paths):
+    os.makedirs(RUNNING, exist_ok=True)
+    p = os.path.join(RUNNING, jid + ".json")
+    tmp = p + f".tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump({"dir": d, "paths": paths, "pid": os.getpid()}, f)
+    os.replace(tmp, p)
+
+
+def clear_marker(jid):
+    try:
+        os.remove(os.path.join(RUNNING, jid + ".json"))
+    except OSError:
+        pass
+
+
+def claim_job(jid, d, paths):
+    os.makedirs(RUNNING, exist_ok=True)
+    with open(os.path.join(RUNNING, ".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        check_overlap(d, paths)
+        write_marker(jid, d, paths)
+
+
+def new_job_id():
+    base = time.strftime("%m%d-%H%M%S")
+    n = 0
+    while True:
+        jid = base if n == 0 else f"{base}-{n}"
+        try:
+            os.makedirs(os.path.join(JOBS, jid))
+            return jid
+        except FileExistsError:
+            n += 1
+
+
+def cleanup_progress():
+    try:
+        names = os.listdir(PROGRESS)
+    except OSError:
+        return
+    cutoff = time.time() - 86400
+    for name in names:
+        p = os.path.join(PROGRESS, name)
+        try:
+            if os.path.getmtime(p) < cutoff:
+                os.remove(p)
+        except OSError:
+            pass
 
 
 def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
@@ -109,11 +248,12 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
                "out_tokens": tok["output"], "tok_s": tok_s()}
         obj.update(extra)
         try:
-            os.makedirs(STATE, exist_ok=True)
-            tmp = PROGRESS + ".tmp"
+            os.makedirs(PROGRESS, exist_ok=True)
+            path = os.path.join(PROGRESS, job["id"] + ".json")
+            tmp = path + f".tmp.{os.getpid()}"
             with open(tmp, "w") as f:
                 json.dump(obj, f)
-            os.replace(tmp, PROGRESS)
+            os.replace(tmp, path)
         except OSError:
             pass
 
@@ -200,10 +340,16 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
 
 def diff_text(job, full=False, paths=(), since=None):
     d, gd = job["dir"], job["shadow"]
-    git(gd, d, "add", "-A")
+    idx = job_index(job["id"])
+    job_paths = job.get("paths")
+    if job_paths:
+        git(gd, d, "add", "-A", "--", *job_paths, index=idx)
+    else:
+        git(gd, d, "add", "-A", index=idx)
+    scope = list(paths) if paths else (job_paths or [])
     since = since or job["base"]
-    stat = git(gd, d, "diff", "--cached", "--stat=100", since, "--", *paths)
-    body = git(gd, d, "diff", "--cached", "-U2", "--no-color", since, "--", *paths)
+    stat = git(gd, d, "diff", "--cached", "--stat=100", since, "--", *scope, index=idx)
+    body = git(gd, d, "diff", "--cached", "-U2", "--no-color", since, "--", *scope, index=idx)
     lines = body.splitlines()
     jdir = os.path.join(JOBS, job["id"])
     open(os.path.join(jdir, "full.diff"), "w").write(body)
@@ -261,33 +407,52 @@ def cmd_run(a):
     if d in (HOME, "/"):
         die("refusing to run in $HOME or / ; pass -C <project dir>")
     task = a.task if a.task != "-" else sys.stdin.read()
+    paths = norm_paths(a.paths)
     os.makedirs(JOBS, exist_ok=True)
-    jid = time.strftime("%m%d-%H%M%S")
-    os.makedirs(os.path.join(JOBS, jid))
+    jid = new_job_id()
     gd = shadow_for(d)
-    base = snapshot(d, gd, f"pre {jid}")
-    job = {"id": jid, "dir": d, "shadow": gd, "base": base, "model": a.m or c["model"],
-           "agent": c["agent"], "session": None, "round": 1, "status": "open",
-           "task": task[:2000]}
-    save(job)
-    res = run_opencode(d, task, job["model"], job["agent"], files=a.f or (), job=job)
-    job["session"] = res["session"]
-    save(job)
-    emit(job, res)
+    try:
+        claim_job(jid, d, paths)
+    except SystemExit:
+        try:
+            os.rmdir(os.path.join(JOBS, jid))
+        except OSError:
+            pass
+        raise
+    try:
+        base = snapshot(d, gd, f"pre {jid}", job_index(jid), jid, paths)
+        job = {"id": jid, "dir": d, "shadow": gd, "base": base, "model": a.m or c["model"],
+               "agent": c["agent"], "session": None, "round": 1, "status": "open",
+               "paths": paths, "task": task[:2000]}
+        save(job)
+        res = run_opencode(d, task, job["model"], job["agent"], files=a.f or (), job=job)
+        job["session"] = res["session"]
+        save(job)
+        emit(job, res)
+    finally:
+        clear_marker(jid)
+        cleanup_progress()
 
 
 def cmd_revise(a):
     job = load(a.job)
     if job["status"] != "open":
         die(f"job {a.job} is {job['status']}")
-    job["round"] += 1
-    job["round_base"] = snapshot(job["dir"], job["shadow"], f"{job['id']} r{job['round']}")
-    msg = ("REVIEW FEEDBACK - revise your work. Fix exactly these points, nothing else, "
-           "then reply with the same final report block (describe only this round's changes):\n"
-           + (a.feedback if a.feedback != "-" else sys.stdin.read()))
-    res = run_opencode(job["dir"], msg, job["model"], job["agent"], session=job["session"], job=job)
-    save(job)
-    emit(job, res)
+    paths = job.get("paths")
+    claim_job(job["id"], job["dir"], paths)
+    try:
+        job["round"] += 1
+        job["round_base"] = snapshot(job["dir"], job["shadow"], f"{job['id']} r{job['round']}",
+                                     job_index(job["id"]), job["id"], paths)
+        msg = ("REVIEW FEEDBACK - revise your work. Fix exactly these points, nothing else, "
+               "then reply with the same final report block (describe only this round's changes):\n"
+               + (a.feedback if a.feedback != "-" else sys.stdin.read()))
+        res = run_opencode(job["dir"], msg, job["model"], job["agent"], session=job["session"], job=job)
+        save(job)
+        emit(job, res)
+    finally:
+        clear_marker(job["id"])
+        cleanup_progress()
 
 
 def cmd_diff(a):
@@ -307,18 +472,33 @@ def cmd_approve(a):
 def cmd_reject(a):
     job = load(a.job)
     d, gd = job["dir"], job["shadow"]
-    git(gd, d, "add", "-A")
+    idx = job_index(job["id"])
+    paths = job.get("paths")
+    if paths:
+        git(gd, d, "add", "-A", "--", *paths, index=idx)
+    else:
+        git(gd, d, "add", "-A", index=idx)
     # files created since snapshot -> remove; changed/deleted -> restore
-    added = git(gd, d, "diff", "--cached", "--name-only", "--diff-filter=A", job["base"]).split("\n")
-    for f in filter(None, added):
+    diff_args = ["diff", "--cached", "--name-only", "--diff-filter=A", job["base"]]
+    if paths:
+        diff_args += ["--", *paths]
+    added = [f for f in git(gd, d, *diff_args, index=idx).split("\n") if f]
+    for f in added:
         try:
             os.remove(os.path.join(d, f))
         except OSError:
             pass
-    git(gd, d, "checkout", job["base"], "--", ".")
+    if paths:
+        # New paths are absent from base; check out only paths that base has.
+        base_paths = [f for f in git(gd, d, "ls-tree", "-r", "--name-only",
+                                    job["base"], "--", *paths, index=idx).split("\n") if f]
+        if base_paths:
+            git(gd, d, "checkout", job["base"], "--", *base_paths, index=idx)
+    else:
+        git(gd, d, "checkout", job["base"], "--", ".", index=idx)
     job["status"] = "rejected"
     save(job)
-    print(f"rejected {a.job}: restored {d} to pre-job state ({len([x for x in added if x])} new files removed)")
+    print(f"rejected {a.job}: restored {d} to pre-job state ({len(added)} new files removed)")
 
 
 def cmd_list(a):
@@ -337,7 +517,8 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     s = p.add_subparsers(dest="cmd", required=True)
     r = s.add_parser("run"); r.add_argument("-C"); r.add_argument("-m")
-    r.add_argument("-f", action="append"); r.add_argument("task")
+    r.add_argument("-f", action="append"); r.add_argument("--paths", nargs="+")
+    r.add_argument("task", nargs="?")
     r.set_defaults(fn=cmd_run)
     r = s.add_parser("revise"); r.add_argument("job"); r.add_argument("feedback"); r.set_defaults(fn=cmd_revise)
     r = s.add_parser("diff"); r.add_argument("job"); r.add_argument("--full", action="store_true")
@@ -346,6 +527,13 @@ def main():
         r = s.add_parser(n); r.add_argument("job"); r.set_defaults(fn=f)
     s.add_parser("list").set_defaults(fn=cmd_list)
     a = p.parse_args()
+    if a.cmd == "run" and a.task is None:
+        # --paths uses nargs="+"; when it comes before the task, argparse
+        # greedily takes the task too. The task is the last value it took.
+        if a.paths and len(a.paths) > 1:
+            a.task = a.paths.pop()
+        else:
+            p.error("the following arguments are required: task")
     a.fn(a)
 
 
