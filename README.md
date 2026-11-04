@@ -88,11 +88,13 @@ flowchart LR
 Claude Code's status line can poll ds-bridge once a second (`refreshInterval: 1`) and render the worker's current step:
 
 ```
-⠴ DeepSeek 1104-152450 r1 · 0:05 · step 2 · 4 tools · 144 tok · ▸ read notes.txt
+⠴ DeepSeek 1104-152450 r1 · 0:05 · step 2 · 4 tools · 144 tok · 152 tok/s · ▸ read notes.txt
 ✓ DeepSeek 1104-152450 done in 0:11
 ```
 
 There is no percentage. An agent can't know its step count in advance, so the line shows elapsed time, the step reached so far, and the last tool call instead of inventing a progress bar.
+
+tok/s is the model's generation speed averaged over finished steps, with tool run time excluded; it appears after the first step completes.
 
 ## Commands
 

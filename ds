@@ -96,12 +96,17 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
     cost, tools, steps = 0.0, 0, 0
     last = "thinking"
     cur_msg, cur_text = None, []
+    gen_tokens, gen_ms_total = 0, 0
+    step_window, step_tool_ms = None, 0
+
+    def tok_s():
+        return round(gen_tokens / (gen_ms_total / 1000)) if gen_ms_total else None
 
     def write_progress(state, **extra):
         obj = {"state": state, "job": job["id"], "round": job["round"], "model": model,
                "dir": os.path.basename(d), "started": t0, "updated": time.time(),
                "steps": steps, "tools": tools, "last": last,
-               "out_tokens": tok["output"]}
+               "out_tokens": tok["output"], "tok_s": tok_s()}
         obj.update(extra)
         try:
             os.makedirs(STATE, exist_ok=True)
@@ -142,11 +147,17 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
             continue
         sid = ev.get("sessionID", sid)
         t, part = ev.get("type"), ev.get("part") or {}
+        ts = ev.get("timestamp")
         if t == "step_start":
             steps += 1
+            step_window, step_tool_ms = ts, 0
             if tools == 0:
                 last = "thinking"
-        elif t == "text":
+        for st in ((part.get("time") or {}).get("start"),
+                   ((part.get("state") or {}).get("time") or {}).get("start")):
+            if st is not None and (step_window is None or st < step_window):
+                step_window = st
+        if t == "text":
             if part.get("messageID") != cur_msg:
                 cur_msg, cur_text = part.get("messageID"), []
                 texts.append(cur_text)
@@ -154,6 +165,9 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
         elif t in ("tool_use", "tool"):
             tools += 1
             nm = part.get("tool") or "tool"
+            stt = (part.get("state") or {}).get("time") or {}
+            if stt.get("start") is not None and stt.get("end") is not None:
+                step_tool_ms += stt["end"] - stt["start"]
             inp = (part.get("state") or {}).get("input") or {}
             if nm == "shell":
                 detail = inp.get("command") or ""
@@ -166,6 +180,11 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
             tok["output"] += tk.get("output", 0) + tk.get("reasoning", 0)
             tok["cache_read"] += (tk.get("cache") or {}).get("read", 0)
             cost += part.get("cost") or 0
+            if step_window is not None and ts is not None:
+                gen_ms = ts - step_window - step_tool_ms
+                if gen_ms >= 200:
+                    gen_tokens += tk.get("output", 0) + tk.get("reasoning", 0)
+                    gen_ms_total += gen_ms
         elif t == "error":
             errors.append((ev.get("error") or {}).get("message", "unknown error"))
         write_progress("running")
@@ -176,7 +195,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
     secs = round(time.time() - t0)
     write_progress("error" if errors else "done", updated=time.time(), secs=secs)
     return {"session": sid, "report": final, "errors": errors, "tokens": tok,
-            "cost": cost, "tools": tools, "secs": secs}
+            "cost": cost, "tools": tools, "secs": secs, "tok_s": tok_s()}
 
 
 def diff_text(job, full=False, paths=(), since=None):
@@ -217,8 +236,11 @@ def emit(job, res):
     stat, body = diff_text(job, since=rb)
     tk = res["tokens"]
     print(f"JOB {job['id']}  round {job['round']}  dir {job['dir']}")
-    print(f"worker: {job['model']}  {res['secs']}s  tok in {tk['input']} (cache {tk['cache_read']}) "
-          f"out {tk['output']}  cost ${res['cost']:.4f}")
+    line = (f"worker: {job['model']}  {res['secs']}s  tok in {tk['input']} "
+            f"(cache {tk['cache_read']}) out {tk['output']}  cost ${res['cost']:.4f}")
+    if res.get("tok_s") is not None:
+        line += f"  gen {res['tok_s']} tok/s"
+    print(line)
     if res["errors"]:
         print("ERRORS: " + " | ".join(e[:300] for e in res["errors"]))
     print("--- report")

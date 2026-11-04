@@ -8,11 +8,12 @@ P="$HOME/.local/share/ds-bridge/progress.json"
 
 data=$(jq -r '[(.state // ""), (.job // ""), (.round // 0), (.steps // 0),
                (.tools // 0), (.out_tokens // 0), ((.started // 0) | floor),
-               ((.updated // 0) | floor), (.last // ""), ((.secs // 0) | floor)]
+               ((.updated // 0) | floor), (.last // ""), ((.secs // 0) | floor),
+               (.tok_s // "")]
               | map(tostring) | @tsv' "$P" 2>/dev/null) || exit 0
 [ -n "$data" ] || exit 0
 
-IFS=$'\t' read -r state job round steps tools out_tokens started updated last secs <<< "$data"
+IFS=$'\t' read -r state job round steps tools out_tokens started updated last secs tok_s <<< "$data"
 
 now=$(date +%s)
 
@@ -31,6 +32,12 @@ fmt_secs() {
     printf '%d:%02d' $((s / 60)) $((s % 60))
 }
 
+tok_s_seg=""
+case "$tok_s" in
+    ''|*[!0-9]*) ;;
+    *) tok_s_seg=" · ${tok_s} tok/s" ;;
+esac
+
 case "$state" in
     running)
         age=$((now - updated))
@@ -40,13 +47,13 @@ case "$state" in
         fi
         spinners=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
         sp=${spinners[$((now % 10))]}
-        printf '%s DeepSeek %s r%s · %s · step %s · %s tools · %s tok · ▸ %s\n' \
+        printf '%s DeepSeek %s r%s · %s · step %s · %s tools · %s tok%s · ▸ %s\n' \
             "$sp" "$job" "$round" "$(fmt_secs $((now - started)))" \
-            "$steps" "$tools" "$(fmt_tok "$out_tokens")" "$last"
+            "$steps" "$tools" "$(fmt_tok "$out_tokens")" "$tok_s_seg" "$last"
         ;;
     done)
         if [ $((now - updated)) -le 120 ]; then
-            printf '✓ DeepSeek %s done in %s\n' "$job" "$(fmt_secs "$secs")"
+            printf '✓ DeepSeek %s done in %s%s\n' "$job" "$(fmt_secs "$secs")" "$tok_s_seg"
         fi
         ;;
     error)
