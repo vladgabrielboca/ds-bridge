@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""ds - Claude -> OpenCode/DeepSeek execution bridge.
+
+Claude plans and reviews; DeepSeek (OpenCode agent "worker") executes.
+The bridge itself computes the diff from a shadow-git snapshot, so Claude
+only ever reads: the worker's short report + a capped diff.
+
+  ds run  [-C DIR] [-m MODEL] [-f FILE]... "task"   new job
+  ds revise JOB "feedback"                         same session, keeps DeepSeek's context
+  ds diff   JOB [--full] [PATH...]                 re-show diff (optionally full / per path)
+  ds approve JOB                                   accept, drop snapshot
+  ds reject  JOB                                   restore files to pre-job snapshot
+  ds list                                          recent jobs
+"""
+import hashlib, json, os, subprocess, sys, time, argparse, shutil
+
+HOME = os.path.expanduser("~")
+STATE = os.path.join(HOME, ".local/share/ds-bridge")
+JOBS = os.path.join(STATE, "jobs")
+SHADOW = os.path.join(STATE, "shadow")
+CONF = os.path.join(HOME, ".config/ds-bridge/config.json")
+DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
+            "max_diff_lines": 250, "max_report_chars": 1500, "timeout_s": 1800,
+            "max_files": 20000, "big_file_mb": 5}
+EXCLUDES = ["node_modules/", ".venv/", "venv/", "__pycache__/", ".git/", "*.pyc",
+            "media/", "*.mp4", "*.mkv", "*.mov", "*.wav", "*.mp3", "*.flac",
+            "*.safetensors", "*.bin", "*.pt", "*.pth", "*.ckpt", "*.gguf", "*.onnx",
+            "*.zip", "*.tar*", "*.iso", ".cache/", "dist/", "build/", ".next/"]
+
+
+def cfg():
+    c = dict(DEFAULTS)
+    try:
+        c.update(json.load(open(CONF)))
+    except FileNotFoundError:
+        pass
+    return c
+
+
+def die(msg, code=2):
+    print(f"ds: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def git(job_or_gd, wt, *args, check=True, capture=True):
+    gd = job_or_gd
+    r = subprocess.run(["git", f"--git-dir={gd}", f"--work-tree={wt}", *args],
+                       capture_output=capture, text=True, cwd=wt)
+    if check and r.returncode:
+        die(f"git {' '.join(args)} failed: {r.stderr.strip()[:500]}")
+    return r.stdout if capture else ""
+
+
+def shadow_for(d):
+    gd = os.path.join(SHADOW, hashlib.sha1(d.encode()).hexdigest()[:16])
+    if not os.path.isdir(gd):
+        os.makedirs(gd)
+        subprocess.run(["git", "init", "-q", "--bare", gd], check=True)
+        for k, v in [("core.bare", "false"), ("user.name", "ds-bridge"),
+                     ("user.email", "ds-bridge@localhost"), ("core.autocrlf", "false"),
+                     ("gc.auto", "0")]:
+            subprocess.run(["git", f"--git-dir={gd}", "config", k, v], check=True)
+    os.makedirs(os.path.join(gd, "info"), exist_ok=True)
+    return gd
+
+
+def snapshot(d, gd, label):
+    c = cfg()
+    ex = list(EXCLUDES)
+    # skip big files so snapshots stay fast/small
+    r = subprocess.run(["find", ".", "-path", "./.git", "-prune", "-o", "-type", "f",
+                        "-size", f"+{c['big_file_mb']}M", "-print"],
+                       capture_output=True, text=True, cwd=d)
+    ex += ["/" + p[2:] for p in r.stdout.splitlines() if p.startswith("./")]
+    open(os.path.join(gd, "info/exclude"), "w").write("\n".join(ex) + "\n")
+    git(gd, d, "add", "-A")
+    n = len(git(gd, d, "ls-files").splitlines())
+    if n > c["max_files"]:
+        die(f"{d} has {n} tracked files (> {c['max_files']}); run in a smaller directory")
+    git(gd, d, "commit", "-q", "--allow-empty", "--no-verify", "-m", label)
+    return git(gd, d, "rev-parse", "HEAD").strip()
+
+
+def run_opencode(d, msg, model, agent, session=None, files=()):
+    c = cfg()
+    cmd = ["opencode", "run", "--format", "json", "--auto", "--agent", agent, "-m", model]
+    if session:
+        cmd += ["-s", session]
+    for f in files:
+        cmd += ["-f", f]
+    cmd.append(msg)
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, cwd=d, timeout=c["timeout_s"],
+                           stdin=subprocess.DEVNULL)
+        out = p.stdout
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+    sid, texts, errors = session, [], []
+    tok = {"input": 0, "output": 0, "cache_read": 0}
+    cost, tools = 0.0, 0
+    cur_msg, cur_text = None, []
+    for line in out.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        sid = ev.get("sessionID", sid)
+        t, part = ev.get("type"), ev.get("part") or {}
+        if t == "text":
+            if part.get("messageID") != cur_msg:
+                cur_msg, cur_text = part.get("messageID"), []
+                texts.append(cur_text)
+            cur_text.append(part.get("text", ""))
+        elif t in ("tool_use", "tool"):
+            tools += 1
+        elif t == "step_finish":
+            tk = part.get("tokens") or {}
+            tok["input"] += tk.get("input", 0)
+            tok["output"] += tk.get("output", 0) + tk.get("reasoning", 0)
+            tok["cache_read"] += (tk.get("cache") or {}).get("read", 0)
+            cost += part.get("cost") or 0
+        elif t == "error":
+            errors.append((ev.get("error") or {}).get("message", "unknown error"))
+    final = "".join(texts[-1]).strip() if texts else ""
+    return {"session": sid, "report": final, "errors": errors, "tokens": tok,
+            "cost": cost, "tools": tools, "secs": round(time.time() - t0)}
+
+
+def diff_text(job, full=False, paths=(), since=None):
+    d, gd = job["dir"], job["shadow"]
+    git(gd, d, "add", "-A")
+    since = since or job["base"]
+    stat = git(gd, d, "diff", "--cached", "--stat=100", since, "--", *paths)
+    body = git(gd, d, "diff", "--cached", "-U2", "--no-color", since, "--", *paths)
+    lines = body.splitlines()
+    jdir = os.path.join(JOBS, job["id"])
+    open(os.path.join(jdir, "full.diff"), "w").write(body)
+    cap = cfg()["max_diff_lines"]
+    if not full and len(lines) > cap:
+        body = "\n".join(lines[:cap]) + (
+            f"\n... [diff truncated: {len(lines) - cap} more lines. "
+            f"`ds diff {job['id']} --full` or `ds diff {job['id']} <path>`; "
+            f"file: {jdir}/full.diff]")
+    return stat.strip(), body
+
+
+def save(job):
+    json.dump(job, open(os.path.join(JOBS, job["id"], "job.json"), "w"), indent=1)
+
+
+def load(jid):
+    p = os.path.join(JOBS, jid, "job.json")
+    if not os.path.exists(p):
+        die(f"no job {jid}")
+    return json.load(open(p))
+
+
+def emit(job, res):
+    c = cfg()
+    rep = res["report"] or "(worker gave no final report)"
+    if len(rep) > c["max_report_chars"]:
+        rep = rep[:c["max_report_chars"]] + " …[report truncated]"
+    rb = job.get("round_base")
+    stat, body = diff_text(job, since=rb)
+    tk = res["tokens"]
+    print(f"JOB {job['id']}  round {job['round']}  dir {job['dir']}")
+    print(f"worker: {job['model']}  {res['secs']}s  tok in {tk['input']} (cache {tk['cache_read']}) "
+          f"out {tk['output']}  cost ${res['cost']:.4f}")
+    if res["errors"]:
+        print("ERRORS: " + " | ".join(e[:300] for e in res["errors"]))
+    print("--- report")
+    print(rep)
+    if rb:
+        print(f"--- this round only (cumulative: ds diff {job['id']})")
+    print("--- diff stat")
+    print(stat.rstrip() or "(no changes)")
+    if body:
+        print("--- diff")
+        print(body)
+    print(f"--- next: ds approve {job['id']} | ds revise {job['id']} \"...\" | ds reject {job['id']}")
+
+
+def cmd_run(a):
+    c = cfg()
+    d = os.path.realpath(a.C or os.getcwd())
+    if d in (HOME, "/"):
+        die("refusing to run in $HOME or / ; pass -C <project dir>")
+    task = a.task if a.task != "-" else sys.stdin.read()
+    os.makedirs(JOBS, exist_ok=True)
+    jid = time.strftime("%m%d-%H%M%S")
+    os.makedirs(os.path.join(JOBS, jid))
+    gd = shadow_for(d)
+    base = snapshot(d, gd, f"pre {jid}")
+    job = {"id": jid, "dir": d, "shadow": gd, "base": base, "model": a.m or c["model"],
+           "agent": c["agent"], "session": None, "round": 1, "status": "open",
+           "task": task[:2000]}
+    save(job)
+    res = run_opencode(d, task, job["model"], job["agent"], files=a.f or ())
+    job["session"] = res["session"]
+    save(job)
+    emit(job, res)
+
+
+def cmd_revise(a):
+    job = load(a.job)
+    if job["status"] != "open":
+        die(f"job {a.job} is {job['status']}")
+    job["round"] += 1
+    job["round_base"] = snapshot(job["dir"], job["shadow"], f"{job['id']} r{job['round']}")
+    msg = ("REVIEW FEEDBACK - revise your work. Fix exactly these points, nothing else, "
+           "then reply with the same final report block (describe only this round's changes):\n"
+           + (a.feedback if a.feedback != "-" else sys.stdin.read()))
+    res = run_opencode(job["dir"], msg, job["model"], job["agent"], session=job["session"])
+    save(job)
+    emit(job, res)
+
+
+def cmd_diff(a):
+    job = load(a.job)
+    stat, body = diff_text(job, full=a.full, paths=a.paths)
+    print(stat.rstrip() or "(no changes)")
+    print(body)
+
+
+def cmd_approve(a):
+    job = load(a.job)
+    job["status"] = "approved"
+    save(job)
+    print(f"approved {a.job}")
+
+
+def cmd_reject(a):
+    job = load(a.job)
+    d, gd = job["dir"], job["shadow"]
+    git(gd, d, "add", "-A")
+    # files created since snapshot -> remove; changed/deleted -> restore
+    added = git(gd, d, "diff", "--cached", "--name-only", "--diff-filter=A", job["base"]).split("\n")
+    for f in filter(None, added):
+        try:
+            os.remove(os.path.join(d, f))
+        except OSError:
+            pass
+    git(gd, d, "checkout", job["base"], "--", ".")
+    job["status"] = "rejected"
+    save(job)
+    print(f"rejected {a.job}: restored {d} to pre-job state ({len([x for x in added if x])} new files removed)")
+
+
+def cmd_list(a):
+    if not os.path.isdir(JOBS):
+        return
+    for jid in sorted(os.listdir(JOBS))[-15:]:
+        try:
+            j = load(jid)
+        except SystemExit:
+            continue
+        print(f"{jid}  {j['status']:8}  r{j['round']}  {j['dir']}  {j['task'][:60]!r}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="ds", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    s = p.add_subparsers(dest="cmd", required=True)
+    r = s.add_parser("run"); r.add_argument("-C"); r.add_argument("-m")
+    r.add_argument("-f", action="append"); r.add_argument("task")
+    r.set_defaults(fn=cmd_run)
+    r = s.add_parser("revise"); r.add_argument("job"); r.add_argument("feedback"); r.set_defaults(fn=cmd_revise)
+    r = s.add_parser("diff"); r.add_argument("job"); r.add_argument("--full", action="store_true")
+    r.add_argument("paths", nargs="*"); r.set_defaults(fn=cmd_diff)
+    for n, f in [("approve", cmd_approve), ("reject", cmd_reject)]:
+        r = s.add_parser(n); r.add_argument("job"); r.set_defaults(fn=f)
+    s.add_parser("list").set_defaults(fn=cmd_list)
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

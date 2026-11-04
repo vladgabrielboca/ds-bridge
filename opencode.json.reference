@@ -1,0 +1,53 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "theme": "system",
+  "autoupdate": false,
+  "agent": {
+    "worker": {
+      "description": "Execution worker driven by Claude via ds-bridge",
+      "mode": "primary",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "prompt": "{file:/home/vlad/Work/ds-bridge/worker-prompt.md}",
+      "permission": {
+        "edit": "allow",
+        "webfetch": "allow",
+        "bash": {
+          "*": "allow",
+          "git commit*": "deny",
+          "git push*": "deny",
+          "git reset*": "deny",
+          "git checkout*": "deny",
+          "rm -rf /*": "deny",
+          "sudo *": "deny"
+        }
+      }
+    }
+  },
+  "mcp": {
+    "google-calendar": {
+      "type": "remote",
+      "url": "https://calendarmcp.googleapis.com/mcp/v1",
+      "enabled": true
+    },
+    "superhuman-docs": {
+      "type": "remote",
+      "url": "https://docs.superhuman.com/apis/mcp",
+      "enabled": true
+    },
+    "claude-docs": {
+      "type": "remote",
+      "url": "https://api.anthropic.com/v1/pages/mcp",
+      "enabled": true
+    },
+    "chrome-devtools": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--autoConnect"
+      ],
+      "enabled": true
+    }
+  }
+}
