@@ -12,12 +12,13 @@ only ever reads: the worker's short report + a capped diff.
   ds reject  JOB                                   restore files to pre-job snapshot
   ds list                                          recent jobs
 """
-import hashlib, json, os, subprocess, sys, time, argparse, shutil
+import hashlib, json, os, subprocess, sys, time, argparse, shutil, queue, threading
 
 HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".local/share/ds-bridge")
 JOBS = os.path.join(STATE, "jobs")
 SHADOW = os.path.join(STATE, "shadow")
+PROGRESS = os.path.join(STATE, "progress.json")
 CONF = os.path.join(HOME, ".config/ds-bridge/config.json")
 DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
             "max_diff_lines": 250, "max_report_chars": 1500, "timeout_s": 1800,
@@ -81,7 +82,7 @@ def snapshot(d, gd, label):
     return git(gd, d, "rev-parse", "HEAD").strip()
 
 
-def run_opencode(d, msg, model, agent, session=None, files=()):
+def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
     c = cfg()
     cmd = ["opencode", "run", "--format", "json", "--auto", "--agent", agent, "-m", model]
     if session:
@@ -90,30 +91,75 @@ def run_opencode(d, msg, model, agent, session=None, files=()):
         cmd += ["-f", f]
     cmd.append(msg)
     t0 = time.time()
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, cwd=d, timeout=c["timeout_s"],
-                           stdin=subprocess.DEVNULL)
-        out = p.stdout
-    except subprocess.TimeoutExpired as e:
-        out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
     sid, texts, errors = session, [], []
     tok = {"input": 0, "output": 0, "cache_read": 0}
-    cost, tools = 0.0, 0
+    cost, tools, steps = 0.0, 0, 0
+    last = "thinking"
     cur_msg, cur_text = None, []
-    for line in out.splitlines():
+
+    def write_progress(state, **extra):
+        obj = {"state": state, "job": job["id"], "round": job["round"], "model": model,
+               "dir": os.path.basename(d), "started": t0, "updated": time.time(),
+               "steps": steps, "tools": tools, "last": last,
+               "out_tokens": tok["output"]}
+        obj.update(extra)
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            tmp = PROGRESS + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(obj, f)
+            os.replace(tmp, PROGRESS)
+        except OSError:
+            pass
+
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, text=True, cwd=d)
+    q = queue.Queue()
+
+    def _reader():
+        try:
+            for line in p.stdout:
+                q.put(line)
+        finally:
+            q.put(None)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    timed_out = False
+    while True:
+        if time.time() - t0 > c["timeout_s"]:
+            timed_out = True
+            p.kill()
+            break
+        try:
+            line = q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if line is None:
+            break
         try:
             ev = json.loads(line)
         except ValueError:
             continue
         sid = ev.get("sessionID", sid)
         t, part = ev.get("type"), ev.get("part") or {}
-        if t == "text":
+        if t == "step_start":
+            steps += 1
+            if tools == 0:
+                last = "thinking"
+        elif t == "text":
             if part.get("messageID") != cur_msg:
                 cur_msg, cur_text = part.get("messageID"), []
                 texts.append(cur_text)
             cur_text.append(part.get("text", ""))
         elif t in ("tool_use", "tool"):
             tools += 1
+            nm = part.get("tool") or "tool"
+            inp = (part.get("state") or {}).get("input") or {}
+            if nm == "shell":
+                detail = inp.get("command") or ""
+            else:
+                detail = inp.get("path") or inp.get("filePath") or inp.get("pattern") or ""
+            last = " ".join(f"{nm} {detail}".split())[:60]
         elif t == "step_finish":
             tk = part.get("tokens") or {}
             tok["input"] += tk.get("input", 0)
@@ -122,9 +168,15 @@ def run_opencode(d, msg, model, agent, session=None, files=()):
             cost += part.get("cost") or 0
         elif t == "error":
             errors.append((ev.get("error") or {}).get("message", "unknown error"))
+        write_progress("running")
+    p.wait()
+    if timed_out:
+        errors.append(f"timeout after {int(c['timeout_s'])}s")
     final = "".join(texts[-1]).strip() if texts else ""
+    secs = round(time.time() - t0)
+    write_progress("error" if errors else "done", updated=time.time(), secs=secs)
     return {"session": sid, "report": final, "errors": errors, "tokens": tok,
-            "cost": cost, "tools": tools, "secs": round(time.time() - t0)}
+            "cost": cost, "tools": tools, "secs": secs}
 
 
 def diff_text(job, full=False, paths=(), since=None):
@@ -196,7 +248,7 @@ def cmd_run(a):
            "agent": c["agent"], "session": None, "round": 1, "status": "open",
            "task": task[:2000]}
     save(job)
-    res = run_opencode(d, task, job["model"], job["agent"], files=a.f or ())
+    res = run_opencode(d, task, job["model"], job["agent"], files=a.f or (), job=job)
     job["session"] = res["session"]
     save(job)
     emit(job, res)
@@ -211,7 +263,7 @@ def cmd_revise(a):
     msg = ("REVIEW FEEDBACK - revise your work. Fix exactly these points, nothing else, "
            "then reply with the same final report block (describe only this round's changes):\n"
            + (a.feedback if a.feedback != "-" else sys.stdin.read()))
-    res = run_opencode(job["dir"], msg, job["model"], job["agent"], session=job["session"])
+    res = run_opencode(job["dir"], msg, job["model"], job["agent"], session=job["session"], job=job)
     save(job)
     emit(job, res)
 
