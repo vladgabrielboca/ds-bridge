@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# ds-bridge installer: wires the worker agent, the ds CLI and the status line
+# into OpenCode and Claude Code. Idempotent; safe to re-run.
+set -euo pipefail
+
+DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+OC_DIR="$HOME/.config/opencode"
+OC="$OC_DIR/opencode.json"
+OC_BAK="$OC.bak-ds-bridge"
+AGENT_JSON="$DIR/opencode-agent.json"
+CLAUDE_DIR="$HOME/.claude"
+SETTINGS="$CLAUDE_DIR/settings.json"
+BIN_DIR="$HOME/.local/bin"
+LINK="$BIN_DIR/ds"
+
+say() { printf '%s\n' "$*"; }
+warn() { printf 'install.sh: %s\n' "$*" >&2; }
+
+require_commands() {
+    local missing=()
+    local cmd
+    for cmd in opencode python3 git jq; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        warn "missing required command(s): ${missing[*]}"
+        warn "install them, then re-run ./install.sh"
+        exit 1
+    fi
+}
+
+# Replace the __DS_BRIDGE_DIR__ placeholder in every string of a JSON tree.
+py_merge_agent() {
+    DIR="$DIR" AGENT_JSON="$AGENT_JSON" OC="$OC" python3 - <<'PY'
+import json, os, sys
+
+d = os.environ["DIR"]
+src = json.load(open(os.environ["AGENT_JSON"]))
+path = os.environ["OC"]
+
+def sub(o):
+    if isinstance(o, str):
+        return o.replace("__DS_BRIDGE_DIR__", d)
+    if isinstance(o, list):
+        return [sub(x) for x in o]
+    if isinstance(o, dict):
+        return {k: sub(v) for k, v in o.items()}
+    return o
+
+agent = sub(src["agent"])
+
+if os.path.exists(path):
+    try:
+        cfg = json.load(open(path))
+    except (ValueError, OSError) as e:
+        sys.exit(f"install.sh: cannot parse {path}: {e}")
+    if not isinstance(cfg, dict):
+        sys.exit(f"install.sh: {path} is not a JSON object")
+else:
+    cfg = {"$schema": "https://opencode.ai/config.json"}
+
+cfg.setdefault("agent", {})
+cfg["agent"].update(agent)
+
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+PY
+}
+
+py_remove_agent() {
+    OC="$OC" python3 - <<'PY'
+import json, os, sys
+
+path = os.environ["OC"]
+if not os.path.exists(path):
+    print("opencode.json: not present, nothing to remove")
+    sys.exit(0)
+try:
+    cfg = json.load(open(path))
+except (ValueError, OSError) as e:
+    sys.exit(f"install.sh: cannot parse {path}: {e}")
+
+agents = cfg.get("agent")
+if not isinstance(agents, dict) or "worker" not in agents:
+    print("opencode.json: worker agent not set, nothing to remove")
+    sys.exit(0)
+
+del agents["worker"]
+if not agents:
+    cfg.pop("agent", None)
+
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+print("opencode.json: removed worker agent")
+PY
+}
+
+py_set_statusline() {
+    DIR="$DIR" SETTINGS="$SETTINGS" python3 - <<'PY'
+import json, os, sys
+
+path = os.environ["SETTINGS"]
+d = os.environ["DIR"]
+ours = {"type": "command", "command": d + "/statusline.sh", "refreshInterval": 1}
+
+if os.path.exists(path):
+    try:
+        cfg = json.load(open(path))
+    except (ValueError, OSError) as e:
+        sys.exit(f"install.sh: cannot parse {path}: {e}")
+    if not isinstance(cfg, dict):
+        sys.exit(f"install.sh: {path} is not a JSON object")
+else:
+    cfg = {}
+
+cur = cfg.get("statusLine")
+if cur == ours:
+    print("settings.json: statusLine already configured")
+    sys.exit(0)
+if cur is not None:
+    print("settings.json: statusLine belongs to something else; left it untouched")
+    print("  to use ds-bridge, set \"statusLine\" to: " + json.dumps(ours))
+    sys.exit(0)
+
+cfg["statusLine"] = ours
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+print("settings.json: statusLine configured")
+PY
+}
+
+py_remove_statusline() {
+    DIR="$DIR" SETTINGS="$SETTINGS" python3 - <<'PY'
+import json, os, sys
+
+path = os.environ["SETTINGS"]
+d = os.environ["DIR"]
+ours = {"type": "command", "command": d + "/statusline.sh", "refreshInterval": 1}
+
+if not os.path.exists(path):
+    print("settings.json: not present, nothing to remove")
+    sys.exit(0)
+try:
+    cfg = json.load(open(path))
+except (ValueError, OSError) as e:
+    sys.exit(f"install.sh: cannot parse {path}: {e}")
+
+if cfg.get("statusLine") != ours:
+    print("settings.json: statusLine is not ours, left it untouched")
+    sys.exit(0)
+
+del cfg["statusLine"]
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+print("settings.json: removed statusLine")
+PY
+}
+
+link_ds() {
+    mkdir -p "$BIN_DIR"
+    ln -sfn "$DIR/ds" "$LINK"
+    say "linked $LINK -> $DIR/ds"
+    case ":$PATH:" in
+        *":$BIN_DIR:"*|*":$HOME/.local/bin:"*) ;;
+        *) warn "$BIN_DIR is not on PATH; add it, e.g. export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+    esac
+}
+
+unlink_ds() {
+    if [ -L "$LINK" ] && [ "$(readlink -f "$LINK")" = "$DIR/ds" ]; then
+        rm -f "$LINK"
+        say "removed $LINK"
+    elif [ -e "$LINK" ] || [ -L "$LINK" ]; then
+        say "left $LINK alone (not a symlink to $DIR/ds)"
+    else
+        say "$LINK not present, nothing to remove"
+    fi
+}
+
+restart_opencode() {
+    if opencode service restart >/dev/null 2>&1; then
+        say "restarted the OpenCode service"
+    fi
+}
+
+do_uninstall() {
+    command -v python3 >/dev/null 2>&1 || {
+        warn "python3 is required for --uninstall"
+        exit 1
+    }
+    py_remove_agent
+    unlink_ds
+    py_remove_statusline
+}
+
+do_install() {
+    require_commands
+
+    mkdir -p "$OC_DIR"
+    if [ -f "$OC" ] && [ ! -f "$OC_BAK" ]; then
+        cp "$OC" "$OC_BAK"
+        say "backed up $OC -> $OC_BAK"
+    fi
+    py_merge_agent
+    say "merged worker agent into $OC"
+
+    link_ds
+
+    mkdir -p "$CLAUDE_DIR"
+    py_set_statusline
+
+    restart_opencode
+    say ""
+    say "Add the rules in claude-rules.md to ~/.claude/CLAUDE.md (or a project CLAUDE.md) so Claude delegates."
+}
+
+case "${1:-}" in
+    --uninstall) do_uninstall ;;
+    "") do_install ;;
+    *)
+        warn "unknown argument: $1"
+        say "usage: ./install.sh [--uninstall]"
+        exit 2
+        ;;
+esac
