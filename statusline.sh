@@ -1,14 +1,47 @@
 #!/usr/bin/env bash
 # Claude Code status line: show ds-bridge progress for all jobs.
-# Needs only jq. Ignores stdin.
+# Needs only jq and awk. Ignores stdin.
 cat >/dev/null 2>&1
 
 P="$HOME/.local/share/ds-bridge/progress"
-[ -d "$P" ] || exit 0
+TODAY="$HOME/.local/share/ds-bridge/today.json"
+
+fmt_num() {
+    awk -v n="$1" 'BEGIN {
+        sign = (n < 0 ? "-" : ""); n = (n < 0 ? -n : n)
+        if (n >= 10000000) printf "%s%.0fM", sign, n / 1000000
+        else if (n >= 1000000) printf "%s%.1fM", sign, n / 1000000
+        else if (n >= 10000) printf "%s%.0fk", sign, n / 1000
+        else if (n >= 1000) printf "%s%.1fk", sign, n / 1000
+        else printf "%s%d", sign, n
+    }'
+}
+
+idle() {
+    [ -f "$TODAY" ] || return 0
+    local data day jobs saved
+    data=$(jq -r '[(.date // ""), ((.jobs // 0) | floor),
+                   ((.saved_tokens // 0) | floor)] | map(tostring) | join("\u001f")' \
+        "$TODAY" 2>/dev/null) || return 0
+    [ -n "$data" ] || return 0
+    IFS=$'\x1f' read -r day jobs saved <<< "$data"
+    [ "$day" = "$(date +%F)" ] || return 0
+    [ "$jobs" -gt 0 ] 2>/dev/null || return 0
+    printf 'DeepSeek idle · %s jobs today · ≈%s tok saved\n' \
+        "$jobs" "$(fmt_num "$saved")"
+}
+
+if [ ! -d "$P" ]; then
+    idle
+    exit 0
+fi
 
 shopt -s nullglob
 files=("$P"/*.json)
-[ ${#files[@]} -gt 0 ] || exit 0
+if [ ${#files[@]} -eq 0 ]; then
+    idle
+    exit 0
+fi
 
 now=$(date +%s)
 
@@ -78,7 +111,7 @@ for f in "${files[@]}"; do
     records+=("$started"$'\t'"$is_running"$'\t'"$line")
 done
 
-[ ${#records[@]} -gt 0 ] || exit 0
+[ ${#records[@]} -gt 0 ] || { idle; exit 0; }
 
 mapfile -t sorted < <(printf '%s\n' "${records[@]}" | sort -t $'\t' -k1,1nr)
 n=${#sorted[@]}

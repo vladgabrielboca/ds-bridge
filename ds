@@ -12,8 +12,16 @@ only ever reads: the worker's short report + a capped diff.
   ds approve JOB                                   accept, drop snapshot
   ds reject  JOB                                   restore files to pre-job snapshot
   ds list                                          recent jobs
+  ds stats [--days N | --all]                      token savings from the ledger
+  ds log   JOB [--tools-only]                      readable session transcript
 
 --paths limits the snapshot/diff/reject scope to those paths, relative to -C.
+
+Every emit() appends one line to <STATE>/ledger.jsonl (tokens, emitted
+characters, seconds, check result); ds stats totals it and estimates what
+Claude would have read. A desktop notification is sent when a run or revise
+finishes (config "notify", default true; at least "notify_min_s" seconds,
+default 15).
 
 --check runs CMD with bash -c in the job dir after every worker call. On a
 non-zero exit (or a timeout, config check_timeout_s, default 600) the worker is
@@ -30,11 +38,14 @@ JOBS = os.path.join(STATE, "jobs")
 SHADOW = os.path.join(STATE, "shadow")
 PROGRESS = os.path.join(STATE, "progress")
 RUNNING = os.path.join(STATE, "running")
+LEDGER = os.path.join(STATE, "ledger.jsonl")
+TODAY = os.path.join(STATE, "today.json")
 CONF = os.path.join(HOME, ".config/ds-bridge/config.json")
 DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
             "max_diff_lines": 250, "max_report_chars": 1500, "timeout_s": 1800,
             "max_files": 20000, "big_file_mb": 5,
-            "fix_tries": 2, "check_timeout_s": 600}
+            "fix_tries": 2, "check_timeout_s": 600,
+            "notify": True, "notify_min_s": 15}
 EXCLUDES = ["node_modules/", ".venv/", "venv/", "__pycache__/", ".git/", "*.pyc",
             "media/", "*.mp4", "*.mkv", "*.mov", "*.wav", "*.mp3", "*.flac",
             "*.safetensors", "*.bin", "*.pt", "*.pth", "*.ckpt", "*.gguf", "*.onnx",
@@ -466,6 +477,79 @@ def load(jid):
     return json.load(open(p))
 
 
+def fmt_num(n):
+    """Format a token count as 1.2M / 340k / 912."""
+    n = int(round(n))
+    sign = "-" if n < 0 else ""
+    a = abs(n)
+    if a >= 1_000_000:
+        return f"{sign}{a / 1_000_000:.1f}M" if a < 10_000_000 else f"{sign}{a / 1_000_000:.0f}M"
+    if a >= 1_000:
+        return f"{sign}{a / 1_000:.1f}k" if a < 10_000 else f"{sign}{a / 1_000:.0f}k"
+    return f"{sign}{a}"
+
+
+def saved_tokens(worker_in, worker_cache, worker_out, claude_chars):
+    return worker_in + 0.1 * worker_cache + worker_out - claude_chars / 4
+
+
+def _entry_saved(e):
+    return saved_tokens(int(e.get("worker_in") or 0),
+                        int(e.get("worker_cache") or 0),
+                        int(e.get("worker_out") or 0),
+                        int(e.get("claude_chars") or 0))
+
+
+def refresh_today():
+    """Recompute today.json from the ledger (old formula values get corrected)."""
+    today = time.strftime("%Y-%m-%d")
+    saved = jobs = 0
+    try:
+        with open(LEDGER) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                ts = e.get("ts") or 0
+                try:
+                    day = time.strftime("%Y-%m-%d", time.localtime(ts))
+                except (OSError, ValueError, OverflowError):
+                    continue
+                if day != today:
+                    continue
+                saved += int(round(_entry_saved(e)))
+                jobs += 1
+    except OSError:
+        pass
+    try:
+        tmp = TODAY + f".tmp.{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump({"date": today, "saved_tokens": saved, "jobs": jobs}, f)
+        os.replace(tmp, TODAY)
+    except OSError:
+        pass
+
+
+def record_ledger(job, res, claude_chars):
+    tk = res["tokens"]
+    entry = {"ts": int(time.time()), "job": job["id"], "round": job["round"],
+             "dir": job["dir"], "worker_in": tk["input"],
+             "worker_cache": tk["cache_read"], "worker_out": tk["output"],
+             "claude_chars": claude_chars, "secs": res.get("secs"),
+             "check": (None if not res.get("check")
+                       else "pass" if res["check"]["pass"] else "fail")}
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(os.path.join(STATE, ".ledger.lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with open(LEDGER, "a") as f:
+                f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+            refresh_today()
+    except Exception:
+        pass
+
+
 def emit(job, res):
     c = cfg()
     rep = res["report"] or "(worker gave no final report)"
@@ -474,35 +558,173 @@ def emit(job, res):
     rb = job.get("round_base")
     stat, body = diff_text(job, since=rb)
     tk = res["tokens"]
-    print(f"JOB {job['id']}  round {job['round']}  dir {job['dir']}")
+    out = [f"JOB {job['id']}  round {job['round']}  dir {job['dir']}"]
     line = (f"worker: {job['model']}  {res['secs']}s  tok in {tk['input']} "
             f"(cache {tk['cache_read']}) out {tk['output']}  cost ${res['cost']:.4f}")
     if res.get("tok_s") is not None:
         line += f"  gen {res['tok_s']} tok/s"
-    print(line)
+    out.append(line)
     if res["errors"]:
-        print("ERRORS: " + " | ".join(e[:300] for e in res["errors"]))
-    print("--- report")
-    print(rep)
+        out.append("ERRORS: " + " | ".join(e[:300] for e in res["errors"]))
+    out.append("--- report")
+    out.append(rep)
     chk = res.get("check")
     if chk:
-        print("--- check")
+        out.append("--- check")
         if chk["pass"]:
             extra = f" (after {chk['rounds']} auto-fix rounds)" if chk["rounds"] > 0 else ""
-            print(f"PASS  {chk['cmd']}{extra}")
+            out.append(f"PASS  {chk['cmd']}{extra}")
         else:
-            print(f"FAIL  {chk['cmd']}  exit {chk['code']}  "
-                  f"after {chk['rounds']} auto-fix rounds")
+            out.append(f"FAIL  {chk['cmd']}  exit {chk['code']}  "
+                       f"after {chk['rounds']} auto-fix rounds")
             if chk["output"]:
-                print("\n".join(chk["output"].splitlines()[-30:]))
+                out.append("\n".join(chk["output"].splitlines()[-30:]))
     if rb:
-        print(f"--- this round only (cumulative: ds diff {job['id']})")
-    print("--- diff stat")
-    print(stat.rstrip() or "(no changes)")
+        out.append(f"--- this round only (cumulative: ds diff {job['id']})")
+    out.append("--- diff stat")
+    out.append(stat.rstrip() or "(no changes)")
     if body:
-        print("--- diff")
-        print(body)
-    print(f"--- next: ds approve {job['id']} | ds revise {job['id']} \"...\" | ds reject {job['id']}")
+        out.append("--- diff")
+        out.append(body)
+    out.append(f"--- next: ds approve {job['id']} | ds revise {job['id']} \"...\" | ds reject {job['id']}")
+    text = "\n".join(out) + "\n"
+    sys.stdout.write(text)
+    record_ledger(job, res, len(text))
+
+
+def notify_cmd(job, res):
+    """Return the notify-send argv for a finished job, or None to stay quiet."""
+    c = cfg()
+    if not c.get("notify", True):
+        return None
+    try:
+        min_s = int(c.get("notify_min_s", 15))
+    except (TypeError, ValueError):
+        min_s = 15
+    secs = int(res.get("secs") or 0)
+    if secs < min_s or not shutil.which("notify-send"):
+        return None
+    base = os.path.basename(job["dir"].rstrip("/")) or job["dir"]
+    when = f"{secs // 60}:{secs % 60:02d}"
+    errs = res.get("errors") or []
+    if errs:
+        title = f"DeepSeek {job['id']} failed"
+        body = f"{base} · {when} · {str(errs[0])[:100]}"
+    else:
+        title = f"DeepSeek {job['id']} done"
+        body = f"{base} · {when}"
+        chk = res.get("check")
+        if chk:
+            body += " · check " + ("PASS" if chk["pass"] else "FAIL")
+    return ["notify-send", "-a", "ds-bridge", title, body]
+
+
+def notify_done(job, res):
+    try:
+        cmd = notify_cmd(job, res)
+        if cmd:
+            subprocess.run(cmd, timeout=5, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def cmd_stats(a):
+    now = time.time()
+    if a.all:
+        cutoff = None
+    elif a.days is not None:
+        cutoff = now - int(a.days) * 86400
+    else:
+        lt = time.localtime()
+        cutoff = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    rows = []
+    try:
+        with open(LEDGER) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if cutoff is None or e.get("ts", 0) >= cutoff:
+                    rows.append(e)
+    except OSError:
+        pass
+    win = sum(int(e.get("worker_in") or 0) for e in rows)
+    wca = sum(int(e.get("worker_cache") or 0) for e in rows)
+    wout = sum(int(e.get("worker_out") or 0) for e in rows)
+    chars = sum(int(e.get("claude_chars") or 0) for e in rows)
+    claude_tok = chars / 4
+    saved = saved_tokens(win, wca, wout, chars)
+    jobs = len({e.get("job") for e in rows if e.get("job")})
+    print(f"jobs {jobs} · rounds {len(rows)}")
+    print(f"worker tokens: in {fmt_num(win)} / cache {fmt_num(wca)} / out {fmt_num(wout)}")
+    print(f"Claude read: {fmt_num(chars)} chars ≈ {fmt_num(claude_tok)} tokens")
+    print(f"est. saved: ≈ {fmt_num(saved)} tokens")
+    print("estimate: input-equivalent tokens Claude would have spent doing it itself (cache reads weighted 0.1×), minus what it read from ds")
+
+
+def _tool_short(part):
+    nm = part.get("name") or part.get("tool") or "tool"
+    inp = (part.get("state") or {}).get("input") or {}
+    detail = (inp.get("command") or inp.get("path") or inp.get("filePath")
+              or inp.get("pattern") or "")
+    detail = " ".join(str(detail).split())
+    if len(detail) > 100:
+        detail = detail[:100] + "…"
+    return f"  ▸ {nm} {detail}".rstrip()
+
+
+def _tool_output(part):
+    st = part.get("state") or {}
+    if isinstance(st.get("output"), str):
+        out = st["output"]
+    else:
+        out = "\n".join(c.get("text", "") for c in (st.get("content") or [])
+                        if isinstance(c, dict) and c.get("type") == "text")
+    return out.splitlines()[:6]
+
+
+def cmd_log(a):
+    job = load(a.job)
+    sid = job.get("session")
+    if not sid:
+        die(f"job {a.job} has no session to export")
+    r = subprocess.run(["opencode", "session", "export", sid],
+                       capture_output=True, text=True)
+    if r.returncode:
+        msg = (r.stderr or "").strip() or (r.stdout or "").strip() or "session export failed"
+        print(msg, file=sys.stderr)
+        sys.exit(1)
+    try:
+        data = json.loads(r.stdout)
+    except ValueError as e:
+        print(f"ds: could not parse session export: {e}", file=sys.stderr)
+        sys.exit(1)
+    for m in data.get("messages") or []:
+        t = m.get("type")
+        if t == "user":
+            if a.tools_only:
+                continue
+            print("── user")
+            print((m.get("text") or "")[:400])
+        elif t == "assistant":
+            blocks = []
+            for part in m.get("content") or []:
+                if part.get("type") == "text" and not a.tools_only:
+                    blocks.append(("text", part.get("text") or ""))
+                elif part.get("type") == "tool":
+                    blocks.append(("tool", part))
+            if not blocks:
+                continue
+            print("── worker")
+            for kind, val in blocks:
+                if kind == "text":
+                    print(val)
+                else:
+                    print(_tool_short(val))
+                    for ln in _tool_output(val):
+                        print("    " + ln)
 
 
 def cmd_run(a):
@@ -534,6 +756,7 @@ def cmd_run(a):
         job["session"] = res["session"]
         save(job)
         emit(job, res)
+        notify_done(job, res)
     finally:
         clear_marker(jid)
         cleanup_progress()
@@ -557,6 +780,7 @@ def cmd_revise(a):
         res = run_with_check(job, msg, session=job["session"])
         save(job)
         emit(job, res)
+        notify_done(job, res)
     finally:
         clear_marker(job["id"])
         cleanup_progress()
@@ -635,6 +859,10 @@ def main():
     for n, f in [("approve", cmd_approve), ("reject", cmd_reject)]:
         r = s.add_parser(n); r.add_argument("job"); r.set_defaults(fn=f)
     s.add_parser("list").set_defaults(fn=cmd_list)
+    r = s.add_parser("stats"); r.add_argument("--days", type=int)
+    r.add_argument("--all", action="store_true"); r.set_defaults(fn=cmd_stats)
+    r = s.add_parser("log"); r.add_argument("job")
+    r.add_argument("--tools-only", action="store_true"); r.set_defaults(fn=cmd_log)
     a = p.parse_args()
     if a.cmd == "run" and a.task is None:
         # --paths uses nargs="+"; when it comes before the task, argparse
