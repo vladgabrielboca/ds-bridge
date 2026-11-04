@@ -22,32 +22,5 @@
         }
       }
     }
-  },
-  "mcp": {
-    "google-calendar": {
-      "type": "remote",
-      "url": "https://calendarmcp.googleapis.com/mcp/v1",
-      "enabled": true
-    },
-    "superhuman-docs": {
-      "type": "remote",
-      "url": "https://docs.superhuman.com/apis/mcp",
-      "enabled": true
-    },
-    "claude-docs": {
-      "type": "remote",
-      "url": "https://api.anthropic.com/v1/pages/mcp",
-      "enabled": true
-    },
-    "chrome-devtools": {
-      "type": "local",
-      "command": [
-        "npx",
-        "-y",
-        "chrome-devtools-mcp@latest",
-        "--autoConnect"
-      ],
-      "enabled": true
-    }
   }
 }
