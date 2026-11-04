@@ -31,7 +31,7 @@ fix_tries times (config "fix_tries", default 2; override with --fix-tries).
 The job report shows PASS/FAIL, and the diff includes any auto-fix changes.
 revise reuses the stored check unless --check replaces it.
 """
-import hashlib, json, os, subprocess, sys, time, argparse, shutil, queue, threading, fcntl
+import hashlib, json, os, signal, subprocess, sys, time, argparse, shutil, queue, threading, fcntl
 
 HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".local/share/ds-bridge")
@@ -82,6 +82,17 @@ def cfg():
 def die(msg, code=2):
     print(f"ds: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+def install_signal_handlers():
+    """Turn SIGTERM/SIGHUP into SystemExit so run/revise finally blocks run."""
+    def _exit(signum, frame):
+        raise SystemExit(128 + signum)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _exit)
+        except (ValueError, OSError):
+            pass
 
 
 def git(job_or_gd, wt, *args, check=True, capture=True, index=None):
@@ -262,13 +273,50 @@ def cleanup_progress():
     except OSError:
         return
     cutoff = time.time() - 86400
+    stale = time.time() - 120
     for name in names:
         p = os.path.join(PROGRESS, name)
         try:
             if os.path.getmtime(p) < cutoff:
                 os.remove(p)
+                continue
         except OSError:
             pass
+        try:
+            obj = json.load(open(p))
+        except (OSError, ValueError):
+            continue
+        if obj.get("state") != "running":
+            continue
+        pid = obj.get("pid")
+        dead = (not pid_alive(pid)) if pid else obj.get("updated", 0) < stale
+        if dead:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def mark_interrupted(jid):
+    """Rewrite a still-running progress file as error/interrupted."""
+    path = os.path.join(PROGRESS, jid + ".json")
+    try:
+        obj = json.load(open(path))
+    except (OSError, ValueError):
+        return
+    if obj.get("state") != "running":
+        return
+    started = obj.get("started") or time.time()
+    obj.update({"state": "error", "last": "interrupted",
+                "secs": max(0, round(time.time() - started)),
+                "updated": time.time(), "pid": os.getpid()})
+    try:
+        tmp = path + f".tmp.{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
@@ -294,7 +342,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
     def write_progress(state, **extra):
         obj = {"state": state, "job": job["id"], "round": job["round"], "model": model,
                "dir": os.path.basename(d), "started": t0, "updated": time.time(),
-               "steps": steps, "tools": tools, "last": last,
+               "steps": steps, "tools": tools, "last": last, "pid": os.getpid(),
                "out_tokens": tok["output"], "tok_s": tok_s()}
         obj.update(extra)
         try:
@@ -308,7 +356,8 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
             pass
 
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL, text=True, cwd=d)
+                         stdin=subprocess.DEVNULL, text=True, cwd=d,
+                         start_new_session=True)
     q = queue.Queue()
 
     def _reader():
@@ -320,65 +369,83 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
 
     threading.Thread(target=_reader, daemon=True).start()
     timed_out = False
-    while True:
-        if time.time() - t0 > c["timeout_s"]:
-            timed_out = True
-            p.kill()
-            break
-        try:
-            line = q.get(timeout=0.5)
-        except queue.Empty:
-            continue
-        if line is None:
-            break
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        sid = ev.get("sessionID", sid)
-        t, part = ev.get("type"), ev.get("part") or {}
-        ts = ev.get("timestamp")
-        if t == "step_start":
-            steps += 1
-            step_window, step_tool_ms = ts, 0
-            if tools == 0:
-                last = "thinking"
-        for st in ((part.get("time") or {}).get("start"),
-                   ((part.get("state") or {}).get("time") or {}).get("start")):
-            if st is not None and (step_window is None or st < step_window):
-                step_window = st
-        if t == "text":
-            if part.get("messageID") != cur_msg:
-                cur_msg, cur_text = part.get("messageID"), []
-                texts.append(cur_text)
-            cur_text.append(part.get("text", ""))
-        elif t in ("tool_use", "tool"):
-            tools += 1
-            nm = part.get("tool") or "tool"
-            stt = (part.get("state") or {}).get("time") or {}
-            if stt.get("start") is not None and stt.get("end") is not None:
-                step_tool_ms += stt["end"] - stt["start"]
-            inp = (part.get("state") or {}).get("input") or {}
-            if nm == "shell":
-                detail = inp.get("command") or ""
-            else:
-                detail = inp.get("path") or inp.get("filePath") or inp.get("pattern") or ""
-            last = " ".join(f"{nm} {detail}".split())[:60]
-        elif t == "step_finish":
-            tk = part.get("tokens") or {}
-            tok["input"] += tk.get("input", 0)
-            tok["output"] += tk.get("output", 0) + tk.get("reasoning", 0)
-            tok["cache_read"] += (tk.get("cache") or {}).get("read", 0)
-            cost += part.get("cost") or 0
-            if step_window is not None and ts is not None:
-                gen_ms = ts - step_window - step_tool_ms
-                if gen_ms >= 200:
-                    gen_tokens += tk.get("output", 0) + tk.get("reasoning", 0)
-                    gen_ms_total += gen_ms
-        elif t == "error":
-            errors.append((ev.get("error") or {}).get("message", "unknown error"))
-        write_progress("running")
-    p.wait()
+    try:
+        while True:
+            if time.time() - t0 > c["timeout_s"]:
+                timed_out = True
+                break
+            try:
+                line = q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if line is None:
+                break
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            sid = ev.get("sessionID", sid)
+            t, part = ev.get("type"), ev.get("part") or {}
+            ts = ev.get("timestamp")
+            if t == "step_start":
+                steps += 1
+                step_window, step_tool_ms = ts, 0
+                if tools == 0:
+                    last = "thinking"
+            for st in ((part.get("time") or {}).get("start"),
+                       ((part.get("state") or {}).get("time") or {}).get("start")):
+                if st is not None and (step_window is None or st < step_window):
+                    step_window = st
+            if t == "text":
+                if part.get("messageID") != cur_msg:
+                    cur_msg, cur_text = part.get("messageID"), []
+                    texts.append(cur_text)
+                cur_text.append(part.get("text", ""))
+            elif t in ("tool_use", "tool"):
+                tools += 1
+                nm = part.get("tool") or "tool"
+                stt = (part.get("state") or {}).get("time") or {}
+                if stt.get("start") is not None and stt.get("end") is not None:
+                    step_tool_ms += stt["end"] - stt["start"]
+                inp = (part.get("state") or {}).get("input") or {}
+                if nm == "shell":
+                    detail = inp.get("command") or ""
+                else:
+                    detail = inp.get("path") or inp.get("filePath") or inp.get("pattern") or ""
+                last = " ".join(f"{nm} {detail}".split())[:60]
+            elif t == "step_finish":
+                tk = part.get("tokens") or {}
+                tok["input"] += tk.get("input", 0)
+                tok["output"] += tk.get("output", 0) + tk.get("reasoning", 0)
+                tok["cache_read"] += (tk.get("cache") or {}).get("read", 0)
+                cost += part.get("cost") or 0
+                if step_window is not None and ts is not None:
+                    gen_ms = ts - step_window - step_tool_ms
+                    if gen_ms >= 200:
+                        gen_tokens += tk.get("output", 0) + tk.get("reasoning", 0)
+                        gen_ms_total += gen_ms
+            elif t == "error":
+                errors.append((ev.get("error") or {}).get("message", "unknown error"))
+            write_progress("running")
+        if not timed_out:
+            p.wait()
+    finally:
+        if p.poll() is None:
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
     if timed_out:
         errors.append(f"timeout after {int(c['timeout_s'])}s")
     final = "".join(texts[-1]).strip() if texts else ""
@@ -397,6 +464,7 @@ def write_progress_file(job, model, **fields):
                "out_tokens": 0, "tok_s": None, "job": job["id"], "round": job["round"],
                "model": model, "dir": os.path.basename(job["dir"])}
     obj.update(fields)
+    obj["pid"] = os.getpid()
     obj["updated"] = time.time()
     try:
         os.makedirs(PROGRESS, exist_ok=True)
@@ -800,6 +868,7 @@ def cmd_run(a):
         emit(job, res)
         notify_done(job, res)
     finally:
+        mark_interrupted(jid)
         clear_marker(jid)
         cleanup_progress()
 
@@ -824,6 +893,7 @@ def cmd_revise(a):
         emit(job, res)
         notify_done(job, res)
     finally:
+        mark_interrupted(job["id"])
         clear_marker(job["id"])
         cleanup_progress()
 
@@ -883,6 +953,7 @@ def cmd_list(a):
 
 
 def main():
+    install_signal_handlers()
     p = argparse.ArgumentParser(prog="ds", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     s = p.add_subparsers(dest="cmd", required=True)

@@ -66,10 +66,10 @@ for f in "${files[@]}"; do
     data=$(jq -r '[(.state // ""), (.job // ""), (.round // 0), (.steps // 0),
                    (.tools // 0), (.out_tokens // 0), ((.started // 0) | floor),
                    ((.updated // 0) | floor), (.last // ""), ((.secs // 0) | floor),
-                   (.tok_s // "")]
+                   (.tok_s // ""), ((.pid // 0) | floor)]
                   | map(tostring) | join("\u001f")' "$f" 2>/dev/null) || continue
     [ -n "$data" ] || continue
-    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s <<< "$data"
+    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s pid <<< "$data"
     last=${last//$'\t'/ }
     last=${last//$'\n'/ }
 
@@ -83,17 +83,30 @@ for f in "${files[@]}"; do
     case "$state" in
         running)
             age=$((now - updated))
-            if [ "$age" -gt 1800 ]; then
-                line=$(printf 'DeepSeek %s stalled?' "$job")
+            if [ "$pid" -gt 0 ] 2>/dev/null; then
+                alive=0
+                kill -0 "$pid" 2>/dev/null && alive=1
+            elif [ "$age" -gt 120 ]; then
+                alive=0
             else
-                spinners=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
-                sp=${spinners[$((now % 10))]}
-                line=$(printf '%s DeepSeek %s r%s · %s · step %s · %s tools · %s tok%s · ▸ %s' \
-                    "$sp" "$job" "$round" "$(fmt_secs $((now - started)))" \
-                    "$steps" "$tools" "$(fmt_tok "$out_tokens")" "$tok_s_seg" "$last")
+                alive=1
             fi
-            is_running=1
-            running=$((running + 1))
+            if [ "$alive" = "0" ]; then
+                [ "$age" -le 120 ] || continue
+                line=$(printf '✗ DeepSeek %s interrupted' "$job")
+            else
+                if [ "$age" -gt 1800 ]; then
+                    line=$(printf 'DeepSeek %s stalled?' "$job")
+                else
+                    spinners=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+                    sp=${spinners[$((now % 10))]}
+                    line=$(printf '%s DeepSeek %s r%s · %s · step %s · %s tools · %s tok%s · ▸ %s' \
+                        "$sp" "$job" "$round" "$(fmt_secs $((now - started)))" \
+                        "$steps" "$tools" "$(fmt_tok "$out_tokens")" "$tok_s_seg" "$last")
+                fi
+                is_running=1
+                running=$((running + 1))
+            fi
             ;;
         done)
             [ $((now - updated)) -le 120 ] || continue
@@ -101,7 +114,11 @@ for f in "${files[@]}"; do
             ;;
         error)
             [ $((now - updated)) -le 120 ] || continue
-            line=$(printf '✗ DeepSeek %s failed in %s' "$job" "$(fmt_secs "$secs")")
+            if [ "$last" = "interrupted" ]; then
+                line=$(printf '✗ DeepSeek %s interrupted' "$job")
+            else
+                line=$(printf '✗ DeepSeek %s failed in %s' "$job" "$(fmt_secs "$secs")")
+            fi
             ;;
         *)
             continue
