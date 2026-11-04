@@ -53,6 +53,12 @@ sequenceDiagram
         O-->>D: JSON event stream
         D->>D: write progress.json
     end
+    D->>D: run check
+    loop check fails, tries left
+        D->>O: failure tail, same session
+        O-->>D: JSON event stream
+        D->>D: run check
+    end
     D->>S: diff vs snapshot
     D-->>C: report + diff
     alt approve
@@ -89,8 +95,12 @@ Claude Code's status line can poll ds-bridge once a second (`refreshInterval: 1`
 
 ```
 ⠴ DeepSeek 1104-152450 r1 · 0:05 · step 2 · 4 tools · 144 tok · 152 tok/s · ▸ read notes.txt
+⠙ DeepSeek 1104-152510 r1 · 0:02 · step 1 · 1 tool · 18 tok · ▸ rg "def main"
 ✓ DeepSeek 1104-152450 done in 0:11
+DeepSeek idle · 4 jobs today · ≈38k tok saved
 ```
+
+Each active job gets its own line, up to four; when nothing is running the line shows today's ledger instead. A run or revise that lasts at least `notify_min_s` seconds also sends a desktop notification with the job id, project, duration and check result.
 
 There is no percentage. An agent can't know its step count in advance, so the line shows elapsed time, the step reached so far, and the last tool call instead of inventing a progress bar.
 
@@ -100,14 +110,41 @@ tok/s is the model's generation speed averaged over finished steps, with tool ru
 
 | Command | Description |
 | --- | --- |
-| `ds run -C <dir> "<task>"` | Start a job: snapshot, run the worker, print report + diff. |
+| `ds run -C <dir> "<task>"` | Start a job: snapshot, run the worker (and optional check/fix loop), print report + diff. |
+| `ds init [-C <dir>] [--refresh]` | Start a job that writes or refreshes `AGENTS.md` at the project root. |
 | `ds revise JOB "<points>"` | Send numbered feedback in the same session; shows only this round's diff. |
 | `ds diff JOB [PATH…]` | Re-show the diff, optionally `--full` or for specific paths. |
 | `ds approve JOB` | Mark the job accepted; the changes stay in place. |
 | `ds reject JOB` | Restore the project to the pre-job snapshot, removing files the worker created. |
 | `ds list` | List recent jobs with status and round. |
+| `ds stats [--days N \| --all]` | Summarise the ledger: jobs, rounds, worker tokens, Claude's reads and estimated savings. |
+| `ds log JOB [--tools-only]` | Print a readable transcript of the job's OpenCode session. |
 
-Flags: `-C DIR` sets the project directory (`run` only), `-m MODEL` overrides the model for one job, and `-f FILE` attaches a file to the brief (repeatable).
+Flags: `-C DIR` sets the project directory (`run` and `init`), `-m MODEL` overrides the model for one job, `-f FILE` attaches a file to the brief (repeatable), `--paths P…` limits the job's file scope, and `--check CMD` / `--fix-tries N` control the acceptance check (also on `revise`).
+
+### `--check` and the fix loop
+
+`ds run -C <dir> --check "pytest -q" "<task>"` runs CMD with `bash -c` in the project after the worker's first answer. If it exits non-zero (or hits `check_timeout_s`), the bridge sends the last 60 lines of output back into the same session and asks for a fix, then runs the check again, at most `fix_tries` times. The report gets a `--- check` section with PASS/FAIL and the number of auto-fix rounds, and the diff includes every change from those rounds.
+
+### `--paths` and parallel jobs
+
+`--paths P…` limits the snapshot, diff and reject scope to those paths relative to `-C`. Independent subtasks can run in parallel: start several `ds run ... --paths <their files>` calls in the background, then review each report as it arrives. Jobs whose paths overlap a running job in the same project are refused. `ds revise` keeps the job's original scope.
+
+### `ds init` and AGENTS.md
+
+`ds init -C <project>` is a normal job (snapshot, worker, report, approve/revise/reject) with a built-in task: explore the project and write `AGENTS.md` at the root, at most 40 lines of facts about layout, build/test/lint/run commands, conventions and things not to touch. It is scoped with `--paths AGENTS.md`. If `AGENTS.md` already exists it refuses unless you pass `--refresh`, which asks the worker to update the existing file and keep correct lines. OpenCode loads `AGENTS.md` automatically, so later briefs can be shorter.
+
+### Guard hook
+
+`install.sh` adds a Claude Code `PreToolUse` hook (`hooks/guard.py`) for `Edit`, `Write`, `MultiEdit` and `NotebookEdit`. Direct edits to project files are blocked with a message to delegate through `ds`; `~/.claude/`, `/tmp/claude-*` scratchpads and globs in `guard_allow` are allowed. Pause it with `touch ~/.config/ds-bridge/guard-off` or `DS_GUARD_OFF=1`. It can't stop edits made through Bash (heredocs, sed), so it is a guardrail, not a sandbox.
+
+### Stats and log
+
+Every report appends one line to `~/.local/share/ds-bridge/ledger.jsonl`. `ds stats` prints jobs (distinct ids), rounds (ledger rows), worker tokens in/cache/out, what Claude read, and an estimated saving:
+
+> saved = worker input + 0.1 × worker cache reads + worker output − Claude's read characters / 4
+
+Plainly: the input-equivalent tokens the worker spent doing the job (cache reads counted at a tenth) minus the tokens Claude used reading the compact report and diff. It is an estimate, not a measurement. `ds log JOB` exports the session; `--tools-only` hides text and shows the tool calls.
 
 ## Install
 
@@ -123,9 +160,9 @@ cd ds-bridge
 ./install.sh
 ```
 
-The installer merges the `worker` agent into `~/.config/opencode/opencode.json` (backing it up first), links `ds` into `~/.local/bin`, and adds the status line to `~/.claude/settings.json`. It never edits `CLAUDE.md` itself, so finish by adding the rules in `claude-rules.md` to `~/.claude/CLAUDE.md` (or a project `CLAUDE.md`).
+The installer merges the `worker` agent into `~/.config/opencode/opencode.json` (backing it up first), links `ds` into `~/.local/bin`, and adds the status line and the `PreToolUse` guard hook to `~/.claude/settings.json`. It never edits `CLAUDE.md` itself, so finish by adding the rules in `claude-rules.md` to `~/.claude/CLAUDE.md` (or a project `CLAUDE.md`). The guard is active immediately; `touch ~/.config/ds-bridge/guard-off` pauses it.
 
-`./install.sh --uninstall` removes the worker agent, the symlink and the status line, touching only what ds-bridge created.
+`./install.sh --uninstall` removes the worker agent, the symlink, the status line and the guard hook, touching only what ds-bridge created.
 
 > OpenCode Go DeepSeek models need the workspace region set to **Global** in its Privacy settings.
 
@@ -142,6 +179,11 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `timeout_s` | `1800` | Per-run timeout. |
 | `max_files` | `20000` | Refuse to snapshot directories with more tracked files. |
 | `big_file_mb` | `5` | Files larger than this are excluded from snapshots. |
+| `fix_tries` | `2` | Auto-fix rounds after a failed `--check` (override per job with `--fix-tries`). |
+| `check_timeout_s` | `600` | Timeout for one `--check` command. |
+| `notify` | `true` | Send a desktop notification when a run or revise finishes. |
+| `notify_min_s` | `15` | Don't notify for jobs shorter than this many seconds. |
+| `guard_allow` | `[]` | Globs of paths the guard hook always allows (for example `~/work/sandbox/*`). |
 
 ## Safety
 
@@ -152,6 +194,9 @@ The worker's `bash` permission denies `git commit`, `git push`, `git reset`, `gi
 - No real percentage progress — the status line counts steps, not total work.
 - Files over 5 MB aren't snapshotted, so `ds reject` can't restore them.
 - The worker's quality is a flash model's; review is mandatory.
+- Token savings from `ds stats` are an estimate, not a measurement.
+- The guard hook covers Claude's edit tools only; it can't see Bash-based edits.
+- Auto-fix rounds restart the status-line timer for each worker call.
 
 ## License
 

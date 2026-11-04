@@ -7,6 +7,7 @@ only ever reads: the worker's short report + a capped diff.
 
   ds run  [-C DIR] [-m MODEL] [-f FILE]... [--paths P ...]
           [--check CMD] [--fix-tries N] "task"      new job
+  ds init [-C DIR] [--refresh]                      job that writes AGENTS.md
   ds revise JOB "feedback" [--check CMD]           same session, keeps DeepSeek's context
   ds diff   JOB [--full] [PATH...]                 re-show diff (optionally full / per path)
   ds approve JOB                                   accept, drop snapshot
@@ -50,6 +51,23 @@ EXCLUDES = ["node_modules/", ".venv/", "venv/", "__pycache__/", ".git/", "*.pyc"
             "media/", "*.mp4", "*.mkv", "*.mov", "*.wav", "*.mp3", "*.flac",
             "*.safetensors", "*.bin", "*.pt", "*.pth", "*.ckpt", "*.gguf", "*.onnx",
             "*.zip", "*.tar*", "*.iso", ".cache/", "dist/", "build/", ".next/"]
+INIT_BASE = (
+    "Explore this project briefly (top-level layout, build/test/lint commands from "
+    "config files such as package.json, pyproject.toml, Makefile, justfile, "
+    "Cargo.toml) and write AGENTS.md at the project root, at most 40 lines: "
+    "one-line purpose; layout (key dirs/files, one line each); exact commands to "
+    "build, test, lint, run; code conventions you can see (language version, "
+    "formatter, naming, test style); things not to touch (generated files, "
+    "vendored code, large media). Facts only, no guesses; omit a section if unknown.")
+INIT_REFRESH = (
+    "Update the existing AGENTS.md at the project root, keeping correct lines. "
+    "Explore this project briefly (top-level layout, build/test/lint commands from "
+    "config files such as package.json, pyproject.toml, Makefile, justfile, "
+    "Cargo.toml) and rewrite AGENTS.md at the project root, at most 40 lines: "
+    "one-line purpose; layout (key dirs/files, one line each); exact commands to "
+    "build, test, lint, run; code conventions you can see (language version, "
+    "formatter, naming, test style); things not to touch (generated files, "
+    "vendored code, large media). Facts only, no guesses; omit a section if unknown.")
 
 
 def cfg():
@@ -107,6 +125,21 @@ def write_exclude(gd, ex):
     os.replace(tmp, p)
 
 
+def stage_paths(gd, wt, paths, index):
+    """Stage paths; missing paths that never existed are simply skipped."""
+    if not paths:
+        git(gd, wt, "add", "-A", index=index)
+        return
+    env = os.environ.copy()
+    env["GIT_INDEX_FILE"] = index
+    for p in paths:
+        r = subprocess.run(["git", f"--git-dir={gd}", f"--work-tree={wt}",
+                            "add", "-A", "--", p],
+                           capture_output=True, text=True, cwd=wt, env=env)
+        if r.returncode and "did not match any files" not in (r.stderr or ""):
+            die(f"git add {p} failed: {(r.stderr or '').strip()[:500]}")
+
+
 def snapshot(d, gd, label, index, jid, paths=None):
     c = cfg()
     ex = list(EXCLUDES)
@@ -116,10 +149,7 @@ def snapshot(d, gd, label, index, jid, paths=None):
                        capture_output=True, text=True, cwd=d)
     ex += ["/" + p[2:] for p in r.stdout.splitlines() if p.startswith("./")]
     write_exclude(gd, ex)
-    if paths:
-        git(gd, d, "add", "-A", "--", *paths, index=index)
-    else:
-        git(gd, d, "add", "-A", index=index)
+    stage_paths(gd, d, paths, index)
     n = len(git(gd, d, "ls-files", index=index).splitlines())
     if n > c["max_files"]:
         die(f"{d} has {n} tracked files (> {c['max_files']}); run in a smaller directory")
@@ -446,10 +476,7 @@ def diff_text(job, full=False, paths=(), since=None):
     d, gd = job["dir"], job["shadow"]
     idx = job_index(job["id"])
     job_paths = job.get("paths")
-    if job_paths:
-        git(gd, d, "add", "-A", "--", *job_paths, index=idx)
-    else:
-        git(gd, d, "add", "-A", index=idx)
+    stage_paths(gd, d, job_paths, idx)
     scope = list(paths) if paths else (job_paths or [])
     since = since or job["base"]
     stat = git(gd, d, "diff", "--cached", "--stat=100", since, "--", *scope, index=idx)
@@ -503,7 +530,8 @@ def _entry_saved(e):
 def refresh_today():
     """Recompute today.json from the ledger (old formula values get corrected)."""
     today = time.strftime("%Y-%m-%d")
-    saved = jobs = 0
+    saved = 0
+    job_ids = set()
     try:
         with open(LEDGER) as f:
             for line in f:
@@ -519,13 +547,15 @@ def refresh_today():
                 if day != today:
                     continue
                 saved += int(round(_entry_saved(e)))
-                jobs += 1
+                if e.get("job"):
+                    job_ids.add(e["job"])
     except OSError:
         pass
     try:
         tmp = TODAY + f".tmp.{os.getpid()}"
         with open(tmp, "w") as f:
-            json.dump({"date": today, "saved_tokens": saved, "jobs": jobs}, f)
+            json.dump({"date": today, "saved_tokens": saved,
+                       "jobs": len(job_ids)}, f)
         os.replace(tmp, TODAY)
     except OSError:
         pass
@@ -727,6 +757,18 @@ def cmd_log(a):
                         print("    " + ln)
 
 
+def cmd_init(a):
+    d = os.path.realpath(a.C or os.getcwd())
+    target = os.path.join(d, "AGENTS.md")
+    exists = os.path.exists(target)
+    if exists and not a.refresh:
+        die("AGENTS.md exists; use --refresh to rewrite it")
+    task = INIT_REFRESH if a.refresh else INIT_BASE
+    ns = argparse.Namespace(C=d, m=None, paths=["AGENTS.md"], check=None,
+                            fix_tries=None, f=None, task=task)
+    cmd_run(ns)
+
+
 def cmd_run(a):
     c = cfg()
     d = os.path.realpath(a.C or os.getcwd())
@@ -805,10 +847,7 @@ def cmd_reject(a):
     d, gd = job["dir"], job["shadow"]
     idx = job_index(job["id"])
     paths = job.get("paths")
-    if paths:
-        git(gd, d, "add", "-A", "--", *paths, index=idx)
-    else:
-        git(gd, d, "add", "-A", index=idx)
+    stage_paths(gd, d, paths, idx)
     # files created since snapshot -> remove; changed/deleted -> restore
     diff_args = ["diff", "--cached", "--name-only", "--diff-filter=A", job["base"]]
     if paths:
@@ -852,6 +891,8 @@ def main():
     r.add_argument("--check"); r.add_argument("--fix-tries", type=int)
     r.add_argument("task", nargs="?")
     r.set_defaults(fn=cmd_run)
+    r = s.add_parser("init"); r.add_argument("-C")
+    r.add_argument("--refresh", action="store_true"); r.set_defaults(fn=cmd_init)
     r = s.add_parser("revise"); r.add_argument("job"); r.add_argument("feedback")
     r.add_argument("--check"); r.set_defaults(fn=cmd_revise)
     r = s.add_parser("diff"); r.add_argument("job"); r.add_argument("--full", action="store_true")
