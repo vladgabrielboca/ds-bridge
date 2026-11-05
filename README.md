@@ -105,7 +105,9 @@ Each active job gets its own line, up to four; when nothing is running the line 
 
 There is no percentage. An agent can't know its step count in advance, so the line shows elapsed time, the step reached so far, and the last tool call instead of inventing a progress bar.
 
-While a job runs, ds also reads the OpenCode service's event stream (`~/.local/state/opencode/service.json`). The status line shows the live generation rate (`▶ N tok/s`) while the model writes, `✎ tool Ns` while tool arguments are being generated, an elapsed tool timer (`⏸ Ns`) while a tool runs, and `… waiting` during model latency. The live rate uses generated text from the last five seconds, calibrated against completed steps; if the stream is unavailable it falls back to the average for finished steps, with tool run time excluded.
+While a job runs, ds also reads the OpenCode service's event stream (`~/.local/state/opencode/service.json`). The status line shows the live generation rate (`▶ N tok/s`) while the model writes, `✎ tool Ns` while tool arguments are being generated, an elapsed tool timer (`⏸ Ns`) while a tool runs, and `… waiting` during model latency. The live rate uses only active generation time in the last five seconds, calibrated against completed steps; long pauses and tool execution do not lower it. If the stream is unavailable, no live rate is shown.
+
+The final report's `tok/s` is decode speed: output tokens per second while the model is writing, measured from the event stream between the first and last generation event of each step. It excludes time to the first token and tool execution. The same measurement gives the time to first token (TTFT), shown after the rate as `· first token X.Xs`. When the event stream was unavailable, or no step completed, ds prints no speed rather than estimating one from `opencode run` stdout.
 
 ## Commands
 
@@ -161,7 +163,7 @@ Snapshots skip media, build output, big files and dependency/cache directories, 
 
 ### Stats and log
 
-Every report appends one line to `~/.local/share/ds-bridge/ledger.jsonl`. `ds stats` prints jobs (distinct ids), rounds (ledger rows), worker tokens in/cache/out, what Claude read, and an estimated saving:
+Every report appends one line to `~/.local/share/ds-bridge/ledger.jsonl`. `ds stats` prints jobs (distinct ids), rounds (ledger rows), worker tokens in/cache/out, what Claude read, an estimated saving, and (when known) the median decode speed and TTFT across rounds:
 
 > saved = worker input + 0.1 × worker cache reads + worker output − Claude's read characters / 4
 

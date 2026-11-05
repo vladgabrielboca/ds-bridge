@@ -620,6 +620,29 @@ def stderr_tail(path, limit=1000):
         return ""
 
 
+def _live_rate(segs, now_ms, cpt):
+    """Live tok/s from active generation segments clipped to the last 5 s."""
+    win_start = now_ms - 5000
+    chars = dur_ms = 0.0
+    keep = []
+    for start, end, ch in segs:
+        if end < win_start - 10000:
+            continue
+        keep.append((start, end, ch))
+        if end <= win_start or start >= now_ms:
+            continue
+        span = end - start
+        lo, hi = max(start, win_start), min(end, now_ms)
+        if span <= 0 or hi <= lo:
+            continue
+        overlap = hi - lo
+        chars += ch * overlap / span
+        dur_ms += overlap
+    if dur_ms >= 300 and chars:
+        return int(round((chars / cpt) / (dur_ms / 1000))), keep
+    return None, keep
+
+
 def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                  limit_s=None, wrapup=False):
     c = cfg()
@@ -641,32 +664,26 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
     cost, tools, steps = 0.0, 0, 0
     last = "thinking"
     cur_msg, cur_text = None, []
-    gen_tokens, gen_ms_total = 0, 0
-    step_window, step_tool_ms = None, 0
-    live = {"available": False, "resp": None, "dq": collections.deque(),
+    live = {"available": False, "resp": None, "segs": [],
             "cpt": 3.5, "cal_chars": 0, "cal_tokens": 0, "step_chars": 0,
-            "last_delta_ms": None, "tools": {}, "args": {}}
+            "last_delta_ms": None, "last_gen_ms": None, "tools": {}, "args": {},
+            "step_start_ms": None, "first_gen_ms": None, "last_step_gen_ms": None,
+            "dec_tokens": 0, "dec_ms": 0, "ttft": []}
     progress_lock = threading.Lock()
 
     def tok_s():
-        return round(gen_tokens / (gen_ms_total / 1000)) if gen_ms_total else None
+        return (round(live["dec_tokens"] / (live["dec_ms"] / 1000))
+                if live["dec_ms"] else None)
+
+    def ttft_s():
+        med = _median(live["ttft"])
+        return round(med / 1000, 1) if med is not None else None
 
     def live_view(now_ms):
         """Return live tok/s plus phase and its timing fields."""
         if not live["available"]:
             return None, None, None, None, None
-        dq = live["dq"]
-        pruned = False
-        while dq and now_ms - dq[0][0] > 5000:
-            dq.popleft()
-            pruned = True
-        live_tok = None
-        if dq:
-            span_ms = (5000 if pruned
-                       else min(5000, max(1000, now_ms - dq[0][0])))
-            chars = sum(ch for ts, ch in dq if now_ms - ts <= span_ms)
-            if chars:
-                live_tok = int(round((chars / live["cpt"]) / (span_ms / 1000)))
+        live_tok, live["segs"] = _live_rate(live["segs"], now_ms, live["cpt"])
         tool_since = args_since = args_tool = None
         if live["args"]:
             phase = "args"
@@ -695,8 +712,8 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                    "model": model, "dir": os.path.basename(d), "started": t0,
                    "updated": time.time(), "steps": steps, "tools": tools,
                    "last": last_shown, "pid": os.getpid(), "out_tokens": out_tokens,
-                   "tok_s": tok_s(), "live_tok_s": live_tok, "phase": phase,
-                   "tool_since": tool_since, "args_tool": args_tool,
+                   "tok_s": tok_s(), "ttft_s": ttft_s(), "live_tok_s": live_tok,
+                   "phase": phase, "tool_since": tool_since, "args_tool": args_tool,
                    "args_since": args_since}
             obj.update(extra)
             try:
@@ -780,30 +797,68 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                     if ty in ("session.reasoning.delta", "session.text.delta"):
                         n = len(data.get("delta") or "")
                         if n:
-                            live["dq"].append((created, n))
+                            prev = live["last_gen_ms"]
+                            if prev is not None and created - prev <= 1000:
+                                live["segs"].append((prev, created, n))
+                            else:
+                                # New burst: no active time for its first delta.
+                                live["segs"].append((created, created, 0))
                             live["last_delta_ms"] = created
                             live["step_chars"] += n
+                        live["last_gen_ms"] = created
+                        if live["first_gen_ms"] is None:
+                            live["first_gen_ms"] = created
+                        live["last_step_gen_ms"] = created
                     elif ty == "session.step.started":
                         live["step_chars"] = 0
+                        started = data.get("started")
+                        try:
+                            live["step_start_ms"] = (int(started)
+                                                     if started is not None else created)
+                        except (TypeError, ValueError):
+                            live["step_start_ms"] = created
+                        live["first_gen_ms"] = None
+                        live["last_step_gen_ms"] = None
                     elif ty == "session.step.ended":
                         tk = data.get("tokens")
                         if not isinstance(tk, dict):
                             tk = {}
                         out_tok = int(tk.get("output") or 0) + int(tk.get("reasoning") or 0)
+                        first_gen = live["first_gen_ms"]
+                        last_gen = live["last_step_gen_ms"]
+                        step_start = live["step_start_ms"]
+                        if (out_tok > 0 and first_gen is not None
+                                and last_gen is not None and step_start is not None):
+                            span = last_gen - first_gen
+                            if span >= 100:
+                                live["dec_tokens"] += out_tok
+                                live["dec_ms"] += span
+                                live["ttft"].append(max(0, first_gen - step_start))
                         live["cal_chars"] += live["step_chars"]
                         live["cal_tokens"] += out_tok
                         live["step_chars"] = 0
                         if live["cal_tokens"] > 0:
                             cpt = live["cal_chars"] / live["cal_tokens"]
                             live["cpt"] = min(8.0, max(1.5, cpt))
+                        live["step_start_ms"] = None
+                        live["first_gen_ms"] = None
+                        live["last_step_gen_ms"] = None
                         live["tools"].clear()
                         live["args"].clear()
                     elif ty == "session.tool.input.started":
+                        live["last_gen_ms"] = created
+                        if live["first_gen_ms"] is None:
+                            live["first_gen_ms"] = created
+                        live["last_step_gen_ms"] = created
                         cid = data.get("id")
                         nm = data.get("name") or data.get("tool") or "tool"
                         if cid is not None:
                             live["args"][cid] = (created, nm)
                     elif ty == "session.tool.input.ended":
+                        live["last_gen_ms"] = created
+                        if live["first_gen_ms"] is None:
+                            live["first_gen_ms"] = created
+                        live["last_step_gen_ms"] = created
                         cid = data.get("id")
                         pending = live["args"].pop(cid, None) if cid is not None else None
                         if pending is not None:
@@ -814,12 +869,8 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                             n = len(text)
                             live["step_chars"] += n
                             if n:
-                                end_ms = max(start_ms, created)
-                                span = end_ms - start_ms
-                                for i in range(4):
-                                    live["dq"].append(
-                                        (int(start_ms + span * (i + 1) / 4.0),
-                                         n / 4.0))
+                                live["segs"].append(
+                                    (start_ms, max(start_ms, created), n))
                     elif ty == "session.tool.called":
                         inp = data.get("input")
                         if not isinstance(inp, dict):
@@ -886,16 +937,10 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             n_events += 1
             sid = ev.get("sessionID", sid)
             t, part = ev.get("type"), ev.get("part") or {}
-            ts = ev.get("timestamp")
             if t == "step_start":
                 steps += 1
-                step_window, step_tool_ms = ts, 0
                 if tools == 0:
                     last = "thinking"
-            for st in ((part.get("time") or {}).get("start"),
-                       ((part.get("state") or {}).get("time") or {}).get("start")):
-                if st is not None and (step_window is None or st < step_window):
-                    step_window = st
             if t == "text":
                 if part.get("messageID") != cur_msg:
                     cur_msg, cur_text = part.get("messageID"), []
@@ -904,9 +949,6 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             elif t in ("tool_use", "tool"):
                 tools += 1
                 nm = part.get("tool") or "tool"
-                stt = (part.get("state") or {}).get("time") or {}
-                if stt.get("start") is not None and stt.get("end") is not None:
-                    step_tool_ms += stt["end"] - stt["start"]
                 inp = (part.get("state") or {}).get("input") or {}
                 if nm == "shell":
                     detail = inp.get("command") or ""
@@ -919,11 +961,6 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                 tok["output"] += tk.get("output", 0) + tk.get("reasoning", 0)
                 tok["cache_read"] += (tk.get("cache") or {}).get("read", 0)
                 cost += part.get("cost") or 0
-                if step_window is not None and ts is not None:
-                    gen_ms = ts - step_window - step_tool_ms
-                    if gen_ms >= 200:
-                        gen_tokens += tk.get("output", 0) + tk.get("reasoning", 0)
-                        gen_ms_total += gen_ms
             elif t == "error":
                 errors.append((ev.get("error") or {}).get("message", "unknown error"))
             write_progress("running")
@@ -989,7 +1026,9 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
     secs = round(time.time() - t0)
     write_progress("error" if errors else "done", updated=time.time(), secs=secs)
     res = {"session": sid, "report": final, "errors": errors, "tokens": tok,
-           "cost": cost, "tools": tools, "secs": secs, "tok_s": tok_s()}
+           "cost": cost, "tools": tools, "secs": secs, "tok_s": tok_s(),
+           "dec_tokens": live["dec_tokens"], "dec_ms": live["dec_ms"],
+           "ttft": list(live["ttft"])}
     if soft_hit:
         if sid:
             w = run_opencode(d, WRAPUP_MSG, model, agent, session=sid, job=job,
@@ -1001,7 +1040,14 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             res["cost"] += w.get("cost", 0) or 0
             res["secs"] += w.get("secs", 0) or 0
             res["tools"] += w.get("tools", 0) or 0
-            res["tok_s"] = w.get("tok_s") or res.get("tok_s")
+            res["dec_tokens"] += w.get("dec_tokens") or 0
+            res["dec_ms"] += w.get("dec_ms") or 0
+            res["ttft"] += w.get("ttft") or []
+            res["tok_s"] = (round(res["dec_tokens"] / (res["dec_ms"] / 1000))
+                            if res["dec_ms"] else None)
+            live["dec_tokens"] = res["dec_tokens"]
+            live["dec_ms"] = res["dec_ms"]
+            live["ttft"] = list(res["ttft"])
             res["errors"] += w["errors"]
             res["session"] = w.get("session") or sid
             write_progress("error" if res["errors"] else "done",
@@ -1017,7 +1063,8 @@ def write_progress_file(job, model, **fields):
         obj = json.load(open(path))
     except (OSError, ValueError):
         obj = {"state": "running", "started": time.time(), "steps": 0, "tools": 0,
-               "out_tokens": 0, "tok_s": None, "job": job["id"], "round": job["round"],
+               "out_tokens": 0, "tok_s": None, "ttft_s": None,
+               "job": job["id"], "round": job["round"],
                "model": model, "dir": os.path.basename(job["dir"])}
     obj.update(fields)
     obj["pid"] = os.getpid()
@@ -1106,7 +1153,11 @@ def run_with_check(job, msg, session=None, files=(), budget_s=None):
     out["tokens"] = tok
     out["cost"] = sum(r.get("cost", 0) or 0 for r in results)
     out["secs"] = sum(r.get("secs", 0) or 0 for r in results)
-    out["tok_s"] = last.get("tok_s")
+    out["dec_tokens"] = sum(r.get("dec_tokens") or 0 for r in results)
+    out["dec_ms"] = sum(r.get("dec_ms") or 0 for r in results)
+    out["ttft"] = [x for r in results for x in (r.get("ttft") or [])]
+    out["tok_s"] = (round(out["dec_tokens"] / (out["dec_ms"] / 1000))
+                    if out["dec_ms"] else None)
     soft = [r["soft_deadline"] for r in results if r.get("soft_deadline")]
     if soft:
         out["soft_deadline"] = soft[0]
@@ -1114,9 +1165,11 @@ def run_with_check(job, msg, session=None, files=(), budget_s=None):
                     "output": chk["output"], "rounds": rounds}
     if skipped:
         out["check"]["budget_skipped"] = skipped
+    ttft_med = _median(out["ttft"])
     write_progress_file(job, job["model"], state="error" if last["errors"] else "done",
                         last="check: " + ("pass" if chk["pass"] else "fail"),
-                        secs=out["secs"], out_tokens=tok["output"], tok_s=out["tok_s"])
+                        secs=out["secs"], out_tokens=tok["output"], tok_s=out["tok_s"],
+                        ttft_s=(round(ttft_med / 1000, 1) if ttft_med is not None else None))
     return out
 
 
@@ -1154,6 +1207,14 @@ def load(jid):
     if not os.path.exists(p):
         die(f"no job {jid}")
     return json.load(open(p))
+
+
+def _median(vals):
+    vals = sorted(vals)
+    if not vals:
+        return None
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
 
 
 def fmt_num(n):
@@ -1215,10 +1276,13 @@ def refresh_today():
 
 def record_ledger(job, res, claude_chars):
     tk = res["tokens"]
+    ttft_med = _median(res.get("ttft") or [])
     entry = {"ts": int(time.time()), "job": job["id"], "round": job["round"],
              "dir": job["dir"], "worker_in": tk["input"],
              "worker_cache": tk["cache_read"], "worker_out": tk["output"],
              "claude_chars": claude_chars, "secs": res.get("secs"),
+             "tok_s": res.get("tok_s"),
+             "ttft_ms": (int(round(ttft_med)) if ttft_med is not None else None),
              "check": (None if not res.get("check")
                        else "pass" if res["check"]["pass"] else "fail")}
     try:
@@ -1245,6 +1309,9 @@ def emit(job, res):
             f"(cache {tk['cache_read']}) out {tk['output']}  cost ${res['cost']:.4f}")
     if res.get("tok_s") is not None:
         line += f"  gen {res['tok_s']} tok/s"
+    ttft_med = _median(res.get("ttft") or [])
+    if ttft_med is not None:
+        line += f" · first token {ttft_med / 1000:.1f}s"
     out.append(line)
     soft = res.get("soft_deadline")
     if soft:
@@ -1354,6 +1421,17 @@ def cmd_stats(a):
     print(f"worker tokens: in {fmt_num(win)} / cache {fmt_num(wca)} / out {fmt_num(wout)}")
     print(f"Claude read: {fmt_num(chars)} chars ≈ {fmt_num(claude_tok)} tokens")
     print(f"est. saved: ≈ {fmt_num(saved)} tokens")
+    speed_rows = [e for e in rows
+                  if e.get("tok_s") is not None or e.get("ttft_ms") is not None]
+    if speed_rows:
+        speeds = [e["tok_s"] for e in speed_rows if e.get("tok_s") is not None]
+        ttfts = [e["ttft_ms"] for e in speed_rows if e.get("ttft_ms") is not None]
+        parts = []
+        if speeds:
+            parts.append(f"median {int(round(_median(speeds)))} tok/s decode")
+        if ttfts:
+            parts.append(f"median {_median(ttfts) / 1000:.1f}s first token")
+        print(f"speed: {' · '.join(parts)} ({len(speed_rows)} rounds)")
     print("estimate: input-equivalent tokens Claude would have spent doing it itself (cache reads weighted 0.1×), minus what it read from ds")
 
 

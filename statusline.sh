@@ -68,10 +68,11 @@ for f in "${files[@]}"; do
                    ((.updated // 0) | floor), (.last // ""), ((.secs // 0) | floor),
                    (.tok_s // ""), ((.pid // 0) | floor), (.phase // ""),
                    (.live_tok_s // ""), ((.tool_since // 0) | floor),
-                   (.args_tool // ""), ((.args_since // 0) | floor)]
+                   (.args_tool // ""), ((.args_since // 0) | floor),
+                   (.ttft_s // "")]
                   | map(tostring) | join("\u001f")' "$f" 2>/dev/null) || continue
     [ -n "$data" ] || continue
-    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s pid phase live_tok_s tool_since args_tool args_since <<< "$data"
+    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s pid phase live_tok_s tool_since args_tool args_since ttft_s <<< "$data"
     last=${last//$'\t'/ }
     last=${last//$'\n'/ }
 
@@ -79,6 +80,11 @@ for f in "${files[@]}"; do
     case "$tok_s" in
         ''|*[!0-9]*) ;;
         *) tok_s_seg=" · ${tok_s} tok/s" ;;
+    esac
+    ttft_seg=""
+    case "$ttft_s" in
+        ''|*[!0-9.]*) ;;
+        *) ttft_seg=" · ttft ${ttft_s}s" ;;
     esac
 
     is_running=0
@@ -143,7 +149,7 @@ for f in "${files[@]}"; do
             ;;
         done)
             [ $((now - updated)) -le 120 ] || continue
-            line=$(printf '✓ DeepSeek %s done in %s%s' "$job" "$(fmt_secs "$secs")" "$tok_s_seg")
+            line=$(printf '✓ DeepSeek %s done in %s%s%s' "$job" "$(fmt_secs "$secs")" "$tok_s_seg" "$ttft_seg")
             ;;
         error)
             [ $((now - updated)) -le 120 ] || continue
