@@ -39,7 +39,7 @@ job's paths and shows them as a WARNING (config "outside_ignore", default
 [".git", "__pycache__", "media*", "*.log", "node_modules", ".venv"]).
 """
 import hashlib, json, os, signal, subprocess, sys, time, argparse, shutil, queue, threading, fcntl
-import fnmatch, tempfile, base64, collections, urllib.request
+import fnmatch, tempfile, base64, collections, urllib.request, urllib.parse
 
 HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".local/share/ds-bridge")
@@ -392,19 +392,49 @@ def mark_interrupted(jid):
         pass
 
 
-def open_event_stream():
-    """Open the local OpenCode SSE event stream, or return None if unavailable."""
+def service_auth():
+    """Return (service base url, Authorization header) from service.json, or None."""
     try:
         with open(SERVICE_JSON) as f:
             svc = json.load(f)
-        url = str(svc["url"]).rstrip("/") + "/api/event"
+        url = str(svc["url"]).rstrip("/")
         password = str(svc["password"])
         auth = base64.b64encode(f"opencode:{password}".encode()).decode()
     except (OSError, ValueError, KeyError, TypeError):
         return None
-    req = urllib.request.Request(url, headers={
+    return url, "Basic " + auth
+
+
+def interrupt_session(sid):
+    """Ask the local OpenCode service to stop a session. True on success."""
+    if not sid:
+        return False
+    got = service_auth()
+    if not got:
+        return False
+    url, auth = got
+    try:
+        req = urllib.request.Request(
+            f"{url}/api/session/{urllib.parse.quote(str(sid), safe='')}/interrupt",
+            data=b"", method="POST",
+            headers={"Authorization": auth, "Content-Type": "application/json"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=5) as resp:
+            resp.read()
+        return True
+    except Exception:
+        return False
+
+
+def open_event_stream():
+    """Open the local OpenCode SSE event stream, or return None if unavailable."""
+    got = service_auth()
+    if not got:
+        return None
+    url, auth = got
+    req = urllib.request.Request(url + "/api/event", headers={
         "Accept": "text/event-stream",
-        "Authorization": "Basic " + auth,
+        "Authorization": auth,
     })
     resp = None
     try:
@@ -424,6 +454,19 @@ def open_event_stream():
             except Exception:
                 pass
         return None
+
+
+def stderr_tail(path, limit=1000):
+    """Read at most the last `limit` characters of a file, as one line."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - limit))
+            data = f.read().decode("utf-8", "replace")
+        return " ".join(data.split())
+    except OSError:
+        return ""
 
 
 def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
@@ -514,7 +557,9 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
 
     env = dict(os.environ, PWD=d)
     # opencode follows $PWD, not the process cwd
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    stderr_file = tempfile.NamedTemporaryFile(prefix="ds-opencode-", suffix=".log",
+                                              delete=False)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr_file,
                          stdin=subprocess.DEVNULL, text=True, cwd=d, env=env,
                          start_new_session=True)
     q = queue.Queue()
@@ -657,6 +702,9 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
     live_thread = threading.Thread(target=_live_reader, daemon=True)
     live_thread.start()
     timed_out, soft_hit = False, False
+    stopped_by_ds = False
+    stderr_text = ""
+    n_events = 0
     last_tick = 0.0
     try:
         while True:
@@ -681,6 +729,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                 ev = json.loads(line)
             except ValueError:
                 continue
+            n_events += 1
             sid = ev.get("sessionID", sid)
             t, part = ev.get("type"), ev.get("part") or {}
             ts = ev.get("timestamp")
@@ -728,21 +777,32 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             p.wait()
     finally:
         if p.poll() is None:
-            try:
-                os.killpg(p.pid, signal.SIGTERM)
-            except OSError:
-                pass
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
+            stopped_by_ds = True
+            if sid:
                 try:
-                    os.killpg(p.pid, signal.SIGKILL)
+                    interrupt_session(sid)
+                except Exception:
+                    pass
+                try:
+                    p.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+            if p.poll() is None:
+                try:
+                    os.killpg(p.pid, signal.SIGTERM)
                 except OSError:
                     pass
                 try:
                     p.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    pass
+                    try:
+                        os.killpg(p.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    try:
+                        p.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
         stop_live.set()
         with progress_lock:
             resp = live["resp"]
@@ -754,8 +814,23 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
         live_thread.join(timeout=2)
         with progress_lock:
             live["available"] = False
+        try:
+            stderr_file.close()
+        except Exception:
+            pass
+        stderr_text = stderr_tail(stderr_file.name)
+        try:
+            os.remove(stderr_file.name)
+        except OSError:
+            pass
     if timed_out:
         errors.append(f"timeout after {int(limit_s)}s")
+    if (not timed_out and not soft_hit and not stopped_by_ds
+            and p.returncode not in (None, 0)):
+        reason = stderr_text[:300] if stderr_text else "no stderr"
+        errors.append(f"opencode exited {p.returncode}: {reason}")
+    if n_events == 0 and not errors:
+        errors.append("no output from opencode: " + (stderr_text[:300] or "empty stderr"))
     final = "".join(texts[-1]).strip() if texts else ""
     secs = round(time.time() - t0)
     write_progress("error" if errors else "done", updated=time.time(), secs=secs)
@@ -1220,6 +1295,7 @@ def cmd_run(a):
         res = run_with_check(job, task, files=a.f or ())
         if outside is not None:
             res["outside"] = outside_changes(outside, outside_listing(d, paths))
+        job["post"] = snapshot(d, gd, f"post r{job['round']}", job_index(jid), jid, paths)
         job["session"] = res["session"]
         save(job)
         emit(job, res)
@@ -1249,6 +1325,8 @@ def cmd_revise(a):
         res = run_with_check(job, msg, session=job["session"])
         if outside is not None:
             res["outside"] = outside_changes(outside, outside_listing(job["dir"], paths))
+        job["post"] = snapshot(job["dir"], job["shadow"], f"post r{job['round']}",
+                               job_index(job["id"]), job["id"], paths)
         save(job)
         emit(job, res)
         notify_done(job, res)
@@ -1272,33 +1350,122 @@ def cmd_approve(a):
     print(f"approved {a.job}")
 
 
+def commit_blob(gd, wt, commit, path):
+    """Blob hash of path in commit, or "absent"."""
+    out = git(gd, wt, "ls-tree", commit, "--", path).strip()
+    if not out:
+        return "absent"
+    parts = out.split("\t", 1)[0].split()
+    if len(parts) >= 3 and parts[1] in ("blob", "commit"):
+        return parts[2]
+    return "absent"
+
+
+def worktree_blob(gd, wt, path):
+    """Blob hash of the current working file, or "absent"/"unreadable"."""
+    if not os.path.lexists(os.path.join(wt, path)):
+        return "absent"
+    try:
+        r = subprocess.run(["git", f"--git-dir={gd}", f"--work-tree={wt}",
+                            "hash-object", "--", path],
+                           capture_output=True, text=True, cwd=wt)
+    except OSError:
+        return "unreadable"
+    if r.returncode:
+        return "unreadable"
+    return r.stdout.strip()
+
+
+def prune_empty_dirs(root, rel):
+    """Remove parent dirs of rel left empty, never reaching root itself."""
+    root = os.path.realpath(root)
+    parent = os.path.dirname(rel.replace(os.sep, "/"))
+    while parent and parent not in (".", ""):
+        path = os.path.realpath(os.path.join(root, parent))
+        if path == root or not path.startswith(root + os.sep):
+            break
+        try:
+            os.rmdir(path)
+        except OSError:
+            break
+        parent = os.path.dirname(parent)
+
+
 def cmd_reject(a):
     job = load(a.job)
     d, gd = job["dir"], job["shadow"]
     idx = job_index(job["id"])
     paths = job.get("paths")
-    stage_paths(gd, d, paths, idx)
-    # files created since snapshot -> remove; changed/deleted -> restore
-    diff_args = ["diff", "--cached", "--name-only", "--diff-filter=A", job["base"]]
+    if not job.get("post"):
+        print(f"ds: warning: job {a.job} has no post-run snapshot; "
+              "restoring the whole scope to the pre-job state")
+        stage_paths(gd, d, paths, idx)
+        # files created since snapshot -> remove; changed/deleted -> restore
+        diff_args = ["diff", "--cached", "--name-only", "--diff-filter=A", job["base"]]
+        if paths:
+            diff_args += ["--", *paths]
+        added = [f for f in git(gd, d, *diff_args, index=idx).split("\n") if f]
+        for f in added:
+            try:
+                os.remove(os.path.join(d, f))
+            except OSError:
+                pass
+        if paths:
+            # New paths are absent from base; check out only paths that base has.
+            base_paths = [f for f in git(gd, d, "ls-tree", "-r", "--name-only",
+                                        job["base"], "--", *paths, index=idx).split("\n") if f]
+            if base_paths:
+                git(gd, d, "checkout", job["base"], "--", *base_paths, index=idx)
+        else:
+            git(gd, d, "checkout", job["base"], "--", ".", index=idx)
+        job["status"] = "rejected"
+        save(job)
+        print(f"rejected {a.job}: restored {d} to pre-job state ({len(added)} new files removed)")
+        return
+
+    post = job["post"]
+    diff_args = ["diff", "--name-status", "--no-renames", job["base"], post]
     if paths:
         diff_args += ["--", *paths]
-    added = [f for f in git(gd, d, *diff_args, index=idx).split("\n") if f]
-    for f in added:
-        try:
-            os.remove(os.path.join(d, f))
-        except OSError:
-            pass
-    if paths:
-        # New paths are absent from base; check out only paths that base has.
-        base_paths = [f for f in git(gd, d, "ls-tree", "-r", "--name-only",
-                                    job["base"], "--", *paths, index=idx).split("\n") if f]
-        if base_paths:
-            git(gd, d, "checkout", job["base"], "--", *base_paths, index=idx)
-    else:
-        git(gd, d, "checkout", job["base"], "--", ".", index=idx)
+    files = []
+    for line in git(gd, d, *diff_args).splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[-1].strip():
+            files.append(parts[-1].strip())
+
+    restore, skipped = [], []
+    for f in files:
+        if worktree_blob(gd, d, f) == commit_blob(gd, d, post, f):
+            restore.append(f)
+        else:
+            skipped.append(f)
+    force = bool(getattr(a, "force", False))
+    if force:
+        restore += skipped
+        skipped = []
+
+    restored, removed = 0, []
+    for f in restore:
+        if commit_blob(gd, d, job["base"], f) == "absent":
+            try:
+                os.remove(os.path.join(d, f))
+                removed.append(f)
+            except OSError:
+                pass
+        else:
+            git(gd, d, "checkout", job["base"], "--", f, index=idx)
+            restored += 1
+    for f in removed:
+        prune_empty_dirs(d, f)
+
     job["status"] = "rejected"
     save(job)
-    print(f"rejected {a.job}: restored {d} to pre-job state ({len(added)} new files removed)")
+    print(f"rejected {a.job}: restored {restored}, removed {len(removed)} new files")
+    if skipped:
+        names = ", ".join(skipped[:10])
+        if len(skipped) > 10:
+            names += " …"
+        print(f"skipped {len(skipped)} changed after the job (use --force): {names}")
 
 
 def cmd_list(a):
@@ -1328,8 +1495,9 @@ def main():
     r.add_argument("--check"); r.set_defaults(fn=cmd_revise)
     r = s.add_parser("diff"); r.add_argument("job"); r.add_argument("--full", action="store_true")
     r.add_argument("paths", nargs="*"); r.set_defaults(fn=cmd_diff)
-    for n, f in [("approve", cmd_approve), ("reject", cmd_reject)]:
-        r = s.add_parser(n); r.add_argument("job"); r.set_defaults(fn=f)
+    r = s.add_parser("approve"); r.add_argument("job"); r.set_defaults(fn=cmd_approve)
+    r = s.add_parser("reject"); r.add_argument("job")
+    r.add_argument("--force", action="store_true"); r.set_defaults(fn=cmd_reject)
     s.add_parser("list").set_defaults(fn=cmd_list)
     r = s.add_parser("stats"); r.add_argument("--days", type=int)
     r.add_argument("--all", action="store_true"); r.set_defaults(fn=cmd_stats)

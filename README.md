@@ -116,7 +116,7 @@ While a job runs, ds also reads the OpenCode service's event stream (`~/.local/s
 | `ds revise JOB "<points>"` | Send numbered feedback in the same session; shows only this round's diff. |
 | `ds diff JOB [PATH…]` | Re-show the diff, optionally `--full` or for specific paths. |
 | `ds approve JOB` | Mark the job accepted; the changes stay in place. |
-| `ds reject JOB` | Restore the project to the pre-job snapshot, removing files the worker created. |
+| `ds reject JOB [--force]` | Undo only the job's own file changes; files changed since the job are skipped unless `--force`. |
 | `ds list` | List recent jobs with status and round. |
 | `ds stats [--days N \| --all]` | Summarise the ledger: jobs, rounds, worker tokens, Claude's reads and estimated savings. |
 | `ds log JOB [--tools-only]` | Print a readable transcript of the job's OpenCode session. |
@@ -129,7 +129,11 @@ Flags: `-C DIR` sets the project directory (`run` and `init`), `-m MODEL` overri
 
 ### Soft deadline
 
-A worker call that passes `soft_timeout_frac × timeout_s` (default `0.8`, so 24 minutes of a 30-minute run) is stopped and the same session is asked for its final report, including anything unfinished. That wrap-up call has its own limit, `wrapup_s` (default `180`). The `--check` still runs afterwards, and the report starts with `SOFT DEADLINE HIT`. This applies to `ds run`, `ds init` and `ds revise`, including auto-fix rounds.
+A worker call that passes `soft_timeout_frac × timeout_s` (default `0.8`, so 24 minutes of a 30-minute run) is stopped and the same session is asked for its final report, including anything unfinished. That wrap-up call has its own limit, `wrapup_s` (default `180`). The `--check` still runs afterwards, and the report starts with `SOFT DEADLINE HIT`. This applies to `ds run`, `ds init` and `ds revise`, including auto-fix rounds. Both the hard timeout and the soft deadline interrupt the session through the OpenCode service, not just the `opencode run` client, so the worker stops running tools; the wrap-up call then reaches an idle session.
+
+### `ds reject` and `--force`
+
+`ds reject JOB` restores only the files that the job itself changed. It compares the current working tree with the job's end-of-round snapshot: unchanged-since-then files go back to the pre-job state, while files edited afterwards (or by a later approved job) are left alone and listed as skipped. `ds reject JOB --force` restores those too. Directories left empty by removing files the job added are deleted, stopping at the project root. Jobs created before end-of-round snapshots existed still restore the whole scope, after a warning.
 
 ### `--paths` and parallel jobs
 
@@ -197,7 +201,7 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 
 ## Safety
 
-The worker's `bash` permission denies `git commit`, `git push`, `git reset`, `git checkout` and `sudo`. `ds` refuses to run in `$HOME` or `/`. Snapshots live outside your repository in `~/.local/share/ds-bridge/shadow`, so your own `.git` is never touched. Media and big files, `node_modules/`, virtualenvs, build output and caches are excluded. `ds reject` restores the pre-job state.
+The worker's `bash` permission denies `git commit`, `git push`, `git reset`, `git checkout` and `sudo`. `ds` refuses to run in `$HOME` or `/`. Snapshots live outside your repository in `~/.local/share/ds-bridge/shadow`, so your own `.git` is never touched. Media and big files, `node_modules/`, virtualenvs, build output and caches are excluded. `ds reject` restores only the job's own changes; use `--force` for files changed after the job.
 
 ## Limitations
 
