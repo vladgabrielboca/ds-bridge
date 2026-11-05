@@ -94,8 +94,9 @@ flowchart LR
 Claude Code's status line can poll ds-bridge once a second (`refreshInterval: 1`) and render the worker's current step:
 
 ```
-⠴ DeepSeek 1104-152450 r1 · 0:05 · step 2 · 4 tools · 144 tok · 152 tok/s · ▸ read notes.txt
-⠙ DeepSeek 1104-152510 r1 · 0:02 · step 1 · 1 tool · 18 tok · ▸ rg "def main"
+⠴ DeepSeek 1104-152450 r1 · 0:05 · step 2 · 4 tools · 144 tok · ▶ 162 tok/s · ▸ read notes.txt
+⠙ DeepSeek 1104-152510 r1 · 0:02 · step 1 · 1 tool · 18 tok · ⏸ 6s · ▸ bash sleep 6
+⠹ DeepSeek 1104-152510 r1 · 0:04 · step 1 · 1 tool · 18 tok · … waiting · ▸ bash sleep 6
 ✓ DeepSeek 1104-152450 done in 0:11
 DeepSeek idle · 4 jobs today · ≈38k tok saved
 ```
@@ -104,7 +105,7 @@ Each active job gets its own line, up to four; when nothing is running the line 
 
 There is no percentage. An agent can't know its step count in advance, so the line shows elapsed time, the step reached so far, and the last tool call instead of inventing a progress bar.
 
-tok/s is the model's generation speed averaged over finished steps, with tool run time excluded; it appears after the first step completes.
+While a job runs, ds also reads the OpenCode service's event stream (`~/.local/state/opencode/service.json`). The status line shows the live generation rate (`▶ N tok/s`) while the model writes, `✎ tool Ns` while tool arguments are being generated, an elapsed tool timer (`⏸ Ns`) while a tool runs, and `… waiting` during model latency. The live rate uses generated text from the last five seconds, calibrated against completed steps; if the stream is unavailable it falls back to the average for finished steps, with tool run time excluded.
 
 ## Commands
 

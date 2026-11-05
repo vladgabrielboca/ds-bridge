@@ -39,7 +39,7 @@ job's paths and shows them as a WARNING (config "outside_ignore", default
 [".git", "__pycache__", "media*", "*.log", "node_modules", ".venv"]).
 """
 import hashlib, json, os, signal, subprocess, sys, time, argparse, shutil, queue, threading, fcntl
-import fnmatch, tempfile
+import fnmatch, tempfile, base64, collections, urllib.request
 
 HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".local/share/ds-bridge")
@@ -50,6 +50,7 @@ RUNNING = os.path.join(STATE, "running")
 LEDGER = os.path.join(STATE, "ledger.jsonl")
 TODAY = os.path.join(STATE, "today.json")
 CONF = os.path.join(HOME, ".config/ds-bridge/config.json")
+SERVICE_JSON = os.path.join(HOME, ".local/state/opencode/service.json")
 DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
             "max_diff_lines": 250, "max_report_chars": 1500, "timeout_s": 1800,
             "soft_timeout_frac": 0.8, "wrapup_s": 180,
@@ -391,6 +392,40 @@ def mark_interrupted(jid):
         pass
 
 
+def open_event_stream():
+    """Open the local OpenCode SSE event stream, or return None if unavailable."""
+    try:
+        with open(SERVICE_JSON) as f:
+            svc = json.load(f)
+        url = str(svc["url"]).rstrip("/") + "/api/event"
+        password = str(svc["password"])
+        auth = base64.b64encode(f"opencode:{password}".encode()).decode()
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    req = urllib.request.Request(url, headers={
+        "Accept": "text/event-stream",
+        "Authorization": "Basic " + auth,
+    })
+    resp = None
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        resp = opener.open(req, timeout=3)
+        # urllib's timeout also applies to reads; the connection is up now,
+        # so clear it to make the consumer's readline() truly blocking.
+        try:
+            resp.fp.raw._sock.settimeout(None)
+        except (AttributeError, OSError):
+            pass
+        return resp
+    except Exception:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        return None
+
+
 def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                  limit_s=None, wrapup=False):
     c = cfg()
@@ -414,25 +449,68 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
     cur_msg, cur_text = None, []
     gen_tokens, gen_ms_total = 0, 0
     step_window, step_tool_ms = None, 0
+    live = {"available": False, "resp": None, "dq": collections.deque(),
+            "cpt": 3.5, "cal_chars": 0, "cal_tokens": 0, "step_chars": 0,
+            "last_delta_ms": None, "tools": {}, "args": {}}
+    progress_lock = threading.Lock()
 
     def tok_s():
         return round(gen_tokens / (gen_ms_total / 1000)) if gen_ms_total else None
 
+    def live_view(now_ms):
+        """Return live tok/s plus phase and its timing fields."""
+        if not live["available"]:
+            return None, None, None, None, None
+        dq = live["dq"]
+        pruned = False
+        while dq and now_ms - dq[0][0] > 5000:
+            dq.popleft()
+            pruned = True
+        live_tok = None
+        if dq:
+            span_ms = (5000 if pruned
+                       else min(5000, max(1000, now_ms - dq[0][0])))
+            chars = sum(ch for ts, ch in dq if now_ms - ts <= span_ms)
+            if chars:
+                live_tok = int(round((chars / live["cpt"]) / (span_ms / 1000)))
+        tool_since = args_since = args_tool = None
+        if live["args"]:
+            phase = "args"
+            args_since = int(min(v[0] for v in live["args"].values()) // 1000)
+            args_tool = max(live["args"].values(), key=lambda v: v[0])[1]
+        elif live["tools"]:
+            phase = "tool"
+            tool_since = int(min(v[0] for v in live["tools"].values()) // 1000)
+        elif (live["last_delta_ms"] is not None
+              and now_ms - live["last_delta_ms"] <= 2000):
+            phase = "writing"
+        else:
+            phase = "waiting"
+        return live_tok, phase, tool_since, args_tool, args_since
+
     def write_progress(state, **extra):
-        obj = {"state": state, "job": job["id"], "round": job["round"], "model": model,
-               "dir": os.path.basename(d), "started": t0, "updated": time.time(),
-               "steps": steps, "tools": tools, "last": last, "pid": os.getpid(),
-               "out_tokens": tok["output"], "tok_s": tok_s()}
-        obj.update(extra)
-        try:
-            os.makedirs(PROGRESS, exist_ok=True)
-            path = os.path.join(PROGRESS, job["id"] + ".json")
-            tmp = path + f".tmp.{os.getpid()}"
-            with open(tmp, "w") as f:
-                json.dump(obj, f)
-            os.replace(tmp, path)
-        except OSError:
-            pass
+        with progress_lock:
+            now_ms = int(time.time() * 1000)
+            live_tok, phase, tool_since, args_tool, args_since = live_view(now_ms)
+            last_shown = (max(live["tools"].values(), key=lambda v: v[0])[1]
+                          if live["available"] and live["tools"] else last)
+            obj = {"state": state, "job": job["id"], "round": job["round"],
+                   "model": model, "dir": os.path.basename(d), "started": t0,
+                   "updated": time.time(), "steps": steps, "tools": tools,
+                   "last": last_shown, "pid": os.getpid(), "out_tokens": tok["output"],
+                   "tok_s": tok_s(), "live_tok_s": live_tok, "phase": phase,
+                   "tool_since": tool_since, "args_tool": args_tool,
+                   "args_since": args_since}
+            obj.update(extra)
+            try:
+                os.makedirs(PROGRESS, exist_ok=True)
+                path = os.path.join(PROGRESS, job["id"] + ".json")
+                tmp = path + f".tmp.{os.getpid()}"
+                with open(tmp, "w") as f:
+                    json.dump(obj, f)
+                os.replace(tmp, path)
+            except OSError:
+                pass
 
     env = dict(os.environ, PWD=d)
     # opencode follows $PWD, not the process cwd
@@ -449,7 +527,137 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             q.put(None)
 
     threading.Thread(target=_reader, daemon=True).start()
+
+    stop_live = threading.Event()
+
+    def _live_reader():
+        nonlocal last
+        resp = open_event_stream()
+        if resp is None:
+            return
+        if stop_live.is_set():
+            try:
+                resp.close()
+            except Exception:
+                pass
+            return
+        with progress_lock:
+            live["resp"] = resp
+            live["available"] = True
+        last_write = 0.0
+        try:
+            while not stop_live.is_set():
+                try:
+                    line = resp.readline()
+                except Exception:
+                    break
+                if not line or stop_live.is_set():
+                    break
+                s = sid
+                # Cheap pre-filter: most events belong to other sessions.
+                if not s or s.encode() not in line:
+                    continue
+                try:
+                    text = line.decode("utf-8", "replace")
+                except Exception:
+                    continue
+                if not text.startswith("data:"):
+                    continue
+                try:
+                    ev = json.loads(text[5:].strip())
+                except ValueError:
+                    continue
+                data = ev.get("data") or {}
+                if data.get("sessionID") != s:
+                    continue
+                now_ms = int(time.time() * 1000)
+                created = ev.get("created")
+                try:
+                    created = int(created) if created is not None else now_ms
+                except (TypeError, ValueError):
+                    created = now_ms
+                ty = ev.get("type")
+                with progress_lock:
+                    if ty in ("session.reasoning.delta", "session.text.delta"):
+                        n = len(data.get("delta") or "")
+                        if n:
+                            live["dq"].append((created, n))
+                            live["last_delta_ms"] = created
+                            live["step_chars"] += n
+                    elif ty == "session.step.started":
+                        live["step_chars"] = 0
+                    elif ty == "session.step.ended":
+                        tk = data.get("tokens")
+                        if not isinstance(tk, dict):
+                            tk = {}
+                        out_tok = int(tk.get("output") or 0) + int(tk.get("reasoning") or 0)
+                        live["cal_chars"] += live["step_chars"]
+                        live["cal_tokens"] += out_tok
+                        live["step_chars"] = 0
+                        if live["cal_tokens"] > 0:
+                            cpt = live["cal_chars"] / live["cal_tokens"]
+                            live["cpt"] = min(8.0, max(1.5, cpt))
+                        live["tools"].clear()
+                        live["args"].clear()
+                    elif ty == "session.tool.input.started":
+                        cid = data.get("id")
+                        nm = data.get("name") or data.get("tool") or "tool"
+                        if cid is not None:
+                            live["args"][cid] = (created, nm)
+                    elif ty == "session.tool.input.ended":
+                        cid = data.get("id")
+                        pending = live["args"].pop(cid, None) if cid is not None else None
+                        if pending is not None:
+                            start_ms = pending[0]
+                            text = data.get("text")
+                            if not isinstance(text, str):
+                                text = "" if text is None else str(text)
+                            n = len(text)
+                            live["step_chars"] += n
+                            if n:
+                                end_ms = max(start_ms, created)
+                                span = end_ms - start_ms
+                                for i in range(4):
+                                    live["dq"].append(
+                                        (int(start_ms + span * (i + 1) / 4.0),
+                                         n / 4.0))
+                    elif ty == "session.tool.called":
+                        inp = data.get("input")
+                        if not isinstance(inp, dict):
+                            inp = {}
+                        nm = data.get("tool") or data.get("name") or "tool"
+                        detail = (inp.get("command") or inp.get("path")
+                                  or inp.get("filePath") or inp.get("pattern") or "")
+                        if not isinstance(detail, str):
+                            detail = str(detail)
+                        label = " ".join(f"{nm} {detail}".split())[:60] or "tool"
+                        cid = data.get("id") or f"call-{created}"
+                        live["tools"][cid] = (created, label)
+                        last = label
+                    elif ty in ("session.tool.success", "session.tool.error",
+                                "session.tool.failed"):
+                        cid = data.get("id")
+                        if cid is not None:
+                            live["tools"].pop(cid, None)
+                if stop_live.is_set():
+                    break
+                now = time.time()
+                if now - last_write >= 1:
+                    write_progress("running")
+                    last_write = now
+        finally:
+            with progress_lock:
+                live["available"] = False
+                live["resp"] = None
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    live_thread = threading.Thread(target=_live_reader, daemon=True)
+    live_thread.start()
     timed_out, soft_hit = False, False
+    last_tick = 0.0
     try:
         while True:
             elapsed = time.time() - t0
@@ -462,6 +670,10 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             try:
                 line = q.get(timeout=0.5)
             except queue.Empty:
+                now = time.time()
+                if now - last_tick >= 1:
+                    write_progress("running")
+                    last_tick = now
                 continue
             if line is None:
                 break
@@ -531,6 +743,17 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                     p.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
+        stop_live.set()
+        with progress_lock:
+            resp = live["resp"]
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        live_thread.join(timeout=2)
+        with progress_lock:
+            live["available"] = False
     if timed_out:
         errors.append(f"timeout after {int(limit_s)}s")
     final = "".join(texts[-1]).strip() if texts else ""

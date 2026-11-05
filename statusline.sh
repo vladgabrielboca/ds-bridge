@@ -66,10 +66,12 @@ for f in "${files[@]}"; do
     data=$(jq -r '[(.state // ""), (.job // ""), (.round // 0), (.steps // 0),
                    (.tools // 0), (.out_tokens // 0), ((.started // 0) | floor),
                    ((.updated // 0) | floor), (.last // ""), ((.secs // 0) | floor),
-                   (.tok_s // ""), ((.pid // 0) | floor)]
+                   (.tok_s // ""), ((.pid // 0) | floor), (.phase // ""),
+                   (.live_tok_s // ""), ((.tool_since // 0) | floor),
+                   (.args_tool // ""), ((.args_since // 0) | floor)]
                   | map(tostring) | join("\u001f")' "$f" 2>/dev/null) || continue
     [ -n "$data" ] || continue
-    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s pid <<< "$data"
+    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s pid phase live_tok_s tool_since args_tool args_since <<< "$data"
     last=${last//$'\t'/ }
     last=${last//$'\n'/ }
 
@@ -95,6 +97,37 @@ for f in "${files[@]}"; do
                 [ "$age" -le 120 ] || continue
                 line=$(printf '✗ DeepSeek %s interrupted' "$job")
             else
+                live_seg="$tok_s_seg"
+                case "$phase" in
+                    args)
+                        args_name=${args_tool:-tool}
+                        if [ "$args_since" -gt 0 ] 2>/dev/null; then
+                            elapsed=$((now - args_since))
+                            [ "$elapsed" -lt 0 ] && elapsed=0
+                            live_seg=" · ✎ ${args_name} ${elapsed}s"
+                        else
+                            live_seg=" · ✎ ${args_name}"
+                        fi
+                        ;;
+                    tool)
+                        if [ "$tool_since" -gt 0 ] 2>/dev/null; then
+                            elapsed=$((now - tool_since))
+                            [ "$elapsed" -lt 0 ] && elapsed=0
+                            live_seg=" · ⏸ ${elapsed}s"
+                        else
+                            live_seg=" · ⏸"
+                        fi
+                        ;;
+                    writing)
+                        case "$live_tok_s" in
+                            ''|*[!0-9]*) live_seg="$tok_s_seg" ;;
+                            *) live_seg=" · ▶ ${live_tok_s} tok/s" ;;
+                        esac
+                        ;;
+                    waiting)
+                        live_seg=" · … waiting"
+                        ;;
+                esac
                 if [ "$age" -gt 1800 ]; then
                     line=$(printf 'DeepSeek %s stalled?' "$job")
                 else
@@ -102,7 +135,7 @@ for f in "${files[@]}"; do
                     sp=${spinners[$((now % 10))]}
                     line=$(printf '%s DeepSeek %s r%s · %s · step %s · %s tools · %s tok%s · ▸ %s' \
                         "$sp" "$job" "$round" "$(fmt_secs $((now - started)))" \
-                        "$steps" "$tools" "$(fmt_tok "$out_tokens")" "$tok_s_seg" "$last")
+                        "$steps" "$tools" "$(fmt_tok "$out_tokens")" "$live_seg" "$last")
                 fi
                 is_running=1
                 running=$((running + 1))
