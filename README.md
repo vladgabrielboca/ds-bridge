@@ -126,9 +126,15 @@ Flags: `-C DIR` sets the project directory (`run` and `init`), `-m MODEL` overri
 
 `ds run -C <dir> --check "pytest -q" "<task>"` runs CMD with `bash -c` in the project after the worker's first answer. If it exits non-zero (or hits `check_timeout_s`), the bridge sends the last 60 lines of output back into the same session and asks for a fix, then runs the check again, at most `fix_tries` times. The report gets a `--- check` section with PASS/FAIL and the number of auto-fix rounds, and the diff includes every change from those rounds.
 
+### Soft deadline
+
+A worker call that passes `soft_timeout_frac × timeout_s` (default `0.8`, so 24 minutes of a 30-minute run) is stopped and the same session is asked for its final report, including anything unfinished. That wrap-up call has its own limit, `wrapup_s` (default `180`). The `--check` still runs afterwards, and the report starts with `SOFT DEADLINE HIT`. This applies to `ds run`, `ds init` and `ds revise`, including auto-fix rounds.
+
 ### `--paths` and parallel jobs
 
 `--paths P…` limits the snapshot, diff and reject scope to those paths relative to `-C`. Independent subtasks can run in parallel: start several `ds run ... --paths <their files>` calls in the background, then review each report as it arrives. Jobs whose paths overlap a running job in the same project are refused. `ds revise` keeps the job's original scope.
+
+With `--paths`, the bridge also records a cheap path/size/mtime listing of the whole project before the run and compares it afterwards. Files outside the job's paths that were created, changed or deleted appear in a `--- WARNING: changes outside --paths` section (up to 20 lines). Paths matching `outside_ignore` are skipped. Nothing is recorded or printed when `--paths` is not used.
 
 ### `ds init` and AGENTS.md
 
@@ -177,12 +183,15 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `max_diff_lines` | `250` | Lines of diff shown to Claude before truncation. |
 | `max_report_chars` | `1500` | Cap on the worker's report (about 150 words). |
 | `timeout_s` | `1800` | Per-run timeout. |
+| `soft_timeout_frac` | `0.8` | Fraction of `timeout_s` after which the worker is stopped and asked to wrap up. |
+| `wrapup_s` | `180` | Time limit for the wrap-up call that writes the final report. |
 | `max_files` | `20000` | Refuse to snapshot directories with more tracked files. |
 | `big_file_mb` | `5` | Files larger than this are excluded from snapshots. |
 | `fix_tries` | `2` | Auto-fix rounds after a failed `--check` (override per job with `--fix-tries`). |
 | `check_timeout_s` | `600` | Timeout for one `--check` command. |
 | `notify` | `true` | Send a desktop notification when a run or revise finishes. |
 | `notify_min_s` | `15` | Don't notify for jobs shorter than this many seconds. |
+| `outside_ignore` | `[".git", "__pycache__", "media*", "*.log", "node_modules", ".venv"]` | Globs ignored by the `--paths` outside-change warning. |
 | `guard_allow` | `[]` | Globs of paths the guard hook always allows (for example `~/work/sandbox/*`). |
 
 ## Safety

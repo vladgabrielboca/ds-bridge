@@ -30,8 +30,16 @@ asked to fix the cause in the same session and the check is re-run, at most
 fix_tries times (config "fix_tries", default 2; override with --fix-tries).
 The job report shows PASS/FAIL, and the diff includes any auto-fix changes.
 revise reuses the stored check unless --check replaces it.
+
+A run that reaches soft_timeout_frac * timeout_s (config "soft_timeout_frac",
+default 0.8) is stopped early; the same session is asked for a final report with
+its own time limit (config "wrapup_s", default 180), and the report says the
+soft deadline was hit. With --paths, the bridge also lists changes outside the
+job's paths and shows them as a WARNING (config "outside_ignore", default
+[".git", "__pycache__", "media*", "*.log", "node_modules", ".venv"]).
 """
 import hashlib, json, os, signal, subprocess, sys, time, argparse, shutil, queue, threading, fcntl
+import fnmatch, tempfile
 
 HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".local/share/ds-bridge")
@@ -44,9 +52,12 @@ TODAY = os.path.join(STATE, "today.json")
 CONF = os.path.join(HOME, ".config/ds-bridge/config.json")
 DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
             "max_diff_lines": 250, "max_report_chars": 1500, "timeout_s": 1800,
+            "soft_timeout_frac": 0.8, "wrapup_s": 180,
             "max_files": 20000, "big_file_mb": 5,
             "fix_tries": 2, "check_timeout_s": 600,
-            "notify": True, "notify_min_s": 15}
+            "notify": True, "notify_min_s": 15,
+            "outside_ignore": [".git", "__pycache__", "media*", "*.log",
+                               "node_modules", ".venv"]}
 EXCLUDES = ["node_modules/", ".venv/", "venv/", "__pycache__/", ".git/", "*.pyc",
             "media/", "*.mp4", "*.mkv", "*.mov", "*.wav", "*.mp3", "*.flac",
             "*.safetensors", "*.bin", "*.pt", "*.pth", "*.ckpt", "*.gguf", "*.onnx",
@@ -68,6 +79,10 @@ INIT_REFRESH = (
     "build, test, lint, run; code conventions you can see (language version, "
     "formatter, naming, test style); things not to touch (generated files, "
     "vendored code, large media). Facts only, no guesses; omit a section if unknown.")
+WRAPUP_MSG = (
+    "SOFT DEADLINE: stop working now and do not start anything new. Write your "
+    "final report in the usual block (STATUS / SUMMARY / CHECKS / NOTES) "
+    "immediately, including what is unfinished and anything not yet verified.")
 
 
 def cfg():
@@ -181,6 +196,62 @@ def norm_paths(paths):
         if q not in out:
             out.append(q)
     return out
+
+
+def outside_ignored(rel, ignores):
+    parts = rel.split("/")
+    for pat in ignores:
+        if fnmatch.fnmatch(rel, pat):
+            return True
+        if any(fnmatch.fnmatch(p, pat) for p in parts):
+            return True
+    return False
+
+
+def under_paths(rel, paths):
+    for p in paths:
+        p = p.rstrip("/")
+        if rel == p or rel.startswith(p + "/"):
+            return True
+    return False
+
+
+def outside_listing(d, paths):
+    """Cheap (size, mtime) listing of files outside the job's --paths."""
+    ignores = cfg().get("outside_ignore") or []
+    out = {}
+    for root, dirs, names in os.walk(d):
+        rel_root = os.path.relpath(root, d)
+        dirs[:] = [x for x in dirs
+                   if not outside_ignored((x if rel_root == "." else rel_root + "/" + x),
+                                          ignores)]
+        for name in names:
+            rel = name if rel_root == "." else rel_root + "/" + name
+            rel = rel.replace(os.sep, "/")
+            if under_paths(rel, paths) or outside_ignored(rel, ignores):
+                continue
+            try:
+                st = os.stat(os.path.join(root, name))
+            except OSError:
+                continue
+            out[rel] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def outside_changes(before, after):
+    """Return capped lines for files created, changed or deleted outside --paths."""
+    lines = []
+    for rel in sorted(after):
+        if rel not in before:
+            lines.append(f"created {rel}")
+        elif before[rel] != after[rel]:
+            lines.append(f"changed {rel}")
+    for rel in sorted(before):
+        if rel not in after:
+            lines.append(f"deleted {rel}")
+    if len(lines) > 20:
+        lines = lines[:19] + [f"… {len(lines) - 19} more"]
+    return lines
 
 
 def pid_alive(pid):
@@ -319,8 +390,15 @@ def mark_interrupted(jid):
         pass
 
 
-def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
+def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
+                 limit_s=None, wrapup=False):
     c = cfg()
+    limit_s = limit_s if limit_s is not None else c["timeout_s"]
+    try:
+        frac = float(c.get("soft_timeout_frac", 0.8))
+    except (TypeError, ValueError):
+        frac = 0.8
+    soft_s = None if wrapup else limit_s * frac
     cmd = ["opencode", "run", "--format", "json", "--auto", "--agent", agent, "-m", model]
     if session:
         cmd += ["-s", session]
@@ -368,11 +446,15 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
             q.put(None)
 
     threading.Thread(target=_reader, daemon=True).start()
-    timed_out = False
+    timed_out, soft_hit = False, False
     try:
         while True:
-            if time.time() - t0 > c["timeout_s"]:
+            elapsed = time.time() - t0
+            if elapsed > limit_s:
                 timed_out = True
+                break
+            if soft_s is not None and soft_s < limit_s and elapsed > soft_s:
+                soft_hit = True
                 break
             try:
                 line = q.get(timeout=0.5)
@@ -427,7 +509,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
             elif t == "error":
                 errors.append((ev.get("error") or {}).get("message", "unknown error"))
             write_progress("running")
-        if not timed_out:
+        if not timed_out and not soft_hit:
             p.wait()
     finally:
         if p.poll() is None:
@@ -447,12 +529,31 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None):
                 except subprocess.TimeoutExpired:
                     pass
     if timed_out:
-        errors.append(f"timeout after {int(c['timeout_s'])}s")
+        errors.append(f"timeout after {int(limit_s)}s")
     final = "".join(texts[-1]).strip() if texts else ""
     secs = round(time.time() - t0)
     write_progress("error" if errors else "done", updated=time.time(), secs=secs)
-    return {"session": sid, "report": final, "errors": errors, "tokens": tok,
-            "cost": cost, "tools": tools, "secs": secs, "tok_s": tok_s()}
+    res = {"session": sid, "report": final, "errors": errors, "tokens": tok,
+           "cost": cost, "tools": tools, "secs": secs, "tok_s": tok_s()}
+    if soft_hit:
+        if sid:
+            w = run_opencode(d, WRAPUP_MSG, model, agent, session=sid, job=job,
+                             limit_s=c["wrapup_s"], wrapup=True)
+            res["soft_deadline"] = {"at": secs, "limit_s": int(limit_s), "frac": frac}
+            res["report"] = w["report"] or final
+            for k in ("input", "output", "cache_read"):
+                res["tokens"][k] += w["tokens"].get(k, 0)
+            res["cost"] += w.get("cost", 0) or 0
+            res["secs"] += w.get("secs", 0) or 0
+            res["tools"] += w.get("tools", 0) or 0
+            res["tok_s"] = w.get("tok_s") or res.get("tok_s")
+            res["errors"] += w["errors"]
+            res["session"] = w.get("session") or sid
+            write_progress("error" if res["errors"] else "done",
+                           updated=time.time(), secs=res["secs"])
+        else:
+            res["errors"].append(f"soft deadline after {int(secs)}s (no session to wrap up)")
+    return res
 
 
 def write_progress_file(job, model, **fields):
@@ -532,6 +633,9 @@ def run_with_check(job, msg, session=None, files=()):
     out["cost"] = sum(r.get("cost", 0) or 0 for r in results)
     out["secs"] = sum(r.get("secs", 0) or 0 for r in results)
     out["tok_s"] = last.get("tok_s")
+    soft = [r["soft_deadline"] for r in results if r.get("soft_deadline")]
+    if soft:
+        out["soft_deadline"] = soft[0]
     out["check"] = {"cmd": check, "pass": chk["pass"], "code": chk["code"],
                     "output": chk["output"], "rounds": rounds}
     write_progress_file(job, job["model"], state="error" if last["errors"] else "done",
@@ -662,6 +766,10 @@ def emit(job, res):
     if res.get("tok_s") is not None:
         line += f"  gen {res['tok_s']} tok/s"
     out.append(line)
+    soft = res.get("soft_deadline")
+    if soft:
+        out.append(f"SOFT DEADLINE HIT: worker stopped at {soft['at']}s "
+                   f"({soft['frac']:g} × {soft['limit_s']}s) and was asked to wrap up.")
     if res["errors"]:
         out.append("ERRORS: " + " | ".join(e[:300] for e in res["errors"]))
     out.append("--- report")
@@ -677,6 +785,9 @@ def emit(job, res):
                        f"after {chk['rounds']} auto-fix rounds")
             if chk["output"]:
                 out.append("\n".join(chk["output"].splitlines()[-30:]))
+    if res.get("outside"):
+        out.append("--- WARNING: changes outside --paths")
+        out.extend(res["outside"])
     if rb:
         out.append(f"--- this round only (cumulative: ds diff {job['id']})")
     out.append("--- diff stat")
@@ -788,17 +899,33 @@ def cmd_log(a):
     sid = job.get("session")
     if not sid:
         die(f"job {a.job} has no session to export")
-    r = subprocess.run(["opencode", "session", "export", sid],
-                       capture_output=True, text=True)
-    if r.returncode:
-        msg = (r.stderr or "").strip() or (r.stdout or "").strip() or "session export failed"
-        print(msg, file=sys.stderr)
-        sys.exit(1)
+    # opencode truncates a piped export at 320 KiB; a file redirect is complete.
+    fd, tmp = tempfile.mkstemp(prefix="ds-export-", suffix=".json")
     try:
-        data = json.loads(r.stdout)
-    except ValueError as e:
-        print(f"ds: could not parse session export: {e}", file=sys.stderr)
-        sys.exit(1)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            r = subprocess.run(["opencode", "session", "export", sid],
+                               stdout=out, stderr=subprocess.PIPE, text=True)
+        if r.returncode:
+            msg = (r.stderr or "").strip()
+            if not msg:
+                try:
+                    with open(tmp, encoding="utf-8") as f:
+                        msg = f.read().strip()[:500]
+                except OSError:
+                    pass
+            print(msg or "session export failed", file=sys.stderr)
+            sys.exit(1)
+        try:
+            with open(tmp, encoding="utf-8") as f:
+                data = json.load(f)
+        except ValueError as e:
+            print(f"ds: could not parse session export: {e}", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     for m in data.get("messages") or []:
         t = m.get("type")
         if t == "user":
@@ -862,7 +989,10 @@ def cmd_run(a):
                "paths": paths, "task": task[:2000], "check": a.check,
                "fix_tries": a.fix_tries if a.fix_tries is not None else c["fix_tries"]}
         save(job)
+        outside = outside_listing(d, paths) if paths else None
         res = run_with_check(job, task, files=a.f or ())
+        if outside is not None:
+            res["outside"] = outside_changes(outside, outside_listing(d, paths))
         job["session"] = res["session"]
         save(job)
         emit(job, res)
@@ -888,7 +1018,10 @@ def cmd_revise(a):
         msg = ("REVIEW FEEDBACK - revise your work. Fix exactly these points, nothing else, "
                "then reply with the same final report block (describe only this round's changes):\n"
                + (a.feedback if a.feedback != "-" else sys.stdin.read()))
+        outside = outside_listing(job["dir"], paths) if paths else None
         res = run_with_check(job, msg, session=job["session"])
+        if outside is not None:
+            res["outside"] = outside_changes(outside, outside_listing(job["dir"], paths))
         save(job)
         emit(job, res)
         notify_done(job, res)
