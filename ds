@@ -137,7 +137,8 @@ def git(job_or_gd, wt, *args, check=True, capture=True, index=None):
     env = os.environ.copy()
     if index:
         env["GIT_INDEX_FILE"] = index
-    r = subprocess.run(["git", f"--git-dir={gd}", f"--work-tree={wt}", *args],
+    r = subprocess.run(["git", "-c", "core.quotePath=false",
+                        f"--git-dir={gd}", f"--work-tree={wt}", *args],
                        capture_output=capture, text=True, cwd=wt, env=env)
     if check and r.returncode:
         die(f"git {' '.join(args)} failed: {r.stderr.strip()[:500]}")
@@ -162,7 +163,8 @@ def maybe_shadow_gc(gd):
             except OSError:
                 pass
             try:
-                subprocess.Popen(["git", f"--git-dir={gd}", "gc", "--quiet",
+                subprocess.Popen(["git", "-c", "core.quotePath=false",
+                                  f"--git-dir={gd}", "gc", "--quiet",
                                   "--prune=1.hour.ago"],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, start_new_session=True)
@@ -182,13 +184,15 @@ def cleanup_shadow(job):
     gd, jid = job.get("shadow"), job["id"]
     if gd and os.path.isdir(gd):
         try:
-            r = subprocess.run(["git", f"--git-dir={gd}", "for-each-ref",
+            r = subprocess.run(["git", "-c", "core.quotePath=false",
+                                f"--git-dir={gd}", "for-each-ref",
                                 "--format=%(refname)", f"refs/ds/{jid}/"],
                                capture_output=True, text=True)
             for ref in r.stdout.splitlines():
                 ref = ref.strip()
                 if ref:
-                    subprocess.run(["git", f"--git-dir={gd}", "update-ref", "-d", ref],
+                    subprocess.run(["git", "-c", "core.quotePath=false",
+                                    f"--git-dir={gd}", "update-ref", "-d", ref],
                                    capture_output=True)
         except OSError:
             pass
@@ -232,7 +236,8 @@ def stage_paths(gd, wt, paths, index):
     env = os.environ.copy()
     env["GIT_INDEX_FILE"] = index
     for p in paths:
-        r = subprocess.run(["git", f"--git-dir={gd}", f"--work-tree={wt}",
+        r = subprocess.run(["git", "-c", "core.quotePath=false",
+                            f"--git-dir={gd}", f"--work-tree={wt}",
                             "add", "-A", "--", p],
                            capture_output=True, text=True, cwd=wt, env=env)
         if r.returncode and "did not match any files" not in (r.stderr or ""):
@@ -250,7 +255,7 @@ def snapshot(d, gd, label, index, jid, paths=None):
     ex += ["/" + p[2:] for p in r.stdout.splitlines() if p.startswith("./")]
     write_exclude(gd, ex)
     stage_paths(gd, d, paths, index)
-    n = len(git(gd, d, "ls-files", index=index).splitlines())
+    n = len([f for f in git(gd, d, "ls-files", "-z", index=index).split("\0") if f])
     if n > c["max_files"]:
         die(f"{d} has {n} tracked files (> {c['max_files']}); run in a smaller directory")
     tree = git(gd, d, "write-tree", index=index).strip()
@@ -1119,7 +1124,9 @@ def write_progress_file(job, model, **fields):
 
 
 def write_check_progress(job, model, cmd):
-    write_progress_file(job, model, state="running", last="check: " + cmd[:40])
+    write_progress_file(job, model, state="running", last="check: " + cmd[:40],
+                        phase="tool", tool_since=int(time.time()), live_tok_s=None,
+                        args_tool=None, args_since=None)
 
 
 def run_check(d, cmd, timeout_s):
@@ -1697,7 +1704,7 @@ def cmd_approve(a):
 
 def commit_blob(gd, wt, commit, path):
     """Blob hash of path in commit, or "absent"."""
-    out = git(gd, wt, "ls-tree", commit, "--", path).strip()
+    out = git(gd, wt, "ls-tree", "-z", commit, "--", path).strip("\0\n")
     if not out:
         return "absent"
     parts = out.split("\t", 1)[0].split()
@@ -1711,7 +1718,8 @@ def worktree_blob(gd, wt, path):
     if not os.path.lexists(os.path.join(wt, path)):
         return "absent"
     try:
-        r = subprocess.run(["git", f"--git-dir={gd}", f"--work-tree={wt}",
+        r = subprocess.run(["git", "-c", "core.quotePath=false",
+                            f"--git-dir={gd}", f"--work-tree={wt}",
                             "hash-object", "--", path],
                            capture_output=True, text=True, cwd=wt)
     except OSError:
@@ -1748,10 +1756,11 @@ def cmd_reject(a):
               "restoring the whole scope to the pre-job state")
         stage_paths(gd, d, paths, idx)
         # files created since snapshot -> remove; changed/deleted -> restore
-        diff_args = ["diff", "--cached", "--name-only", "--diff-filter=A", job["base"]]
+        diff_args = ["diff", "--cached", "--name-only", "-z",
+                     "--diff-filter=A", job["base"]]
         if paths:
             diff_args += ["--", *paths]
-        added = [f for f in git(gd, d, *diff_args, index=idx).split("\n") if f]
+        added = [f for f in git(gd, d, *diff_args, index=idx).split("\0") if f]
         for f in added:
             try:
                 os.remove(os.path.join(d, f))
@@ -1759,8 +1768,8 @@ def cmd_reject(a):
                 pass
         if paths:
             # New paths are absent from base; check out only paths that base has.
-            base_paths = [f for f in git(gd, d, "ls-tree", "-r", "--name-only",
-                                        job["base"], "--", *paths, index=idx).split("\n") if f]
+            base_paths = [f for f in git(gd, d, "ls-tree", "-r", "-z", "--name-only",
+                                        job["base"], "--", *paths, index=idx).split("\0") if f]
             if base_paths:
                 git(gd, d, "checkout", job["base"], "--", *base_paths, index=idx)
         else:
@@ -1772,14 +1781,12 @@ def cmd_reject(a):
         return
 
     post = job["post"]
-    diff_args = ["diff", "--name-status", "--no-renames", job["base"], post]
+    diff_args = ["diff", "--name-status", "-z", "--no-renames", job["base"], post]
     if paths:
         diff_args += ["--", *paths]
-    files = []
-    for line in git(gd, d, *diff_args).splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 2 and parts[-1].strip():
-            files.append(parts[-1].strip())
+    entries = [e for e in git(gd, d, *diff_args).split("\0") if e]
+    files = [entries[i + 1] for i in range(0, len(entries) - 1, 2)
+             if entries[i + 1]]
 
     restore, skipped = [], []
     for f in files:
