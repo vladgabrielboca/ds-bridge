@@ -159,7 +159,7 @@ Snapshots skip media, build output, big files and dependency/cache directories, 
 
 ### Guard hook
 
-`install.sh` adds a Claude Code `PreToolUse` hook (`hooks/guard.py`) for `Edit`, `Write`, `MultiEdit` and `NotebookEdit`. Direct edits to project files are blocked with a message to delegate through `ds`; `~/.claude/`, `/tmp/claude-*` scratchpads and globs in `guard_allow` are allowed. Pause it with `touch ~/.config/ds-bridge/guard-off` or `DS_GUARD_OFF=1`. It can't stop edits made through Bash (heredocs, sed), so it is a guardrail, not a sandbox.
+`install.sh` adds a Claude Code `PreToolUse` hook (`hooks/guard.py`) for `Edit`, `Write`, `MultiEdit` and `NotebookEdit`. Direct edits to project files are blocked with a message to delegate through `ds`; `~/.claude/`, `/tmp/claude-*` scratchpads and globs in `guard_allow` are allowed. Set `guard_mode` to `"warn"` to warn instead of blocking: the edit is not blocked by the hook, you see a warning, and Claude gets a reminder about the delegation rule. Pause it with `touch ~/.config/ds-bridge/guard-off` or `DS_GUARD_OFF=1`. It can't stop edits made through Bash (heredocs, sed), so it is a guardrail, not a sandbox.
 
 ### Stats and log
 
@@ -212,6 +212,7 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `notify_min_s` | `15` | Don't notify for jobs shorter than this many seconds. |
 | `outside_ignore` | `[".git", "__pycache__", "media*", "*.log", "node_modules", ".venv"]` | Globs ignored by the `--paths` outside-change warning. |
 | `guard_allow` | `[]` | Globs of paths the guard hook always allows (for example `~/work/sandbox/*`). |
+| `guard_mode` | `"block"` | Guard hook behaviour for blocked paths: `"block"` (message to stderr, exit 2) or `"warn"` (allow the edit, show a warning to you and add context for Claude). |
 
 ## Safety
 

@@ -7,7 +7,9 @@ Claude's own memory/settings, scratchpads and paths listed in
 ~/.config/ds-bridge/config.json under "guard_allow".
 
 Reads the hook JSON from stdin. Exits 2 with a message to block; otherwise 0.
-Never breaks the session on malformed input or other tools.
+With "guard_mode": "warn" in the config, a would-be block becomes an allow with
+a system message and extra context instead. Never breaks the session on
+malformed input or other tools.
 """
 import fnmatch
 import json
@@ -23,16 +25,35 @@ MESSAGE = (
     "change with `ds run -C <project> \"<brief>\"` (or `ds revise` for an open "
     "job), then review the diff."
 )
+WARN_CONTEXT = (
+    "ds-bridge guard allowed this edit because guard_mode is \"warn\", but project "
+    "changes are normally delegated with `ds run -C <project> \"<brief>\"`. Make "
+    "sure this is a case your rules allow."
+)
+
+_CONFIG = None
+
+
+def load_config():
+    global _CONFIG
+    if _CONFIG is None:
+        try:
+            with open(CONF) as f:
+                data = json.load(f)
+            _CONFIG = data if isinstance(data, dict) else {}
+        except (OSError, ValueError, AttributeError):
+            _CONFIG = {}
+    return _CONFIG
 
 
 def allow_globs():
-    try:
-        with open(CONF) as f:
-            data = json.load(f)
-        patterns = data.get("guard_allow") or []
-        return [p for p in patterns if isinstance(p, str)]
-    except (OSError, ValueError, AttributeError):
-        return []
+    patterns = load_config().get("guard_allow") or []
+    return [p for p in patterns if isinstance(p, str)]
+
+
+def guard_mode():
+    mode = load_config().get("guard_mode")
+    return mode if mode in ("block", "warn") else "block"
 
 
 def allowed(path, cwd):
@@ -72,6 +93,18 @@ def main():
         if not isinstance(path, str) or not path:
             return 0
         if allowed(path, payload.get("cwd")):
+            return 0
+        if guard_mode() == "warn":
+            line = (
+                "ds-bridge guard: direct edit of %s (not delegated to ds)" % path
+            )
+            sys.stdout.write(json.dumps({
+                "systemMessage": line,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "additionalContext": WARN_CONTEXT,
+                },
+            }) + "\n")
             return 0
         sys.stderr.write(MESSAGE + "\n")
         return 2
