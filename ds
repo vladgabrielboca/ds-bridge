@@ -398,9 +398,7 @@ def excluded_note(before, after, c=None):
     for key, counts in items[:5]:
         seg = [key]
         for label, i in (("changed", 0), ("created", 1), ("deleted", 2)):
-            if counts[i] == 1:
-                seg.append(label)
-            elif counts[i]:
+            if counts[i]:
                 seg.append(f"{counts[i]} {label}")
         bits.append(" ".join(seg))
     line = "--- NOTE not in diff, not undoable by reject: " + " · ".join(bits)
