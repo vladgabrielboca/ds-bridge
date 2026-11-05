@@ -121,7 +121,7 @@ While a job runs, ds also reads the OpenCode service's event stream (`~/.local/s
 | `ds stats [--days N \| --all]` | Summarise the ledger: jobs, rounds, worker tokens, Claude's reads and estimated savings. |
 | `ds log JOB [--tools-only]` | Print a readable transcript of the job's OpenCode session. |
 
-Flags: `-C DIR` sets the project directory (`run` and `init`), `-m MODEL` overrides the model for one job, `-f FILE` attaches a file to the brief (repeatable), `--paths P…` limits the job's file scope, and `--check CMD` / `--fix-tries N` control the acceptance check (also on `revise`).
+Flags: `-C DIR` sets the project directory (`run` and `init`), `-m MODEL` overrides the model for one job, `-f FILE` attaches a file to the brief (repeatable), `--paths P…` limits the job's file scope, `--timeout S` overrides `job_budget_s` for this invocation (`run`, `init`, `revise`), and `--check CMD` / `--fix-tries N` control the acceptance check (also on `revise`).
 
 ### `--check` and the fix loop
 
@@ -130,6 +130,14 @@ Flags: `-C DIR` sets the project directory (`run` and `init`), `-m MODEL` overri
 ### Soft deadline
 
 A worker call that passes `soft_timeout_frac × timeout_s` (default `0.8`, so 24 minutes of a 30-minute run) is stopped and the same session is asked for its final report, including anything unfinished. That wrap-up call has its own limit, `wrapup_s` (default `180`). The `--check` still runs afterwards, and the report starts with `SOFT DEADLINE HIT`. This applies to `ds run`, `ds init` and `ds revise`, including auto-fix rounds. Both the hard timeout and the soft deadline interrupt the session through the OpenCode service, not just the `opencode run` client, so the worker stops running tools; the wrap-up call then reaches an idle session.
+
+### Job time budget
+
+`job_budget_s` (default `3600`) caps a whole `ds run`, `ds init` or `ds revise` invocation, including check runs and auto-fix rounds; `--timeout S` overrides it for one invocation. Each worker call gets `min(timeout_s, remaining)` and each check gets `min(check_timeout_s, remaining)`; the soft-deadline fraction applies to that per-call limit. If fewer than 60 seconds remain before a fix round, the round is skipped and the `--- check` section says `budget exhausted, N fix rounds skipped`. The budget is mentioned only when it is hit.
+
+### Cleanup on approve and reject
+
+`ds approve` and `ds reject` drop the job's refs under `refs/ds/<job>/` from the shadow repository and remove its temporary index, so old snapshots do not accumulate. At most once per 24 hours per shadow repo they also start a detached `git gc --prune=1.hour.ago` (never `--prune=now`, which could race a concurrent job). Both commands return immediately. Afterwards `ds diff`, `ds approve` and `ds reject` on that job exit with a one-line "job is approved/rejected" message instead of a git error.
 
 ### `ds reject` and `--force`
 
@@ -140,6 +148,8 @@ A worker call that passes `soft_timeout_frac × timeout_s` (default `0.8`, so 24
 `--paths P…` limits the snapshot, diff and reject scope to those paths relative to `-C`. Independent subtasks can run in parallel: start several `ds run ... --paths <their files>` calls in the background, then review each report as it arrives. Jobs whose paths overlap a running job in the same project are refused. `ds revise` keeps the job's original scope.
 
 With `--paths`, the bridge also records a cheap path/size/mtime listing of the whole project before the run and compares it afterwards. Files outside the job's paths that were created, changed or deleted appear in a `--- WARNING: changes outside --paths` section (up to 20 lines). Paths matching `outside_ignore` are skipped. Nothing is recorded or printed when `--paths` is not used.
+
+Snapshots skip media, build output, big files and dependency/cache directories, so those changes are not in the diff and `ds reject` cannot restore them. To make that visible, each run and revise also compares a cheap listing of excluded files (the job's `--paths` when set, otherwise the whole project; `node_modules`, `.venv`, `venv`, `__pycache__`, `.git` and `.cache` are never entered). When something changed, one compact line is printed, for example `--- NOTE not in diff, not undoable by reject: build/ 12 changed 2 created · media/ 3 created · model.bin changed`. At most five top-level groups are shown plus `+N more groups`. Set `excluded_note` to `false` to disable it.
 
 ### `ds init` and AGENTS.md
 
@@ -194,6 +204,8 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `big_file_mb` | `5` | Files larger than this are excluded from snapshots. |
 | `fix_tries` | `2` | Auto-fix rounds after a failed `--check` (override per job with `--fix-tries`). |
 | `check_timeout_s` | `600` | Timeout for one `--check` command. |
+| `job_budget_s` | `3600` | Time budget for a whole `run`/`init`/`revise` invocation (override with `--timeout`). |
+| `excluded_note` | `true` | Print the one-line note about changes snapshots cannot see. |
 | `notify` | `true` | Send a desktop notification when a run or revise finishes. |
 | `notify_min_s` | `15` | Don't notify for jobs shorter than this many seconds. |
 | `outside_ignore` | `[".git", "__pycache__", "media*", "*.log", "node_modules", ".venv"]` | Globs ignored by the `--paths` outside-change warning. |
@@ -201,7 +213,7 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 
 ## Safety
 
-The worker's `bash` permission denies `git commit`, `git push`, `git reset`, `git checkout` and `sudo`. `ds` refuses to run in `$HOME` or `/`. Snapshots live outside your repository in `~/.local/share/ds-bridge/shadow`, so your own `.git` is never touched. Media and big files, `node_modules/`, virtualenvs, build output and caches are excluded. `ds reject` restores only the job's own changes; use `--force` for files changed after the job.
+The worker's `bash` permission denies `git commit`, `git push`, `git reset`, `git checkout` and `sudo`. `ds` refuses to run in `$HOME` or `/`. Snapshots live outside your repository in `~/.local/share/ds-bridge/shadow`, so your own `.git` is never touched. Media and big files, `node_modules/`, virtualenvs, build output and caches are excluded; the `--- NOTE` line lists changes to those when it can see them. `ds reject` restores only the job's own changes; use `--force` for files changed after the job. Approve and reject remove the job's shadow refs (and occasionally gc) so snapshots do not pile up.
 
 ## Limitations
 

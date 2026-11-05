@@ -55,10 +55,15 @@ DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
             "max_diff_lines": 250, "max_report_chars": 1500, "timeout_s": 1800,
             "soft_timeout_frac": 0.8, "wrapup_s": 180,
             "max_files": 20000, "big_file_mb": 5,
-            "fix_tries": 2, "check_timeout_s": 600,
+            "fix_tries": 2, "check_timeout_s": 600, "job_budget_s": 3600,
+            "excluded_note": True,
             "notify": True, "notify_min_s": 15,
             "outside_ignore": [".git", "__pycache__", "media*", "*.log",
                                "node_modules", ".venv"]}
+# Never walk into these: dependency/cache dirs can be huge and their changes
+# are already reported by size, not by file.
+EXCLUDED_PRUNE = {"node_modules", ".venv", "venv", "__pycache__", ".git", ".cache"}
+FIX_MIN_S = 60
 EXCLUDES = ["node_modules/", ".venv/", "venv/", "__pycache__/", ".git/", "*.pyc",
             "media/", "*.mp4", "*.mkv", "*.mov", "*.wav", "*.mp3", "*.flac",
             "*.safetensors", "*.bin", "*.pt", "*.pth", "*.ckpt", "*.gguf", "*.onnx",
@@ -86,12 +91,28 @@ WRAPUP_MSG = (
     "immediately, including what is unfinished and anything not yet verified.")
 
 
+_CONFIG_CACHE = None
+
+
 def cfg():
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is not None:
+        return _CONFIG_CACHE
     c = dict(DEFAULTS)
     try:
-        c.update(json.load(open(CONF)))
+        with open(CONF) as f:
+            data = json.load(f)
     except FileNotFoundError:
-        pass
+        _CONFIG_CACHE = c
+        return c
+    except ValueError as e:
+        die(f"config.json invalid: {e}")
+    except OSError as e:
+        die(f"config.json invalid: {e}")
+    if not isinstance(data, dict):
+        die("config.json invalid: top-level value must be an object")
+    c.update(data)
+    _CONFIG_CACHE = c
     return c
 
 
@@ -125,6 +146,57 @@ def git(job_or_gd, wt, *args, check=True, capture=True, index=None):
 
 def job_index(jid):
     return os.path.join(JOBS, jid, "index")
+
+
+def maybe_shadow_gc(gd):
+    """Start a detached gc at most once per 24 h per shadow repo."""
+    stamp = os.path.join(gd, "ds-gc-stamp")
+    lock = stamp + ".lock"
+    now = time.time()
+    try:
+        with open(lock, "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                if now - os.path.getmtime(stamp) < 86400:
+                    return
+            except OSError:
+                pass
+            try:
+                subprocess.Popen(["git", f"--git-dir={gd}", "gc", "--quiet",
+                                  "--prune=1.hour.ago"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError:
+                return
+            try:
+                with open(stamp, "a"):
+                    os.utime(stamp, (now, now))
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def cleanup_shadow(job):
+    """Drop the job's refs and index, then opportunistically gc the shadow repo."""
+    gd, jid = job.get("shadow"), job["id"]
+    if gd and os.path.isdir(gd):
+        try:
+            r = subprocess.run(["git", f"--git-dir={gd}", "for-each-ref",
+                                "--format=%(refname)", f"refs/ds/{jid}/"],
+                               capture_output=True, text=True)
+            for ref in r.stdout.splitlines():
+                ref = ref.strip()
+                if ref:
+                    subprocess.run(["git", f"--git-dir={gd}", "update-ref", "-d", ref],
+                                   capture_output=True)
+        except OSError:
+            pass
+        maybe_shadow_gc(gd)
+    try:
+        os.remove(job_index(jid))
+    except OSError:
+        pass
 
 
 def shadow_for(d):
@@ -254,6 +326,87 @@ def outside_changes(before, after):
     if len(lines) > 20:
         lines = lines[:19] + [f"… {len(lines) - 19} more"]
     return lines
+
+
+def excluded_listing(d, paths):
+    """Cheap (size, mtime_ns) listing for files that snapshots may skip.
+
+    Dependency/cache directories are pruned, never entered. Files are listed
+    here (not just pattern matches) so that a file that grew past
+    big_file_mb is reported as changed rather than created; the reporter
+    below keeps only excluded files.
+    """
+    out = {}
+    for root, dirs, names in os.walk(d):
+        dirs[:] = [x for x in dirs if x not in EXCLUDED_PRUNE]
+        rel_root = os.path.relpath(root, d)
+        for name in names:
+            rel = name if rel_root == "." else rel_root + "/" + name
+            rel = rel.replace(os.sep, "/")
+            if paths and not under_paths(rel, paths):
+                continue
+            try:
+                st = os.stat(os.path.join(root, name))
+            except OSError:
+                continue
+            out[rel] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def excluded_name(rel):
+    """True when rel matches an EXCLUDES pattern."""
+    parts = rel.split("/")
+    name = parts[-1]
+    for pat in EXCLUDES:
+        if pat.endswith("/"):
+            if pat[:-1] in parts:
+                return True
+        elif fnmatch.fnmatch(name, pat):
+            return True
+    return False
+
+
+def excluded_note(before, after, c=None):
+    """One tiny line summarising changes snapshots cannot see, or None."""
+    c = c or cfg()
+    if not c.get("excluded_note", True):
+        return None
+    try:
+        big = float(c.get("big_file_mb", 5)) * 1024 * 1024
+    except (TypeError, ValueError):
+        big = 5 * 1024 * 1024
+    groups = collections.defaultdict(lambda: [0, 0, 0])  # changed, created, deleted
+    for rel in set(before) | set(after):
+        b, a = before.get(rel), after.get(rel)
+        if not excluded_name(rel) and not (b and b[0] > big) and not (a and a[0] > big):
+            continue
+        if b is None:
+            kind = 1
+        elif a is None:
+            kind = 2
+        elif b != a:
+            kind = 0
+        else:
+            continue
+        parts = rel.split("/")
+        key = parts[0] + "/" if len(parts) > 1 else rel
+        groups[key][kind] += 1
+    if not groups:
+        return None
+    items = sorted(groups.items(), key=lambda kv: (-sum(kv[1]), kv[0]))
+    bits = []
+    for key, counts in items[:5]:
+        seg = [key]
+        for label, i in (("changed", 0), ("created", 1), ("deleted", 2)):
+            if counts[i] == 1:
+                seg.append(label)
+            elif counts[i]:
+                seg.append(f"{counts[i]} {label}")
+        bits.append(" ".join(seg))
+    line = "--- NOTE not in diff, not undoable by reject: " + " · ".join(bits)
+    if len(items) > 5:
+        line += f" · +{len(items) - 5} more groups"
+    return line
 
 
 def pid_alive(pid):
@@ -537,10 +690,13 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             live_tok, phase, tool_since, args_tool, args_since = live_view(now_ms)
             last_shown = (max(live["tools"].values(), key=lambda v: v[0])[1]
                           if live["available"] and live["tools"] else last)
+            out_tokens = tok["output"]
+            if live["available"] and live["step_chars"]:
+                out_tokens += int(round(live["step_chars"] / live["cpt"]))
             obj = {"state": state, "job": job["id"], "round": job["round"],
                    "model": model, "dir": os.path.basename(d), "started": t0,
                    "updated": time.time(), "steps": steps, "tools": tools,
-                   "last": last_shown, "pid": os.getpid(), "out_tokens": tok["output"],
+                   "last": last_shown, "pid": os.getpid(), "out_tokens": out_tokens,
                    "tok_s": tok_s(), "live_tok_s": live_tok, "phase": phase,
                    "tool_since": tool_since, "args_tool": args_tool,
                    "args_since": args_since}
@@ -900,22 +1056,39 @@ def run_check(d, cmd, timeout_s):
     return {"pass": code == 0, "code": code, "output": "\n".join(lines[-60:])}
 
 
-def run_with_check(job, msg, session=None, files=()):
+def run_with_check(job, msg, session=None, files=(), budget_s=None):
     """Run the worker, then keep auto-fixing until the job's check passes."""
     d = job["dir"]
-    res = run_opencode(d, msg, job["model"], job["agent"], session=session, files=files, job=job)
+    c = cfg()
+    try:
+        budget_s = float(budget_s if budget_s is not None else c["job_budget_s"])
+    except (TypeError, ValueError):
+        budget_s = 3600.0
+    deadline = time.time() + max(0.0, budget_s)
+
+    def remaining():
+        return deadline - time.time()
+
+    def limit(cap):
+        return min(cap, max(1.0, remaining()))
+
+    res = run_opencode(d, msg, job["model"], job["agent"], session=session, files=files,
+                       job=job, limit_s=limit(c["timeout_s"]))
     if res["errors"]:
         return res
     check = job.get("check")
     if not check:
         return res
     tries = max(0, int(job.get("fix_tries") or 0))
-    timeout_s = cfg()["check_timeout_s"]
-    results, rounds = [res], 0
+    timeout_s = c["check_timeout_s"]
+    results, rounds, skipped = [res], 0, 0
     while True:
         write_check_progress(job, job["model"], check)
-        chk = run_check(d, check, timeout_s)
+        chk = run_check(d, check, limit(timeout_s))
         if chk["pass"] or rounds >= tries:
+            break
+        if remaining() < FIX_MIN_S:
+            skipped = tries - rounds
             break
         rounds += 1
         fmsg = (f"AUTOMATED CHECK FAILED (not the reviewer). Command: {check}\n"
@@ -923,7 +1096,8 @@ def run_with_check(job, msg, session=None, files=()):
                 "Fix the cause within the original task scope, then reply with the "
                 "final report block.")
         res = run_opencode(d, fmsg, job["model"], job["agent"],
-                           session=res.get("session") or job.get("session"), job=job)
+                           session=res.get("session") or job.get("session"), job=job,
+                           limit_s=limit(c["timeout_s"]))
         results.append(res)
         if res["errors"]:
             return res
@@ -940,6 +1114,8 @@ def run_with_check(job, msg, session=None, files=()):
         out["soft_deadline"] = soft[0]
     out["check"] = {"cmd": check, "pass": chk["pass"], "code": chk["code"],
                     "output": chk["output"], "rounds": rounds}
+    if skipped:
+        out["check"]["budget_skipped"] = skipped
     write_progress_file(job, job["model"], state="error" if last["errors"] else "done",
                         last="check: " + ("pass" if chk["pass"] else "fail"),
                         secs=out["secs"], out_tokens=tok["output"], tok_s=out["tok_s"])
@@ -968,7 +1144,11 @@ def diff_text(job, full=False, paths=(), since=None):
 
 
 def save(job):
-    json.dump(job, open(os.path.join(JOBS, job["id"], "job.json"), "w"), indent=1)
+    p = os.path.join(JOBS, job["id"], "job.json")
+    tmp = p + f".tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(job, f, indent=1)
+    os.replace(tmp, p)
 
 
 def load(jid):
@@ -1087,9 +1267,13 @@ def emit(job, res):
                        f"after {chk['rounds']} auto-fix rounds")
             if chk["output"]:
                 out.append("\n".join(chk["output"].splitlines()[-30:]))
+        if chk.get("budget_skipped"):
+            out.append(f"budget exhausted, {chk['budget_skipped']} fix rounds skipped")
     if res.get("outside"):
         out.append("--- WARNING: changes outside --paths")
         out.extend(res["outside"])
+    if res.get("excluded_note"):
+        out.append(res["excluded_note"])
     if rb:
         out.append(f"--- this round only (cumulative: ds diff {job['id']})")
     out.append("--- diff stat")
@@ -1262,7 +1446,7 @@ def cmd_init(a):
         die("AGENTS.md exists; use --refresh to rewrite it")
     task = INIT_REFRESH if a.refresh else INIT_BASE
     ns = argparse.Namespace(C=d, m=None, paths=["AGENTS.md"], check=None,
-                            fix_tries=None, f=None, task=task)
+                            fix_tries=None, f=None, task=task, timeout=a.timeout)
     cmd_run(ns)
 
 
@@ -1273,6 +1457,7 @@ def cmd_run(a):
         die("refusing to run in $HOME or / ; pass -C <project dir>")
     task = a.task if a.task != "-" else sys.stdin.read()
     paths = norm_paths(a.paths)
+    budget = a.timeout if a.timeout is not None else c["job_budget_s"]
     os.makedirs(JOBS, exist_ok=True)
     jid = new_job_id()
     gd = shadow_for(d)
@@ -1288,13 +1473,19 @@ def cmd_run(a):
         base = snapshot(d, gd, f"pre {jid}", job_index(jid), jid, paths)
         job = {"id": jid, "dir": d, "shadow": gd, "base": base, "model": a.m or c["model"],
                "agent": c["agent"], "session": None, "round": 1, "status": "open",
-               "paths": paths, "task": task[:2000], "check": a.check,
+               "paths": paths, "task": task, "check": a.check,
                "fix_tries": a.fix_tries if a.fix_tries is not None else c["fix_tries"]}
         save(job)
         outside = outside_listing(d, paths) if paths else None
-        res = run_with_check(job, task, files=a.f or ())
+        want_note = c.get("excluded_note", True)
+        excluded = excluded_listing(d, paths) if want_note else None
+        res = run_with_check(job, task, files=a.f or (), budget_s=budget)
         if outside is not None:
             res["outside"] = outside_changes(outside, outside_listing(d, paths))
+        if excluded is not None:
+            note = excluded_note(excluded, excluded_listing(d, paths), c)
+            if note:
+                res["excluded_note"] = note
         job["post"] = snapshot(d, gd, f"post r{job['round']}", job_index(jid), jid, paths)
         job["session"] = res["session"]
         save(job)
@@ -1310,6 +1501,8 @@ def cmd_revise(a):
     job = load(a.job)
     if job["status"] != "open":
         die(f"job {a.job} is {job['status']}")
+    c = cfg()
+    budget = a.timeout if a.timeout is not None else c["job_budget_s"]
     paths = job.get("paths")
     claim_job(job["id"], job["dir"], paths)
     try:
@@ -1321,10 +1514,18 @@ def cmd_revise(a):
         msg = ("REVIEW FEEDBACK - revise your work. Fix exactly these points, nothing else, "
                "then reply with the same final report block (describe only this round's changes):\n"
                + (a.feedback if a.feedback != "-" else sys.stdin.read()))
+        if not job.get("session"):
+            msg = "ORIGINAL TASK:\n" + (job.get("task") or "") + "\n\n" + msg
         outside = outside_listing(job["dir"], paths) if paths else None
-        res = run_with_check(job, msg, session=job["session"])
+        want_note = c.get("excluded_note", True)
+        excluded = excluded_listing(job["dir"], paths) if want_note else None
+        res = run_with_check(job, msg, session=job["session"], budget_s=budget)
         if outside is not None:
             res["outside"] = outside_changes(outside, outside_listing(job["dir"], paths))
+        if excluded is not None:
+            note = excluded_note(excluded, excluded_listing(job["dir"], paths), c)
+            if note:
+                res["excluded_note"] = note
         job["post"] = snapshot(job["dir"], job["shadow"], f"post r{job['round']}",
                                job_index(job["id"]), job["id"], paths)
         save(job)
@@ -1338,6 +1539,8 @@ def cmd_revise(a):
 
 def cmd_diff(a):
     job = load(a.job)
+    if job["status"] != "open":
+        die(f"job {a.job} is {job['status']}; snapshot removed, nothing to diff")
     stat, body = diff_text(job, full=a.full, paths=a.paths)
     print(stat.rstrip() or "(no changes)")
     print(body)
@@ -1345,8 +1548,11 @@ def cmd_diff(a):
 
 def cmd_approve(a):
     job = load(a.job)
+    if job["status"] != "open":
+        die(f"job {a.job} is {job['status']}; nothing to approve")
     job["status"] = "approved"
     save(job)
+    cleanup_shadow(job)
     print(f"approved {a.job}")
 
 
@@ -1393,6 +1599,8 @@ def prune_empty_dirs(root, rel):
 
 def cmd_reject(a):
     job = load(a.job)
+    if job["status"] != "open":
+        die(f"job {a.job} is {job['status']}; nothing to reject")
     d, gd = job["dir"], job["shadow"]
     idx = job_index(job["id"])
     paths = job.get("paths")
@@ -1420,6 +1628,7 @@ def cmd_reject(a):
             git(gd, d, "checkout", job["base"], "--", ".", index=idx)
         job["status"] = "rejected"
         save(job)
+        cleanup_shadow(job)
         print(f"rejected {a.job}: restored {d} to pre-job state ({len(added)} new files removed)")
         return
 
@@ -1460,6 +1669,7 @@ def cmd_reject(a):
 
     job["status"] = "rejected"
     save(job)
+    cleanup_shadow(job)
     print(f"rejected {a.job}: restored {restored}, removed {len(removed)} new files")
     if skipped:
         names = ", ".join(skipped[:10])
@@ -1487,12 +1697,15 @@ def main():
     r = s.add_parser("run"); r.add_argument("-C"); r.add_argument("-m")
     r.add_argument("-f", action="append"); r.add_argument("--paths", nargs="+")
     r.add_argument("--check"); r.add_argument("--fix-tries", type=int)
+    r.add_argument("--timeout", type=int)
     r.add_argument("task", nargs="?")
     r.set_defaults(fn=cmd_run)
     r = s.add_parser("init"); r.add_argument("-C")
-    r.add_argument("--refresh", action="store_true"); r.set_defaults(fn=cmd_init)
+    r.add_argument("--refresh", action="store_true")
+    r.add_argument("--timeout", type=int); r.set_defaults(fn=cmd_init)
     r = s.add_parser("revise"); r.add_argument("job"); r.add_argument("feedback")
-    r.add_argument("--check"); r.set_defaults(fn=cmd_revise)
+    r.add_argument("--check"); r.add_argument("--timeout", type=int)
+    r.set_defaults(fn=cmd_revise)
     r = s.add_parser("diff"); r.add_argument("job"); r.add_argument("--full", action="store_true")
     r.add_argument("paths", nargs="*"); r.set_defaults(fn=cmd_diff)
     r = s.add_parser("approve"); r.add_argument("job"); r.set_defaults(fn=cmd_approve)
