@@ -666,6 +666,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
     cur_msg, cur_text = None, []
     live = {"available": False, "resp": None, "segs": [],
             "cpt": 3.5, "cal_chars": 0, "cal_tokens": 0, "step_chars": 0,
+            "done_out": 0,
             "last_delta_ms": None, "last_gen_ms": None, "tools": {}, "args": {},
             "step_start_ms": None, "first_gen_ms": None, "last_step_gen_ms": None,
             "dec_tokens": 0, "dec_ms": 0, "ttft": []}
@@ -705,9 +706,12 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             live_tok, phase, tool_since, args_tool, args_since = live_view(now_ms)
             last_shown = (max(live["tools"].values(), key=lambda v: v[0])[1]
                           if live["available"] and live["tools"] else last)
-            out_tokens = tok["output"]
-            if live["available"] and live["step_chars"]:
-                out_tokens += int(round(live["step_chars"] / live["cpt"]))
+            if live["available"]:
+                # SSE-side exact count for finished steps + current-step estimate;
+                # stdout step_finish events lag behind and would make this jump.
+                out_tokens = live["done_out"] + int(round(live["step_chars"] / live["cpt"]))
+            else:
+                out_tokens = tok["output"]
             obj = {"state": state, "job": job["id"], "round": job["round"],
                    "model": model, "dir": os.path.basename(d), "started": t0,
                    "updated": time.time(), "steps": steps, "tools": tools,
@@ -836,6 +840,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                                 live["ttft"].append(max(0, first_gen - step_start))
                         live["cal_chars"] += live["step_chars"]
                         live["cal_tokens"] += out_tok
+                        live["done_out"] += out_tok
                         live["step_chars"] = 0
                         if live["cal_tokens"] > 0:
                             cpt = live["cal_chars"] / live["cal_tokens"]
