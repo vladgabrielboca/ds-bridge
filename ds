@@ -39,7 +39,7 @@ job's paths and shows them as a WARNING (config "outside_ignore", default
 [".git", "__pycache__", "media*", "*.log", "node_modules", ".venv"]).
 """
 import hashlib, json, os, signal, subprocess, sys, time, argparse, shutil, queue, threading, fcntl
-import fnmatch, tempfile, base64, collections, urllib.request, urllib.parse
+import fnmatch, tempfile, base64, collections, urllib.request, urllib.parse, secrets
 
 HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".local/share/ds-bridge")
@@ -491,6 +491,10 @@ def new_job_id():
             n += 1
 
 
+def new_session_id():
+    return "ses_ds" + secrets.token_hex(10)
+
+
 def cleanup_progress():
     try:
         names = os.listdir(PROGRESS)
@@ -644,7 +648,7 @@ def _live_rate(segs, now_ms, cpt):
 
 
 def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
-                 limit_s=None, wrapup=False):
+                 limit_s=None, wrapup=False, deadline=None):
     c = cfg()
     limit_s = limit_s if limit_s is not None else c["timeout_s"]
     try:
@@ -659,6 +663,14 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
         cmd += ["-f", f]
     cmd.append(msg)
     t0 = time.time()
+    prev = (job or {}).get("_prog") or {}
+    base_steps = int(prev.get("steps") or 0)
+    base_tools = int(prev.get("tools") or 0)
+    base_out = int(prev.get("out") or 0)
+    inv_started = prev.get("started") or t0
+    if job is not None:
+        job["_prog"] = {"steps": base_steps, "tools": base_tools,
+                        "out": base_out, "started": inv_started}
     sid, texts, errors = session, [], []
     tok = {"input": 0, "output": 0, "cache_read": 0}
     cost, tools, steps = 0.0, 0, 0
@@ -671,6 +683,21 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             "step_start_ms": None, "first_gen_ms": None, "last_step_gen_ms": None,
             "dec_tokens": 0, "dec_ms": 0, "ttft": []}
     progress_lock = threading.Lock()
+
+    def current_out():
+        if live["available"]:
+            # SSE-side exact count for finished steps + current-step estimate;
+            # stdout step_finish events lag behind and would make this jump.
+            return live["done_out"] + int(round(live["step_chars"] / live["cpt"]))
+        return tok["output"]
+
+    def sync_prog(out=None):
+        if job is None:
+            return
+        job["_prog"] = {"steps": base_steps + steps,
+                        "tools": base_tools + tools,
+                        "out": base_out + (current_out() if out is None else out),
+                        "started": inv_started}
 
     def tok_s():
         return (round(live["dec_tokens"] / (live["dec_ms"] / 1000))
@@ -700,22 +727,24 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             phase = "waiting"
         return live_tok, phase, tool_since, args_tool, args_since
 
-    def write_progress(state, **extra):
+    def write_progress(state, totals=None, **extra):
         with progress_lock:
             now_ms = int(time.time() * 1000)
             live_tok, phase, tool_since, args_tool, args_since = live_view(now_ms)
             last_shown = (max(live["tools"].values(), key=lambda v: v[0])[1]
                           if live["available"] and live["tools"] else last)
-            if live["available"]:
-                # SSE-side exact count for finished steps + current-step estimate;
-                # stdout step_finish events lag behind and would make this jump.
-                out_tokens = live["done_out"] + int(round(live["step_chars"] / live["cpt"]))
-            else:
-                out_tokens = tok["output"]
+            if totals is None:
+                totals = {"steps": base_steps + steps,
+                          "tools": base_tools + tools,
+                          "out": base_out + current_out(),
+                          "started": inv_started}
             obj = {"state": state, "job": job["id"], "round": job["round"],
-                   "model": model, "dir": os.path.basename(d), "started": t0,
-                   "updated": time.time(), "steps": steps, "tools": tools,
-                   "last": last_shown, "pid": os.getpid(), "out_tokens": out_tokens,
+                   "model": model, "dir": os.path.basename(d),
+                   "started": totals.get("started", inv_started),
+                   "updated": time.time(), "steps": totals["steps"],
+                   "tools": totals["tools"],
+                   "last": last_shown, "pid": os.getpid(),
+                   "out_tokens": totals["out"],
                    "tok_s": tok_s(), "ttft_s": ttft_s(), "live_tok_s": live_tok,
                    "phase": phase, "tool_since": tool_since, "args_tool": args_tool,
                    "args_since": args_since}
@@ -1030,14 +1059,18 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
     final = "".join(texts[-1]).strip() if texts else ""
     secs = round(time.time() - t0)
     write_progress("error" if errors else "done", updated=time.time(), secs=secs)
+    sync_prog()
     res = {"session": sid, "report": final, "errors": errors, "tokens": tok,
            "cost": cost, "tools": tools, "secs": secs, "tok_s": tok_s(),
            "dec_tokens": live["dec_tokens"], "dec_ms": live["dec_ms"],
            "ttft": list(live["ttft"])}
     if soft_hit:
         if sid:
+            wrap_limit = c["wrapup_s"]
+            if deadline is not None:
+                wrap_limit = min(wrap_limit, max(60, deadline - time.time()))
             w = run_opencode(d, WRAPUP_MSG, model, agent, session=sid, job=job,
-                             limit_s=c["wrapup_s"], wrapup=True)
+                             limit_s=wrap_limit, wrapup=True, deadline=deadline)
             res["soft_deadline"] = {"at": secs, "limit_s": int(limit_s), "frac": frac}
             res["report"] = w["report"] or final
             for k in ("input", "output", "cache_read"):
@@ -1056,6 +1089,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             res["errors"] += w["errors"]
             res["session"] = w.get("session") or sid
             write_progress("error" if res["errors"] else "done",
+                           totals=job.get("_prog") if job is not None else None,
                            updated=time.time(), secs=res["secs"])
         else:
             res["errors"].append(f"soft deadline after {int(secs)}s (no session to wrap up)")
@@ -1123,7 +1157,7 @@ def run_with_check(job, msg, session=None, files=(), budget_s=None):
         return min(cap, max(1.0, remaining()))
 
     res = run_opencode(d, msg, job["model"], job["agent"], session=session, files=files,
-                       job=job, limit_s=limit(c["timeout_s"]))
+                       job=job, limit_s=limit(c["timeout_s"]), deadline=deadline)
     if res["errors"]:
         return res
     check = job.get("check")
@@ -1147,7 +1181,7 @@ def run_with_check(job, msg, session=None, files=(), budget_s=None):
                 "final report block.")
         res = run_opencode(d, fmsg, job["model"], job["agent"],
                            session=res.get("session") or job.get("session"), job=job,
-                           limit_s=limit(c["timeout_s"]))
+                           limit_s=limit(c["timeout_s"]), deadline=deadline)
         results.append(res)
         if res["errors"]:
             return res
@@ -1203,7 +1237,8 @@ def save(job):
     p = os.path.join(JOBS, job["id"], "job.json")
     tmp = p + f".tmp.{os.getpid()}"
     with open(tmp, "w") as f:
-        json.dump(job, f, indent=1)
+        json.dump({k: v for k, v in job.items() if not k.startswith("_")},
+                  f, indent=1)
     os.replace(tmp, p)
 
 
@@ -1550,17 +1585,20 @@ def cmd_run(a):
         except OSError:
             pass
         raise
+    job = None
+    post_taken = False
     try:
         base = snapshot(d, gd, f"pre {jid}", job_index(jid), jid, paths)
         job = {"id": jid, "dir": d, "shadow": gd, "base": base, "model": a.m or c["model"],
-               "agent": c["agent"], "session": None, "round": 1, "status": "open",
+               "agent": c["agent"], "session": new_session_id(), "round": 1, "status": "open",
                "paths": paths, "task": task, "check": a.check,
                "fix_tries": a.fix_tries if a.fix_tries is not None else c["fix_tries"]}
         save(job)
         outside = outside_listing(d, paths) if paths else None
         want_note = c.get("excluded_note", True)
         excluded = excluded_listing(d, paths) if want_note else None
-        res = run_with_check(job, task, files=a.f or (), budget_s=budget)
+        res = run_with_check(job, task, session=job["session"], files=a.f or (),
+                             budget_s=budget)
         if outside is not None:
             res["outside"] = outside_changes(outside, outside_listing(d, paths))
         if excluded is not None:
@@ -1568,11 +1606,20 @@ def cmd_run(a):
             if note:
                 res["excluded_note"] = note
         job["post"] = snapshot(d, gd, f"post r{job['round']}", job_index(jid), jid, paths)
-        job["session"] = res["session"]
+        post_taken = True
+        if res.get("session"):
+            job["session"] = res["session"]
         save(job)
         emit(job, res)
         notify_done(job, res)
     finally:
+        if job is not None and not post_taken:
+            try:
+                job["post"] = snapshot(d, gd, f"post r{job['round']}",
+                                       job_index(jid), jid, paths)
+                save(job)
+            except BaseException:
+                pass
         mark_interrupted(jid)
         clear_marker(jid)
         cleanup_progress()
@@ -1586,6 +1633,7 @@ def cmd_revise(a):
     budget = a.timeout if a.timeout is not None else c["job_budget_s"]
     paths = job.get("paths")
     claim_job(job["id"], job["dir"], paths)
+    post_taken = False
     try:
         job["round"] += 1
         job["round_base"] = snapshot(job["dir"], job["shadow"], f"{job['id']} r{job['round']}",
@@ -1597,6 +1645,8 @@ def cmd_revise(a):
                + (a.feedback if a.feedback != "-" else sys.stdin.read()))
         if not job.get("session"):
             msg = "ORIGINAL TASK:\n" + (job.get("task") or "") + "\n\n" + msg
+            job["session"] = new_session_id()
+            save(job)
         outside = outside_listing(job["dir"], paths) if paths else None
         want_note = c.get("excluded_note", True)
         excluded = excluded_listing(job["dir"], paths) if want_note else None
@@ -1609,10 +1659,18 @@ def cmd_revise(a):
                 res["excluded_note"] = note
         job["post"] = snapshot(job["dir"], job["shadow"], f"post r{job['round']}",
                                job_index(job["id"]), job["id"], paths)
+        post_taken = True
         save(job)
         emit(job, res)
         notify_done(job, res)
     finally:
+        if not post_taken:
+            try:
+                job["post"] = snapshot(job["dir"], job["shadow"], f"post r{job['round']}",
+                                       job_index(job["id"]), job["id"], paths)
+                save(job)
+            except BaseException:
+                pass
         mark_interrupted(job["id"])
         clear_marker(job["id"])
         cleanup_progress()
