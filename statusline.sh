@@ -131,7 +131,7 @@ for f in "${files[@]}"; do
                         esac
                         ;;
                     waiting)
-                        live_seg=" · … waiting"
+                        live_seg=" · … working"
                         ;;
                 esac
                 if [ "$age" -gt 1800 ]; then

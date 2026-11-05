@@ -96,7 +96,7 @@ Claude Code's status line can poll ds-bridge once a second (`refreshInterval: 1`
 ```
 ⠴ DeepSeek 1104-152450 r1 · 0:05 · step 2 · 4 tools · 144 tok · ▶ 162 tok/s · ▸ read notes.txt
 ⠙ DeepSeek 1104-152510 r1 · 0:02 · step 1 · 1 tool · 18 tok · ⏸ 6s · ▸ bash sleep 6
-⠹ DeepSeek 1104-152510 r1 · 0:04 · step 1 · 1 tool · 18 tok · … waiting · ▸ bash sleep 6
+⠹ DeepSeek 1104-152510 r1 · 0:04 · step 1 · 1 tool · 18 tok · … working · ▸ bash sleep 6
 ✓ DeepSeek 1104-152450 done in 0:11
 DeepSeek idle · 4 jobs today · ≈38k tok saved
 ```
@@ -105,7 +105,7 @@ Each active job gets its own line, up to four; when nothing is running the line 
 
 There is no percentage. An agent can't know its step count in advance, so the line shows elapsed time, the step reached so far, and the last tool call instead of inventing a progress bar.
 
-While a job runs, ds also reads the OpenCode service's event stream (`~/.local/state/opencode/service.json`). The status line shows the live generation rate (`▶ N tok/s`) while the model writes, `✎ tool Ns` while tool arguments are being generated, an elapsed tool timer (`⏸ Ns`) while a tool runs, and `… waiting` during model latency. The live rate uses only active generation time in the last five seconds, calibrated against completed steps; long pauses and tool execution do not lower it. If the stream is unavailable, no live rate is shown.
+While a job runs, ds also reads the OpenCode service's event stream (`~/.local/state/opencode/service.json`). The status line shows the live generation rate (`▶ N tok/s`) while the model writes, `✎ tool Ns` while tool arguments are being generated, an elapsed tool timer (`⏸ Ns`) while a tool runs, and `… working` when no output is streaming (waiting for the first token, or the model writing tool arguments, which OpenCode does not stream). The live rate uses only active generation time in the last five seconds, calibrated against completed steps; long pauses and tool execution do not lower it. If the stream is unavailable, no live rate is shown.
 
 The final report's `tok/s` is decode speed: output tokens per second while the model is writing, measured from the event stream between the first and last generation event of each step. It excludes time to the first token and tool execution. The same measurement gives the time to first token (TTFT), shown after the rate as `· first token X.Xs`. When the event stream was unavailable, or no step completed, ds prints no speed rather than estimating one from `opencode run` stdout.
 
