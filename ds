@@ -170,9 +170,10 @@ def snapshot(d, gd, label, index, jid, paths=None):
     c = cfg()
     ex = list(EXCLUDES)
     # skip big files so snapshots stay fast/small
+    env = dict(os.environ, PWD=d)
     r = subprocess.run(["find", ".", "-path", "./.git", "-prune", "-o", "-type", "f",
                         "-size", f"+{c['big_file_mb']}M", "-print"],
-                       capture_output=True, text=True, cwd=d)
+                       capture_output=True, text=True, cwd=d, env=env)
     ex += ["/" + p[2:] for p in r.stdout.splitlines() if p.startswith("./")]
     write_exclude(gd, ex)
     stage_paths(gd, d, paths, index)
@@ -433,8 +434,10 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
         except OSError:
             pass
 
+    env = dict(os.environ, PWD=d)
+    # opencode follows $PWD, not the process cwd
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL, text=True, cwd=d,
+                         stdin=subprocess.DEVNULL, text=True, cwd=d, env=env,
                          start_new_session=True)
     q = queue.Queue()
 
@@ -583,8 +586,9 @@ def write_check_progress(job, model, cmd):
 
 def run_check(d, cmd, timeout_s):
     """Run cmd with bash -c in d; return pass flag, exit code and last 60 lines."""
+    env = dict(os.environ, PWD=d)
     try:
-        r = subprocess.run(["bash", "-c", cmd], cwd=d, stdin=subprocess.DEVNULL,
+        r = subprocess.run(["bash", "-c", cmd], cwd=d, env=env, stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            text=True, timeout=timeout_s)
         out, code = r.stdout or "", r.returncode
