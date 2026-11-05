@@ -133,7 +133,7 @@ A worker call that passes `soft_timeout_frac × timeout_s` (default `0.8`, so 24
 
 ### Job time budget
 
-`job_budget_s` (default `3600`) caps a whole `ds run`, `ds init` or `ds revise` invocation, including check runs and auto-fix rounds; `--timeout S` overrides it for one invocation. Each worker call gets `min(timeout_s, remaining)` and each check gets `min(check_timeout_s, remaining)`; the soft-deadline fraction applies to that per-call limit. If fewer than 60 seconds remain before a fix round, the round is skipped and the `--- check` section says `budget exhausted, N fix rounds skipped`. The budget is mentioned only when it is hit.
+`job_budget_s` (default `1800`) caps a whole `ds run`, `ds init` or `ds revise` invocation, including check runs and auto-fix rounds; `--timeout S` overrides it for one invocation. Each worker call gets `min(timeout_s, remaining)` and each check gets `min(check_timeout_s, remaining)`; the soft-deadline fraction applies to that per-call limit. If fewer than 60 seconds remain before a fix round, the round is skipped and the `--- check` section says `budget exhausted, N fix rounds skipped`. The budget is mentioned only when it is hit.
 
 ### Cleanup on approve and reject
 
@@ -204,7 +204,7 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `big_file_mb` | `5` | Files larger than this are excluded from snapshots. |
 | `fix_tries` | `2` | Auto-fix rounds after a failed `--check` (override per job with `--fix-tries`). |
 | `check_timeout_s` | `600` | Timeout for one `--check` command. |
-| `job_budget_s` | `3600` | Time budget for a whole `run`/`init`/`revise` invocation (override with `--timeout`). |
+| `job_budget_s` | `1800` | Time budget for a whole `run`/`init`/`revise` invocation (override with `--timeout`). |
 | `excluded_note` | `true` | Print the one-line note about changes snapshots cannot see. |
 | `notify` | `true` | Send a desktop notification when a run or revise finishes. |
 | `notify_min_s` | `15` | Don't notify for jobs shorter than this many seconds. |
