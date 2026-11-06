@@ -122,6 +122,7 @@ The final report's `tok/s` is decode speed: output tokens per second while the m
 | `ds list` | List recent jobs with status and round. |
 | `ds stats [--days N \| --all]` | Summarise the ledger: jobs, rounds, worker tokens, Claude's reads and estimated savings. |
 | `ds log JOB [--tools-only]` | Print a readable transcript of the job's OpenCode session. |
+| `ds delegate on\|off\|status [--session ID]` | Per-chat delegation mode (session defaults to `CLAUDE_CODE_SESSION_ID`). |
 
 Flags: `-C DIR` sets the project directory (`run` and `init`), `-m MODEL` overrides the model for one job, `-f FILE` attaches a file to the brief (repeatable), `--paths P…` limits the job's file scope, `--timeout S` overrides `job_budget_s` for this invocation (`run`, `init`, `revise`), and `--check CMD` / `--fix-tries N` control the acceptance check (also on `revise`).
 
@@ -157,6 +158,10 @@ Snapshots skip media, build output, big files and dependency/cache directories, 
 
 `ds init -C <project>` is a normal job (snapshot, worker, report, approve/revise/reject) with a built-in task: explore the project and write `AGENTS.md` at the root, at most 40 lines of facts about layout, build/test/lint/run commands, conventions and things not to touch. It is scoped with `--paths AGENTS.md`. If `AGENTS.md` already exists it refuses unless you pass `--refresh`, which asks the worker to update the existing file and keep correct lines. OpenCode loads `AGENTS.md` automatically, so later briefs can be shorter.
 
+### Delegation mode (opt-in per chat)
+
+By default Claude works directly; delegation is switched on per chat. Type `/delegate` in Claude Code (the skill in `skills/delegate`, linked into `~/.claude/skills` by the installer) or say "delegate to deepseek", which runs `ds delegate on`; `/delegate off` or `ds delegate off` ends it. While it's on, a `UserPromptSubmit` hook (`hooks/delegate.py`) reminds Claude every turn to send all execution through `ds run ...` started in the background, and the guard blocks direct edits even with `guard_allow`, `guard_mode: "warn"` or `guard-off`; only `~/.claude` and `/tmp/claude-*` stay writable. The marker lives in `~/.local/state/ds-bridge/delegate/<session_id>` (from `CLAUDE_CODE_SESSION_ID`), and stale markers are removed after 30 days.
+
 ### Guard hook
 
 `install.sh` adds a Claude Code `PreToolUse` hook (`hooks/guard.py`) for `Edit`, `Write`, `MultiEdit` and `NotebookEdit`. Direct edits to project files are blocked with a message to delegate through `ds`; `~/.claude/`, `/tmp/claude-*` scratchpads and globs in `guard_allow` are allowed. Set `guard_mode` to `"warn"` to warn instead of blocking: the edit is not blocked by the hook, you see a warning, and Claude gets a reminder about the delegation rule. Pause it with `touch ~/.config/ds-bridge/guard-off` or `DS_GUARD_OFF=1`. It can't stop edits made through Bash (heredocs, sed), so it is a guardrail, not a sandbox.
@@ -183,7 +188,7 @@ cd ds-bridge
 ./install.sh
 ```
 
-The installer merges the `worker` agent into `~/.config/opencode/opencode.json` (backing it up first), links `ds` into `~/.local/bin`, and adds the status line and the `PreToolUse` guard hook to `~/.claude/settings.json`. It never edits `CLAUDE.md` itself, so finish by adding the rules in `claude-rules.md` to `~/.claude/CLAUDE.md` (or a project `CLAUDE.md`). The guard is active immediately; `touch ~/.config/ds-bridge/guard-off` pauses it.
+The installer merges the `worker` agent into `~/.config/opencode/opencode.json` (backing it up first), links `ds` into `~/.local/bin`, adds the status line, the `PreToolUse` guard hook and the `UserPromptSubmit` delegation hook to `~/.claude/settings.json`, and links the `/delegate` skill. It never edits `CLAUDE.md` itself, so finish by adding the rules in `claude-rules.md` to `~/.claude/CLAUDE.md` (or a project `CLAUDE.md`). It creates `~/.config/ds-bridge/guard-off`, so the guard only acts in chats with delegation mode on; delete that file to guard every chat.
 
 `./install.sh --uninstall` removes the worker agent, the symlink, the status line and the guard hook, touching only what ds-bridge created.
 

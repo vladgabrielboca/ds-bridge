@@ -15,6 +15,7 @@ only ever reads: the worker's short report + a capped diff.
   ds list                                          recent jobs
   ds stats [--days N | --all]                      token savings from the ledger
   ds log   JOB [--tools-only]                      readable session transcript
+  ds delegate on|off|status [--session ID]         per-chat delegation mode
 
 --paths limits the snapshot/diff/reject scope to those paths, relative to -C.
 
@@ -50,6 +51,8 @@ RUNNING = os.path.join(STATE, "running")
 LEDGER = os.path.join(STATE, "ledger.jsonl")
 TODAY = os.path.join(STATE, "today.json")
 CONF = os.path.join(HOME, ".config/ds-bridge/config.json")
+DELEGATE = os.path.join(HOME, ".local/state/ds-bridge/delegate")
+DELEGATE_TTL = 30 * 24 * 60 * 60
 SERVICE_JSON = os.path.join(HOME, ".local/state/opencode/service.json")
 DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
             "max_diff_lines": 250, "max_report_chars": 1500, "timeout_s": 1800,
@@ -1824,6 +1827,53 @@ def cmd_reject(a):
         print(f"skipped {len(skipped)} changed after the job (use --force): {names}")
 
 
+def delegate_session(a):
+    sid = a.session or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    sid = sid.strip() if isinstance(sid, str) else ""
+    if not sid:
+        die("missing session id (pass --session ID or set CLAUDE_CODE_SESSION_ID)")
+    return sid
+
+
+def prune_delegates():
+    now = time.time()
+    try:
+        names = os.listdir(DELEGATE)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(DELEGATE, name)
+        try:
+            if os.path.isfile(path) and now - os.path.getmtime(path) > DELEGATE_TTL:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def cmd_delegate(a):
+    sid = delegate_session(a)
+    marker = os.path.join(DELEGATE, sid)
+    if a.action == "status":
+        print("delegation mode: " + ("on" if os.path.exists(marker) else "off"))
+        return
+    if a.action == "on":
+        try:
+            os.makedirs(DELEGATE, exist_ok=True)
+            with open(marker, "a"):
+                pass
+        except OSError as e:
+            die(f"cannot enable delegation for {sid}: {e}")
+    else:
+        try:
+            os.remove(marker)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            die(f"cannot disable delegation for {sid}: {e}")
+    prune_delegates()
+    print("delegation mode: " + ("on" if a.action == "on" else "off"))
+
+
 def cmd_list(a):
     if not os.path.isdir(JOBS):
         return
@@ -1862,6 +1912,10 @@ def main():
     r.add_argument("--all", action="store_true"); r.set_defaults(fn=cmd_stats)
     r = s.add_parser("log"); r.add_argument("job")
     r.add_argument("--tools-only", action="store_true"); r.set_defaults(fn=cmd_log)
+    r = s.add_parser("delegate")
+    r.add_argument("action", choices=["on", "off", "status"])
+    r.add_argument("--session")
+    r.set_defaults(fn=cmd_delegate)
     a = p.parse_args()
     if a.cmd == "run" and a.task is None:
         # --paths uses nargs="+"; when it comes before the task, argparse

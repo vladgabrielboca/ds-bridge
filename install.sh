@@ -214,6 +214,51 @@ print("settings.json: guard hook configured")
 PY
 }
 
+py_set_delegate() {
+    DIR="$DIR" SETTINGS="$SETTINGS" python3 - <<'PY'
+import json, os, sys
+
+path = os.environ["SETTINGS"]
+d = os.environ["DIR"]
+cmd = d + "/hooks/delegate.py"
+ours = {"type": "command", "command": cmd}
+entry = {"hooks": [ours]}
+
+if os.path.exists(path):
+    try:
+        cfg = json.load(open(path))
+    except (ValueError, OSError) as e:
+        sys.exit(f"install.sh: cannot parse {path}: {e}")
+    if not isinstance(cfg, dict):
+        sys.exit(f"install.sh: {path} is not a JSON object")
+else:
+    cfg = {}
+
+hooks = cfg.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    sys.exit(f"install.sh: {path} hooks is not a JSON object")
+submit = hooks.setdefault("UserPromptSubmit", [])
+if not isinstance(submit, list):
+    sys.exit(f"install.sh: {path} hooks.UserPromptSubmit is not a list")
+
+for e in submit:
+    if not isinstance(e, dict) or not isinstance(e.get("hooks"), list):
+        continue
+    for h in e["hooks"]:
+        if isinstance(h, dict) and h.get("command") == cmd:
+            print("settings.json: delegate hook already configured")
+            sys.exit(0)
+
+submit.append(entry)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+print("settings.json: delegate hook configured")
+PY
+}
+
 py_remove_guard() {
     DIR="$DIR" SETTINGS="$SETTINGS" python3 - <<'PY'
 import json, os, sys
@@ -271,6 +316,63 @@ print("settings.json: removed the ds-bridge guard hook")
 PY
 }
 
+py_remove_delegate() {
+    DIR="$DIR" SETTINGS="$SETTINGS" python3 - <<'PY'
+import json, os, sys
+
+path = os.environ["SETTINGS"]
+cmd = os.environ["DIR"] + "/hooks/delegate.py"
+
+if not os.path.exists(path):
+    print("settings.json: not present, nothing to remove")
+    sys.exit(0)
+try:
+    cfg = json.load(open(path))
+except (ValueError, OSError) as e:
+    sys.exit(f"install.sh: cannot parse {path}: {e}")
+
+hooks = cfg.get("hooks")
+if not isinstance(hooks, dict):
+    print("settings.json: delegate hook not set, nothing to remove")
+    sys.exit(0)
+submit = hooks.get("UserPromptSubmit")
+if not isinstance(submit, list):
+    print("settings.json: delegate hook not set, nothing to remove")
+    sys.exit(0)
+
+keep, removed = [], 0
+for e in submit:
+    hit = False
+    if isinstance(e, dict) and isinstance(e.get("hooks"), list):
+        for h in e["hooks"]:
+            if isinstance(h, dict) and h.get("command") == cmd:
+                hit = True
+                break
+    if hit:
+        removed += 1
+    else:
+        keep.append(e)
+
+if not removed:
+    print("settings.json: delegate hook not set, nothing to remove")
+    sys.exit(0)
+
+if keep:
+    hooks["UserPromptSubmit"] = keep
+else:
+    del hooks["UserPromptSubmit"]
+if not hooks:
+    del cfg["hooks"]
+
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+print("settings.json: removed the ds-bridge delegate hook")
+PY
+}
+
 link_ds() {
     mkdir -p "$BIN_DIR"
     ln -sfn "$DIR/ds" "$LINK"
@@ -298,6 +400,25 @@ restart_opencode() {
     fi
 }
 
+link_skill() {
+    local dest="$CLAUDE_DIR/skills/delegate"
+    mkdir -p "$CLAUDE_DIR/skills"
+    if [ -L "$dest" ] || [ ! -e "$dest" ]; then
+        ln -sfn "$DIR/skills/delegate" "$dest"
+        say "linked /delegate skill -> $dest"
+    else
+        warn "$dest exists and is not a link; leaving it (remove it to use the repo's skill)"
+    fi
+}
+
+unlink_skill() {
+    local dest="$CLAUDE_DIR/skills/delegate"
+    if [ -L "$dest" ]; then
+        rm "$dest"
+        say "removed /delegate skill link"
+    fi
+}
+
 do_uninstall() {
     command -v python3 >/dev/null 2>&1 || {
         warn "python3 is required for --uninstall"
@@ -307,6 +428,8 @@ do_uninstall() {
     unlink_ds
     py_remove_statusline
     py_remove_guard
+    py_remove_delegate
+    unlink_skill
 }
 
 do_install() {
@@ -325,13 +448,17 @@ do_install() {
     mkdir -p "$CLAUDE_DIR"
     py_set_statusline
     py_set_guard
+    py_set_delegate
+    link_skill
     mkdir -p "$HOME/.config/ds-bridge"
-    say "guard active in Claude Code: direct Edit/Write on project files is blocked."
-    say "  pause it with: touch ~/.config/ds-bridge/guard-off"
+    touch "$HOME/.config/ds-bridge/guard-off"
+    say "delegation is opt-in per chat: /delegate (or 'ds delegate on') turns it on;"
+    say "  the guard then blocks direct edits in that chat only."
+    say "  to guard every chat instead: rm ~/.config/ds-bridge/guard-off"
 
     restart_opencode
     say ""
-    say "Add the rules in claude-rules.md to ~/.claude/CLAUDE.md (or a project CLAUDE.md) so Claude delegates."
+    say "Add the rules in claude-rules.md to ~/.claude/CLAUDE.md (or a project CLAUDE.md) so Claude knows the delegation rules."
 }
 
 case "${1:-}" in
