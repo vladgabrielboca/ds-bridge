@@ -16,6 +16,13 @@ only ever reads: the worker's short report + a capped diff.
   ds stats [--days N | --all]                      token savings from the ledger
   ds log   JOB [--tools-only]                      readable session transcript
   ds delegate on|off|status [--session ID]         per-chat delegation mode
+  ds playbook                                      the planner rules + brief template
+
+Briefs are linted (config "brief_lint", default true): a run task needs the
+sections GOAL / FILES / STEPS (numbered) / DO NOT / DONE WHEN, at least
+"brief_min_chars" characters (default 300), and none of the vague words in
+VAGUE_WORDS outside backticks and the DO NOT section. A revise needs numbered
+points. A failing brief is refused before anything runs, with the template.
 
 --paths limits the snapshot/diff/reject scope to those paths, relative to -C.
 
@@ -132,6 +139,95 @@ def cfg():
 def die(msg, code=2):
     print(f"ds: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+# ---------------------------------------------------------------- brief lint
+PLAYBOOK = os.path.join(os.path.dirname(os.path.realpath(__file__)), "planner-playbook.md")
+BRIEF_SECTIONS = ["GOAL", "CONTEXT", "FILES", "STEPS", "DO NOT", "DONE WHEN"]
+BRIEF_REQUIRED = ["GOAL", "FILES", "STEPS", "DO NOT", "DONE WHEN"]
+# phrases that leave a decision to the worker; each is refused outside backticks and DO NOT
+VAGUE_WORDS = [r"\betc\b", r"\band so on\b", r"\bas needed\b", r"\bif needed\b",
+               r"\bif necessary\b", r"\bappropriate(ly)?\b", r"\bsomething like\b",
+               r"\band the like\b", r"\bwhatever\b", r"\bclean(\s|-)?up\b", r"\bimprove\b",
+               r"\bhandle (it )?properly\b", r"\bmake sure it works\b", r"\bsimilar to\b",
+               r"\bor so\b", r"\bsomehow\b", r"\bfigure out\b", r"\bas you see fit\b",
+               r"\bmaybe\b", r"\bperhaps\b", r"\bsome kind of\b", r"\bnice\b"]
+_HEAD = re.compile(r"^[ \t]*(" + "|".join(BRIEF_SECTIONS) + r")[ \t]*:", re.M)
+
+
+def playbook_text():
+    try:
+        with open(PLAYBOOK) as f:
+            return f.read()
+    except OSError:
+        return "(planner-playbook.md not found next to ds)"
+
+
+def brief_template():
+    t = playbook_text()
+    m = re.search(r"## Writing the brief.*?```\n(.*?)```", t, re.S)
+    return m.group(1).rstrip() if m else t
+
+
+def brief_sections(task):
+    """{section: text} for the sectioned brief."""
+    out, heads = {}, list(_HEAD.finditer(task))
+    for i, h in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(task)
+        out[h.group(1)] = task[h.end():end].strip()
+    return out
+
+
+def _vague(text):
+    plain = re.sub(r"`[^`]*`", " ", text)          # exact strings may say anything
+    found = []
+    for pat in VAGUE_WORDS:
+        for m in re.finditer(pat, plain, re.I):
+            found.append(m.group(0))
+    return sorted(set(w.lower() for w in found))
+
+
+def lint_brief(task):
+    """Problems with a run brief, [] if it may go to the worker."""
+    c = cfg()
+    probs = []
+    if len(task.strip()) < c.get("brief_min_chars", 300):
+        probs.append(f"too short ({len(task.strip())} chars, need {c.get('brief_min_chars', 300)}): "
+                     "a self-contained brief names files, places, exact changes and checks")
+    sec = brief_sections(task)
+    for name in BRIEF_REQUIRED:
+        if name not in sec:
+            probs.append(f"missing section {name}:")
+        elif not sec[name]:
+            probs.append(f"section {name}: is empty")
+    steps = sec.get("STEPS", "")
+    if "STEPS" in sec and not re.search(r"^[ \t]*\d+[.)][ \t]", steps, re.M):
+        probs.append("STEPS: needs numbered steps (1. 2. 3.), one action each")
+    rest = "\n".join(v for k, v in sec.items() if k != "DO NOT") if sec else task
+    words = _vague(rest)
+    if words:
+        probs.append("vague words (decide it and write it out): " + ", ".join(repr(w) for w in words))
+    return probs
+
+
+def lint_feedback(text):
+    probs = []
+    if not re.search(r"^[ \t]*\d+[.)][ \t]", text, re.M):
+        probs.append("feedback needs numbered points (1. 2. ...), each naming the step, "
+                     "the file and place, and the exact correction")
+    words = _vague(text)
+    if words:
+        probs.append("vague words (write the exact correction): " + ", ".join(repr(w) for w in words))
+    return probs
+
+
+def refuse_brief(kind, probs):
+    msg = [f"brief refused ({kind}); nothing was run.", *("  - " + p for p in probs)]
+    if kind == "run":
+        msg += ["", "Template:", brief_template()]
+    msg += ["", "Full rules: ds playbook"]
+    print("\n".join(msg), file=sys.stderr)
+    sys.exit(2)
 
 
 def install_signal_handlers():
@@ -1666,7 +1762,8 @@ def cmd_init(a):
         die("AGENTS.md exists; use --refresh to rewrite it")
     task = INIT_REFRESH if a.refresh else INIT_BASE
     ns = argparse.Namespace(C=d, m=None, paths=["AGENTS.md"], check=None,
-                            fix_tries=None, f=None, task=task, timeout=a.timeout)
+                            fix_tries=None, f=None, task=task, timeout=a.timeout,
+                            internal=True)
     cmd_run(ns)
 
 
@@ -1676,6 +1773,10 @@ def cmd_run(a):
     if d in (HOME, "/"):
         die("refusing to run in $HOME or / ; pass -C <project dir>")
     task = a.task if a.task != "-" else sys.stdin.read()
+    if c.get("brief_lint", True) and not getattr(a, "internal", False):
+        probs = lint_brief(task)
+        if probs:
+            refuse_brief("run", probs)
     paths = norm_paths(a.paths)
     budget = a.timeout if a.timeout is not None else c["job_budget_s"]
     os.makedirs(JOBS, exist_ok=True)
@@ -1735,6 +1836,10 @@ def cmd_revise(a):
     if job["status"] != "open":
         die(f"job {a.job} is {job['status']}")
     c = cfg()
+    if c.get("brief_lint", True):
+        probs = lint_feedback(a.feedback)
+        if probs:
+            refuse_brief("revise", probs)
     budget = a.timeout if a.timeout is not None else c["job_budget_s"]
     paths = job.get("paths")
     claim_job(job["id"], job["dir"], paths)
@@ -1969,6 +2074,18 @@ def cmd_delegate(a):
             die(f"cannot disable delegation for {sid}: {e}")
     prune_delegates()
     print("delegation mode: " + ("on" if a.action == "on" else "off"))
+    if a.action == "on":
+        print("\nRead these rules now; every brief and revise follows them.\n")
+        print(playbook_text())
+        try:
+            with open(marker, "w") as f:     # the hook then won't inject it a second time
+                json.dump({"shown": True}, f)
+        except OSError:
+            pass
+
+
+def cmd_playbook(a):
+    print(playbook_text())
 
 
 def cmd_list(a):
@@ -2013,6 +2130,7 @@ def main():
     r.add_argument("action", choices=["on", "off", "status"])
     r.add_argument("--session")
     r.set_defaults(fn=cmd_delegate)
+    s.add_parser("playbook").set_defaults(fn=cmd_playbook)
     a = p.parse_args()
     if a.cmd == "run" and a.task is None:
         # --paths uses nargs="+"; when it comes before the task, argparse

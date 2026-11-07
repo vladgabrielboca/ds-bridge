@@ -237,25 +237,29 @@ else:
 hooks = cfg.setdefault("hooks", {})
 if not isinstance(hooks, dict):
     sys.exit(f"install.sh: {path} hooks is not a JSON object")
-submit = hooks.setdefault("UserPromptSubmit", [])
-if not isinstance(submit, list):
-    sys.exit(f"install.sh: {path} hooks.UserPromptSubmit is not a list")
-
-for e in submit:
-    if not isinstance(e, dict) or not isinstance(e.get("hooks"), list):
+# UserPromptSubmit: the per-turn reminder; SessionStart "compact": the playbook again after compaction
+changed = False
+for event, matcher in (("UserPromptSubmit", None), ("SessionStart", "compact")):
+    lst = hooks.setdefault(event, [])
+    if not isinstance(lst, list):
+        sys.exit(f"install.sh: {path} hooks.{event} is not a list")
+    if any(isinstance(e, dict) and isinstance(e.get("hooks"), list) and
+           any(isinstance(h, dict) and h.get("command") == cmd for h in e["hooks"]) for e in lst):
         continue
-    for h in e["hooks"]:
-        if isinstance(h, dict) and h.get("command") == cmd:
-            print("settings.json: delegate hook already configured")
-            sys.exit(0)
-
-submit.append(entry)
+    e = {"hooks": [dict(ours)]}
+    if matcher:
+        e["matcher"] = matcher
+    lst.append(e)
+    changed = True
+if not changed:
+    print("settings.json: delegate hooks already configured")
+    sys.exit(0)
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")
 os.replace(tmp, path)
-print("settings.json: delegate hook configured")
+print("settings.json: delegate hooks configured")
 PY
 }
 
@@ -335,32 +339,28 @@ hooks = cfg.get("hooks")
 if not isinstance(hooks, dict):
     print("settings.json: delegate hook not set, nothing to remove")
     sys.exit(0)
-submit = hooks.get("UserPromptSubmit")
-if not isinstance(submit, list):
-    print("settings.json: delegate hook not set, nothing to remove")
-    sys.exit(0)
 
-keep, removed = [], 0
-for e in submit:
-    hit = False
-    if isinstance(e, dict) and isinstance(e.get("hooks"), list):
-        for h in e["hooks"]:
-            if isinstance(h, dict) and h.get("command") == cmd:
-                hit = True
-                break
-    if hit:
-        removed += 1
+removed = 0
+for event in ("UserPromptSubmit", "SessionStart"):
+    lst = hooks.get(event)
+    if not isinstance(lst, list):
+        continue
+    keep = []
+    for e in lst:
+        hit = isinstance(e, dict) and isinstance(e.get("hooks"), list) and any(
+            isinstance(h, dict) and h.get("command") == cmd for h in e["hooks"])
+        if hit:
+            removed += 1
+        else:
+            keep.append(e)
+    if keep:
+        hooks[event] = keep
     else:
-        keep.append(e)
+        del hooks[event]
 
 if not removed:
     print("settings.json: delegate hook not set, nothing to remove")
     sys.exit(0)
-
-if keep:
-    hooks["UserPromptSubmit"] = keep
-else:
-    del hooks["UserPromptSubmit"]
 if not hooks:
     del cfg["hooks"]
 

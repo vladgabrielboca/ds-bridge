@@ -122,7 +122,8 @@ The final report's `tok/s` is decode speed: output tokens per second while the m
 | `ds list` | List recent jobs with status and round. |
 | `ds stats [--days N \| --all]` | Summarise the ledger: jobs, rounds, worker tokens, Claude's reads and estimated savings. |
 | `ds log JOB [--tools-only]` | Print a readable transcript of the job's OpenCode session. |
-| `ds delegate on\|off\|status [--session ID]` | Per-chat delegation mode (session defaults to `CLAUDE_CODE_SESSION_ID`). |
+| `ds delegate on\|off\|status [--session ID]` | Per-chat delegation mode (session defaults to `CLAUDE_CODE_SESSION_ID`); `on` prints the planner playbook. |
+| `ds playbook` | Print the planner playbook: Claude's rules for briefs and reviews, with the brief template. |
 
 Flags: `-C DIR` sets the project directory (`run` and `init`), `-m MODEL` overrides the model for one job, `-f FILE` attaches a file to the brief (repeatable), `--paths P…` limits the job's file scope, `--timeout S` overrides `job_budget_s` for this invocation (`run`, `init`, `revise`), and `--check CMD` / `--fix-tries N` control the acceptance check (also on `revise`).
 
@@ -162,9 +163,17 @@ Snapshots skip media, build output, big files and dependency/cache directories, 
 
 `ds init -C <project>` is a normal job (snapshot, worker, report, approve/revise/reject) with a built-in task: explore the project and write `AGENTS.md` at the root, at most 40 lines of facts about layout, build/test/lint/run commands, conventions and things not to touch. It is scoped with `--paths AGENTS.md`. If `AGENTS.md` already exists it refuses unless you pass `--refresh`, which asks the worker to update the existing file and keep correct lines. OpenCode loads `AGENTS.md` automatically, so later briefs can be shorter.
 
+### Planner playbook and brief lint
+
+The worker is fast but literal, and it sees no skills, memories or earlier chats: any gap in a brief becomes a guess in the diff. `planner-playbook.md` holds the rules Claude follows as the planner: read the code first and name exact places, decide everything before writing, keep jobs to about 3 files, copy project rules into the brief word for word, write one exact action per numbered step, give DONE WHEN as a command, review step by step and revise with numbered, exact points.
+
+Claude sees the rules in every delegating chat, not only in a memory file, while keeping Claude's reading small (the point of the bridge): `ds delegate on` prints the playbook once (about 1,200 tokens), the delegation hook adds a one-line reminder each turn (about 60 tokens) and re-injects the playbook only after a context compaction, which could otherwise summarise it away. Two independent paths make that reliable: a `SessionStart` hook with matcher `compact`, and a backup in the per-turn hook, which scans only the new part of the chat transcript for `compact_boundary` records and re-injects the playbook for any compaction the first path did not cover. Both record which compactions they handled, so the playbook is injected once per compaction. If the playbook file cannot be read, or the hook fails while delegation is on, a visible warning is injected instead of nothing. `ds playbook` prints it on demand.
+
+`ds run` also enforces the floor. A brief must have the sections `GOAL:`, `FILES:`, `STEPS:` (numbered), `DO NOT:` and `DONE WHEN:` (`CONTEXT:` is recommended), be at least `brief_min_chars` long (default 300), and avoid vague phrases such as "etc.", "as needed", "appropriate", "something like" or "clean up" outside backticks and the `DO NOT:` section. A `ds revise` needs numbered points. A failing brief is refused before anything runs, with the list of problems and the template. Set `"brief_lint": false` in the config to turn the check off.
+
 ### Delegation mode (opt-in per chat)
 
-By default Claude works directly; delegation is switched on per chat. Type `/delegate` in Claude Code (the skill in `skills/delegate`, linked into `~/.claude/skills` by the installer) or say "delegate to deepseek", which runs `ds delegate on`; `/delegate off` or `ds delegate off` ends it. While it's on, a `UserPromptSubmit` hook (`hooks/delegate.py`) reminds Claude every turn to send all execution through `ds run ...` started in the background, and the guard blocks direct edits even with `guard_allow`, `guard_mode: "warn"` or `guard-off`; only `~/.claude` and `/tmp/claude-*` stay writable. The marker lives in `~/.local/state/ds-bridge/delegate/<session_id>` (from `CLAUDE_CODE_SESSION_ID`), and stale markers are removed after 30 days.
+By default Claude works directly; delegation is switched on per chat. Type `/delegate` in Claude Code (the skill in `skills/delegate`, linked into `~/.claude/skills` by the installer) or say "delegate to deepseek", which runs `ds delegate on`; `/delegate off` or `ds delegate off` ends it. While it's on, a `UserPromptSubmit` hook (`hooks/delegate.py`) reminds Claude in one line every turn to send all execution through `ds run ...` started in the background, and the guard blocks direct edits even with `guard_allow`, `guard_mode: "warn"` or `guard-off`; only `~/.claude` and `/tmp/claude-*` stay writable. The marker lives in `~/.local/state/ds-bridge/delegate/<session_id>` (from `CLAUDE_CODE_SESSION_ID`), and stale markers are removed after 30 days.
 
 ### Guard hook
 
@@ -221,6 +230,8 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `excluded_note` | `true` | Print the one-line note about changes snapshots cannot see. |
 | `notify` | `true` | Send a desktop notification when a run or revise finishes. |
 | `notify_min_s` | `15` | Don't notify for jobs shorter than this many seconds. |
+| `brief_lint` | `true` | Refuse `run` briefs without the required sections or with vague words, and `revise` feedback without numbered points. |
+| `brief_min_chars` | `300` | Minimum length of a `run` brief. |
 | `outside_ignore` | `[".git", "__pycache__", "media*", "*.log", "node_modules", ".venv"]` | Globs ignored by the `--paths` outside-change warning. |
 | `guard_allow` | `[]` | Globs of paths the guard hook always allows (for example `~/work/sandbox/*`). |
 | `guard_mode` | `"block"` | Guard hook behaviour for blocked paths: `"block"` (message to stderr, exit 2) or `"warn"` (allow the edit, show a warning to you and add context for Claude). |
