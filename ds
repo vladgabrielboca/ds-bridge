@@ -38,9 +38,13 @@ its own time limit (config "wrapup_s", default 180), and the report says the
 soft deadline was hit. With --paths, the bridge also lists changes outside the
 job's paths and shows them as a WARNING (config "outside_ignore", default
 [".git", "__pycache__", "media*", "*.log", "node_modules", ".venv"]).
+
+If OpenCode gives up because the provider is overloaded or rate-limited, ds
+waits (config "overload_wait_s", default [30, 90]) and continues the same
+session, at most "overload_retries" times (default 2).
 """
 import hashlib, json, os, signal, subprocess, sys, time, argparse, shutil, queue, threading, fcntl
-import fnmatch, tempfile, base64, collections, urllib.request, urllib.parse, secrets
+import fnmatch, re, tempfile, base64, collections, urllib.request, urllib.parse, secrets
 
 HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".local/share/ds-bridge")
@@ -59,6 +63,7 @@ DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
             "soft_timeout_frac": 0.8, "wrapup_s": 180,
             "max_files": 20000, "big_file_mb": 5,
             "fix_tries": 2, "check_timeout_s": 600, "job_budget_s": 1800,
+            "overload_retries": 2, "overload_wait_s": [30, 90],
             "excluded_note": True,
             "notify": True, "notify_min_s": 15,
             "outside_ignore": [".git", "__pycache__", "media*", "*.log",
@@ -92,6 +97,11 @@ WRAPUP_MSG = (
     "SOFT DEADLINE: stop working now and do not start anything new. Write your "
     "final report in the usual block (STATUS / SUMMARY / CHECKS / NOTES) "
     "immediately, including what is unfinished and anything not yet verified.")
+
+OVERLOAD_MSG = (
+    "Your previous request failed because the model provider was overloaded (not "
+    "your fault). Continue the task where you left off: check what is already done "
+    "before redoing anything, then reply with the usual final report block.")
 
 
 _CONFIG_CACHE = None
@@ -682,6 +692,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
     sid, texts, errors = session, [], []
     tok = {"input": 0, "output": 0, "cache_read": 0}
     cost, tools, steps = 0.0, 0, 0
+    step_open = False
     last = "thinking"
     cur_msg, cur_text = None, []
     live = {"available": False, "resp": None, "segs": [],
@@ -755,7 +766,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                    "out_tokens": totals["out"],
                    "tok_s": tok_s(), "ttft_s": ttft_s(), "live_tok_s": live_tok,
                    "phase": phase, "tool_since": tool_since, "args_tool": args_tool,
-                   "args_since": args_since}
+                   "args_since": args_since, "owner": job.get("owner") or ""}
             obj.update(extra)
             try:
                 os.makedirs(PROGRESS, exist_ok=True)
@@ -980,7 +991,11 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             sid = ev.get("sessionID", sid)
             t, part = ev.get("type"), ev.get("part") or {}
             if t == "step_start":
-                steps += 1
+                # A step_start with no step_finish since the last one is
+                # OpenCode retrying the same step (e.g. provider overloaded).
+                if not step_open:
+                    steps += 1
+                step_open = True
                 if tools == 0:
                     last = "thinking"
             if t == "text":
@@ -998,6 +1013,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                     detail = inp.get("path") or inp.get("filePath") or inp.get("pattern") or ""
                 last = " ".join(f"{nm} {detail}".split())[:60]
             elif t == "step_finish":
+                step_open = False
                 tk = part.get("tokens") or {}
                 tok["input"] += tk.get("input", 0)
                 tok["output"] += tk.get("output", 0) + tk.get("reasoning", 0)
@@ -1104,6 +1120,76 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
     return res
 
 
+OVERLOAD_RE = re.compile(r"overloaded|rate.?limit|too many requests|retry shortly"
+                         r"|\b(429|503|529)\b", re.I)
+
+
+def is_overload(errors):
+    # OpenCode also exits non-zero after giving up, which adds an "opencode
+    # exited" error next to the provider's; timeouts never match.
+    return (any(OVERLOAD_RE.search(str(e)) for e in errors)
+            and not any(str(e).startswith("timeout after") for e in errors))
+
+
+def merge_results(first, later):
+    """Combine two run_opencode results of the same session; later wins for text."""
+    out = dict(later)
+    out["tokens"] = {k: first["tokens"].get(k, 0) + later["tokens"].get(k, 0)
+                     for k in ("input", "output", "cache_read")}
+    for k in ("cost", "secs", "tools", "dec_tokens", "dec_ms"):
+        out[k] = (first.get(k) or 0) + (later.get(k) or 0)
+    out["ttft"] = (first.get("ttft") or []) + (later.get("ttft") or [])
+    out["tok_s"] = (round(out["dec_tokens"] / (out["dec_ms"] / 1000))
+                    if out["dec_ms"] else None)
+    out["report"] = later.get("report") or first.get("report")
+    out["session"] = later.get("session") or first.get("session")
+    if first.get("soft_deadline") and not later.get("soft_deadline"):
+        out["soft_deadline"] = first["soft_deadline"]
+    return out
+
+
+def run_retrying(d, msg, model, agent, session=None, files=(), job=None,
+                 limit_s=None, deadline=None):
+    """run_opencode, continuing the same session when the provider is overloaded.
+
+    OpenCode already retries a step for about two minutes before giving up; this
+    waits longer between whole attempts (config overload_wait_s) so a busy
+    provider has time to recover instead of failing the job.
+    """
+    c = cfg()
+    waits = list(c.get("overload_wait_s") or [])[:max(0, int(c.get("overload_retries") or 0))]
+    t0 = time.time()
+    res = run_opencode(d, msg, model, agent, session=session, files=files, job=job,
+                       limit_s=limit_s, deadline=deadline)
+    tries = 0
+    while is_overload(res["errors"]) and tries < len(waits) and job is not None:
+        sid = res.get("session") or session
+        if not sid:
+            break
+        wait = float(waits[tries])
+        left = [x for x in (
+            (limit_s - (time.time() - t0)) if limit_s is not None else None,
+            (deadline - time.time()) if deadline is not None else None) if x is not None]
+        if left and min(left) < wait + FIX_MIN_S:
+            break
+        tries += 1
+        write_progress_file(job, model, state="running",
+                            last=f"provider overloaded · retry {tries}/{len(waits)}",
+                            phase="tool", tool_since=int(time.time()), live_tok_s=None,
+                            args_tool=None, args_since=None)
+        time.sleep(wait)
+        lim = None if limit_s is None else max(1.0, limit_s - (time.time() - t0))
+        nxt = run_opencode(d, OVERLOAD_MSG, model, agent, session=sid, job=job,
+                           limit_s=lim, deadline=deadline)
+        res = merge_results(res, nxt)
+    if tries:
+        res["overload_retries"] = tries
+        if res["errors"]:
+            res["errors"] = res["errors"] + [f"still failing after {tries} overload "
+                                             "retr" + ("y" if tries == 1 else "ies")]
+    return res
+
+
 def write_progress_file(job, model, **fields):
     path = os.path.join(PROGRESS, job["id"] + ".json")
     try:
@@ -1113,6 +1199,7 @@ def write_progress_file(job, model, **fields):
                "out_tokens": 0, "tok_s": None, "ttft_s": None,
                "job": job["id"], "round": job["round"],
                "model": model, "dir": os.path.basename(job["dir"])}
+    obj["owner"] = job.get("owner") or ""
     obj.update(fields)
     obj["pid"] = os.getpid()
     obj["updated"] = time.time()
@@ -1166,7 +1253,7 @@ def run_with_check(job, msg, session=None, files=(), budget_s=None):
     def limit(cap):
         return min(cap, max(1.0, remaining()))
 
-    res = run_opencode(d, msg, job["model"], job["agent"], session=session, files=files,
+    res = run_retrying(d, msg, job["model"], job["agent"], session=session, files=files,
                        job=job, limit_s=limit(c["timeout_s"]), deadline=deadline)
     if res["errors"]:
         return res
@@ -1189,7 +1276,7 @@ def run_with_check(job, msg, session=None, files=(), budget_s=None):
                 f"Exit: {chk['code']}\nLast output lines:\n{chk['output']}\n"
                 "Fix the cause within the original task scope, then reply with the "
                 "final report block.")
-        res = run_opencode(d, fmsg, job["model"], job["agent"],
+        res = run_retrying(d, fmsg, job["model"], job["agent"],
                            session=res.get("session") or job.get("session"), job=job,
                            limit_s=limit(c["timeout_s"]), deadline=deadline)
         results.append(res)
@@ -1210,6 +1297,9 @@ def run_with_check(job, msg, session=None, files=(), budget_s=None):
     soft = [r["soft_deadline"] for r in results if r.get("soft_deadline")]
     if soft:
         out["soft_deadline"] = soft[0]
+    retried = sum(r.get("overload_retries") or 0 for r in results)
+    if retried:
+        out["overload_retries"] = retried
     out["check"] = {"cmd": check, "pass": chk["pass"], "code": chk["code"],
                     "output": chk["output"], "rounds": rounds}
     if skipped:
@@ -1367,6 +1457,10 @@ def emit(job, res):
     if soft:
         out.append(f"SOFT DEADLINE HIT: worker stopped at {soft['at']}s "
                    f"({soft['frac']:g} × {soft['limit_s']}s) and was asked to wrap up.")
+    if res.get("overload_retries"):
+        n = res["overload_retries"]
+        out.append(f"NOTE: provider overloaded; continued the session {n} time"
+                   + ("" if n == 1 else "s") + ".")
     if res["errors"]:
         out.append("ERRORS: " + " | ".join(e[:300] for e in res["errors"]))
     out.append("--- report")
@@ -1602,6 +1696,7 @@ def cmd_run(a):
         job = {"id": jid, "dir": d, "shadow": gd, "base": base, "model": a.m or c["model"],
                "agent": c["agent"], "session": new_session_id(), "round": 1, "status": "open",
                "paths": paths, "task": task, "check": a.check,
+               "owner": os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
                "fix_tries": a.fix_tries if a.fix_tries is not None else c["fix_tries"]}
         save(job)
         outside = outside_listing(d, paths) if paths else None
@@ -1645,6 +1740,8 @@ def cmd_revise(a):
     claim_job(job["id"], job["dir"], paths)
     post_taken = False
     try:
+        # The chat that revises owns the job's status line from now on.
+        job["owner"] = os.environ.get("CLAUDE_CODE_SESSION_ID") or job.get("owner") or ""
         job["round"] += 1
         job["round_base"] = snapshot(job["dir"], job["shadow"], f"{job['id']} r{job['round']}",
                                      job_index(job["id"]), job["id"], paths)

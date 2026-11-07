@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Claude Code status line: show ds-bridge progress for all jobs.
-# Needs only jq and awk. Ignores stdin.
-cat >/dev/null 2>&1
+# Claude Code status line: show ds-bridge progress for this chat's jobs in
+# full, and other chats' running jobs as one "+N … in other chats" line.
+# Needs only jq and awk. Reads the session id from Claude Code's stdin JSON.
+me=$(jq -r '.session_id // ""' 2>/dev/null)
 
 P="$HOME/.local/share/ds-bridge/progress"
 TODAY="$HOME/.local/share/ds-bridge/today.json"
@@ -62,6 +63,7 @@ fmt_secs() {
 
 records=()
 running=0
+others=0
 for f in "${files[@]}"; do
     data=$(jq -r '[(.state // ""), (.job // ""), (.round // 0), (.steps // 0),
                    (.tools // 0), (.out_tokens // 0), ((.started // 0) | floor),
@@ -69,10 +71,10 @@ for f in "${files[@]}"; do
                    (.tok_s // ""), ((.pid // 0) | floor), (.phase // ""),
                    (.live_tok_s // ""), ((.tool_since // 0) | floor),
                    (.args_tool // ""), ((.args_since // 0) | floor),
-                   (.ttft_s // "")]
+                   (.ttft_s // ""), (.owner // "")]
                   | map(tostring) | join("\u001f")' "$f" 2>/dev/null) || continue
     [ -n "$data" ] || continue
-    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s pid phase live_tok_s tool_since args_tool args_since ttft_s <<< "$data"
+    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s pid phase live_tok_s tool_since args_tool args_since ttft_s owner <<< "$data"
     last=${last//$'\t'/ }
     last=${last//$'\n'/ }
 
@@ -164,10 +166,32 @@ for f in "${files[@]}"; do
             ;;
     esac
 
+    # Jobs started from another chat: count them while running, hide otherwise.
+    # A job with no owner (started outside Claude Code) shows everywhere.
+    if [ -n "$owner" ] && [ -n "$me" ] && [ "$owner" != "$me" ]; then
+        if [ "$is_running" = "1" ]; then
+            others=$((others + 1))
+            running=$((running - 1))
+        fi
+        continue
+    fi
+
     records+=("$started"$'\t'"$is_running"$'\t'"$line")
 done
 
-[ ${#records[@]} -gt 0 ] || { idle; exit 0; }
+others_line() {
+    [ "$others" -gt 0 ] || return 0
+    if [ "$others" -eq 1 ]; then
+        printf '+1 DeepSeek job in another chat\n'
+    else
+        printf '+%d DeepSeek jobs in other chats\n' "$others"
+    fi
+}
+
+if [ ${#records[@]} -eq 0 ]; then
+    if [ "$others" -gt 0 ]; then others_line; else idle; fi
+    exit 0
+fi
 
 mapfile -t sorted < <(printf '%s\n' "${records[@]}" | sort -t $'\t' -k1,1nr)
 n=${#sorted[@]}
@@ -191,4 +215,5 @@ else
         print_record "${sorted[$i]}"
     done
 fi
+others_line
 exit 0

@@ -101,7 +101,7 @@ Claude Code's status line can poll ds-bridge once a second (`refreshInterval: 1`
 DeepSeek idle · 4 jobs today · ≈38k tok saved
 ```
 
-Each active job gets its own line, up to four; when nothing is running the line shows today's ledger instead. A run or revise that lasts at least `notify_min_s` seconds also sends a desktop notification with the job id, project, duration and check result.
+Each active job gets its own line, up to four; when nothing is running the line shows today's ledger instead. Every chat sees only its own jobs: ds records the Claude Code session that ran (or last revised) a job, and jobs from other chats collapse into one `+N DeepSeek jobs in other chats` line while they run. Jobs started outside Claude Code show in every chat. A run or revise that lasts at least `notify_min_s` seconds also sends a desktop notification with the job id, project, duration and check result.
 
 There is no percentage. An agent can't know its step count in advance, so the line shows elapsed time, the step reached so far, and the last tool call instead of inventing a progress bar.
 
@@ -133,6 +133,10 @@ Flags: `-C DIR` sets the project directory (`run` and `init`), `-m MODEL` overri
 ### Soft deadline
 
 A worker call that passes `soft_timeout_frac × timeout_s` (default `0.8`, so 24 minutes of a 30-minute run) is stopped and the same session is asked for its final report, including anything unfinished. That wrap-up call has its own limit, `wrapup_s` (default `180`). The `--check` still runs afterwards, and the report starts with `SOFT DEADLINE HIT`. This applies to `ds run`, `ds init` and `ds revise`, including auto-fix rounds. Both the hard timeout and the soft deadline interrupt the session through the OpenCode service, not just the `opencode run` client, so the worker stops running tools; the wrap-up call then reaches an idle session. ds chooses the session id itself before the worker starts, so interrupt works from the first second.
+
+### Provider overload
+
+OpenCode already retries a model request for about two minutes when the provider answers "overloaded" or rate-limited. If it still gives up, ds waits (`overload_wait_s`, default 30 s then 90 s, at most `overload_retries` times) and continues the same session, asking the worker to pick up where it left off. The status line shows `provider overloaded · retry N/M` while waiting, the report gets a `NOTE: provider overloaded` line, and a retry is skipped when the job's time budget can't fit it.
 
 ### Job time budget
 
@@ -210,6 +214,8 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `max_files` | `20000` | Refuse to snapshot directories with more tracked files. |
 | `big_file_mb` | `5` | Files larger than this are excluded from snapshots. |
 | `fix_tries` | `2` | Auto-fix rounds after a failed `--check` (override per job with `--fix-tries`). |
+| `overload_retries` | `2` | Times ds continues the session after the provider stays overloaded. |
+| `overload_wait_s` | `[30, 90]` | Seconds to wait before each overload retry. |
 | `check_timeout_s` | `600` | Timeout for one `--check` command. |
 | `job_budget_s` | `1800` | Time budget for a whole `run`/`init`/`revise` invocation (override with `--timeout`). |
 | `excluded_note` | `true` | Print the one-line note about changes snapshots cannot see. |
