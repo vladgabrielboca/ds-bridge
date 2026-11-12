@@ -173,7 +173,7 @@ Every step needs `files:` (the job's `--paths`). Groups (`--steps "1-2,3"`, defa
 
 ### Where the rules live
 
-`~/.claude/CLAUDE.md` holds only a short pointer (delegation is opt-in, `/delegate` turns it on). The full rules are `planner-playbook.md`: `ds delegate on` prints them, the delegation hook brings them back after a compaction, and a one-line reminder repeats each turn. A chat that never delegates pays for none of it.
+`~/.claude/CLAUDE.md` holds only a short pointer (delegation is opt-in, `/ds:on` turns it on). The full rules are `planner-playbook.md`: `ds delegate on` prints them, the delegation hook brings them back after a compaction, and a one-line reminder repeats each turn. A chat that never delegates pays for none of it.
 
 ### `ds research`: learn the code without reading it
 
@@ -273,7 +273,28 @@ Claude sees the rules in every delegating chat, not only in a memory file, while
 
 ### Delegation mode (opt-in per chat)
 
-By default Claude works directly; delegation is switched on per chat. Type `/delegate` in Claude Code (the skill in `skills/delegate`, linked into `~/.claude/skills` by the installer) or say "delegate to deepseek", which runs `ds delegate on`; `/delegate off` or `ds delegate off` ends it. While it's on, a `UserPromptSubmit` hook (`hooks/delegate.py`) reminds Claude in one line every turn to send all execution through `ds run ...` started in the background, and the guard blocks direct edits even with `guard_allow`, `guard_mode: "warn"` or `guard-off`; only `~/.claude` and `/tmp/claude-*` stay writable. The marker lives in `~/.local/state/ds-bridge/delegate/<session_id>` (from `CLAUDE_CODE_SESSION_ID`), and stale markers are removed after 30 days.
+By default Claude works directly; delegation is switched on per chat. In Claude Code, the `ds` plugin (in `plugin/`, installed by the installer from this repo's local marketplace) adds:
+
+| Command | What it does |
+|---|---|
+| `/ds:on` | Turn delegation on for this chat (worker: the chat's model, else the default Flash). Also "delegate to deepseek", "use ds". |
+| `/ds:muse` | On, with Muse Spark as this chat's worker (faster, slightly weaker). |
+| `/ds:flash` | On, with DeepSeek Flash as this chat's worker. |
+| `/ds:off` | Off: Claude works directly again. Also "stop delegating". |
+| `/ds:status` | Show the state: worker, fallback, extra round, what happens on failure. |
+
+Each prints a status block, e.g.
+
+```
+ds delegation: ON in this chat
+  worker      muse
+  fallback    flash   (provider fails or hits a limit)
+  extra round flash   (after the fix rounds fail)
+  on failure  Claude asks you first
+  switch: /ds:flash or /ds:muse · off: /ds:off
+```
+
+The same from a shell: `ds delegate on [--model muse]`, `ds delegate model flash`, `ds delegate off`, `ds delegate status`. The chat's model applies to every `ds run`, `ds research` and `ds batch` in that chat that passes no `-m`. Only `/ds:on` and `/ds:off` are visible to Claude for natural-language use (about 200 tokens per session for the whole plugin); the other three are yours to type. The plugin is a cached copy: after editing `plugin/`, bump its version in `plugin/.claude-plugin/plugin.json` and run `claude plugin marketplace update ds-bridge && claude plugin update ds@ds-bridge`. While it's on, a `UserPromptSubmit` hook (`hooks/delegate.py`) reminds Claude in one line every turn to send all execution through `ds run ...` started in the background, and the guard blocks direct edits even with `guard_allow`, `guard_mode: "warn"` or `guard-off`; only `~/.claude` and `/tmp/claude-*` stay writable. The marker lives in `~/.local/state/ds-bridge/delegate/<session_id>` (from `CLAUDE_CODE_SESSION_ID`), and stale markers are removed after 30 days.
 
 ### Guard hook
 
@@ -303,7 +324,7 @@ cd ds-bridge
 ./install.sh
 ```
 
-The installer merges the `worker` agent into `~/.config/opencode/opencode.json` (backing it up first), links `ds` into `~/.local/bin`, adds the status line, the `PreToolUse` guard hook and the `UserPromptSubmit` delegation hook to `~/.claude/settings.json`, and links the `/delegate` skill. It never edits `CLAUDE.md` itself, so finish by adding the rules in `claude-rules.md` to `~/.claude/CLAUDE.md` (or a project `CLAUDE.md`). It creates `~/.config/ds-bridge/guard-off`, so the guard only acts in chats with delegation mode on; delete that file to guard every chat.
+The installer merges the `worker` agent into `~/.config/opencode/opencode.json` (backing it up first), links `ds` into `~/.local/bin`, adds the status line, the `PreToolUse` guard hook and the `UserPromptSubmit` delegation hook to `~/.claude/settings.json`, and installs the Claude Code plugin `ds` (`/ds:on`, `/ds:muse`, `/ds:flash`, `/ds:off`, `/ds:status`) from this repo's local marketplace. It never edits `CLAUDE.md` itself, so finish by adding the rules in `claude-rules.md` to `~/.claude/CLAUDE.md` (or a project `CLAUDE.md`). It creates `~/.config/ds-bridge/guard-off`, so the guard only acts in chats with delegation mode on; delete that file to guard every chat.
 
 `./install.sh --uninstall` removes the worker agent, the symlink, the status line and the guard hook, touching only what ds-bridge created.
 

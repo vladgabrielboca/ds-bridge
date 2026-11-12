@@ -457,22 +457,33 @@ restart_opencode() {
 }
 
 link_skill() {
-    local dest="$CLAUDE_DIR/skills/delegate"
-    mkdir -p "$CLAUDE_DIR/skills"
-    if [ -L "$dest" ] || [ ! -e "$dest" ]; then
-        ln -sfn "$DIR/skills/delegate" "$dest"
-        say "linked /delegate skill -> $dest"
+    # the /ds:on, /ds:muse, /ds:flash, /ds:off, /ds:status commands: plugin "ds" from this repo's
+    # local marketplace (.claude-plugin/marketplace.json); the old /delegate skill link goes
+    local old="$CLAUDE_DIR/skills/delegate"
+    if [ -L "$old" ]; then
+        rm "$old"
+        say "removed the old /delegate skill link (now /ds:on etc.)"
+    fi
+    if command -v claude >/dev/null 2>&1; then
+        claude plugin marketplace add "$DIR" >/dev/null 2>&1 || claude plugin marketplace update ds-bridge >/dev/null 2>&1 || true
+        if claude plugin install ds@ds-bridge >/dev/null 2>&1 || claude plugin update ds@ds-bridge >/dev/null 2>&1; then
+            say "installed Claude Code plugin ds (/ds:on /ds:muse /ds:flash /ds:off /ds:status)"
+        else
+            warn "could not install the ds plugin; run: claude plugin marketplace add $DIR && claude plugin install ds@ds-bridge"
+        fi
     else
-        warn "$dest exists and is not a link; leaving it (remove it to use the repo's skill)"
+        warn "claude CLI not found; install the plugin later: claude plugin marketplace add $DIR && claude plugin install ds@ds-bridge"
     fi
 }
 
 unlink_skill() {
-    local dest="$CLAUDE_DIR/skills/delegate"
-    if [ -L "$dest" ]; then
-        rm "$dest"
-        say "removed /delegate skill link"
+    local old="$CLAUDE_DIR/skills/delegate"
+    [ -L "$old" ] && rm "$old" && say "removed /delegate skill link"
+    if command -v claude >/dev/null 2>&1; then
+        claude plugin uninstall ds@ds-bridge >/dev/null 2>&1 && say "uninstalled Claude Code plugin ds"
+        claude plugin marketplace remove ds-bridge >/dev/null 2>&1 || true
     fi
+    return 0
 }
 
 do_uninstall() {
@@ -510,7 +521,7 @@ do_install() {
     link_skill
     mkdir -p "$HOME/.config/ds-bridge"
     touch "$HOME/.config/ds-bridge/guard-off"
-    say "delegation is opt-in per chat: /delegate (or 'ds delegate on') turns it on;"
+    say "delegation is opt-in per chat: /ds:on or /ds:muse (or 'ds delegate on') turns it on;"
     say "  the guard then blocks direct edits in that chat only."
     say "  to guard every chat instead: rm ~/.config/ds-bridge/guard-off"
 

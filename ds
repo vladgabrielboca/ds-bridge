@@ -2463,7 +2463,7 @@ def cmd_run(a):
             a.f = [to_copy(f, d, work) for f in a.f]
     try:
         base = snapshot(work, gd, f"pre {jid}", job_index(jid), jid, paths)
-        job = {"id": jid, "dir": work, "shadow": gd, "base": base, "model": resolve_model(a.m) or c["model"],
+        job = {"id": jid, "dir": work, "shadow": gd, "base": base, "model": resolve_model(a.m) or chat_model() or c["model"],
                "agent": getattr(a, "agent", None) or c["agent"], "session": new_session_id(),
                "round": 1, "status": "open",
                "paths": paths, "task": task, "check": a.check,
@@ -3259,36 +3259,111 @@ def prune_delegates():
             pass
 
 
+def read_marker(marker):
+    try:
+        raw = open(marker).read().strip()
+    except OSError:
+        return None
+    if not raw:
+        return {}
+    try:
+        st = json.loads(raw)
+        return st if isinstance(st, dict) else {"shown": True}
+    except ValueError:
+        return {"shown": True}
+
+
+def write_marker_state(marker, st):
+    os.makedirs(DELEGATE, exist_ok=True)
+    tmp = marker + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.replace(tmp, marker)
+
+
+def chat_model():
+    """The worker model chosen for this chat (`ds delegate on --model` / `ds delegate model`), or None."""
+    sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    if not sid:
+        return None
+    st = read_marker(os.path.join(DELEGATE, sid))
+    return resolve_model(st.get("model")) if st else None
+
+
+def short_model(m):
+    names = {v: k for k, v in (cfg().get("models") or {}).items()}
+    return names.get(m, m.split("/")[-1])
+
+
+def delegate_status_block(st):
+    c = cfg()
+    if st is None:
+        return ("ds delegation: OFF in this chat\n"
+                "  Claude works directly. Turn on: /ds:on (Flash) or /ds:muse")
+    model = resolve_model(st.get("model")) or c["model"]
+    fb = (c.get("fallback_model") or "").strip()
+    if fb == model:
+        fb = other_model(model) or ""
+    esc = (c.get("escalation_model") or "").strip()
+    if esc == model:
+        esc = other_model(model) or ""
+    lines = ["ds delegation: ON in this chat",
+             f"  worker      {short_model(model)}" + ("" if st.get("model") else " (default)"),
+             f"  fallback    {short_model(fb) if fb else 'none'}   (provider fails or hits a limit)",
+             f"  extra round {short_model(esc) if esc else 'none'}   (after the fix rounds fail)",
+             f"  on failure  {'Sonnet subagent takes over' if c.get('takeover') == 'sonnet' else 'Claude asks you first'}",
+             "  switch: /ds:flash or /ds:muse · off: /ds:off"]
+    return "\n".join(lines)
+
+
 def cmd_delegate(a):
+    if getattr(a, "model_opt", None):
+        a.model = a.model_opt
     sid = delegate_session(a)
     marker = os.path.join(DELEGATE, sid)
+    st = read_marker(marker) if os.path.exists(marker) else None
+    want = getattr(a, "model", None)
+    if want and resolve_model(want) == want and "/" not in want:
+        die(f"unknown model name {want!r}; known: {', '.join(cfg().get('models') or {})} or a provider/model id")
     if a.action == "status":
-        print("delegation mode: " + ("on" if os.path.exists(marker) else "off"))
+        print(delegate_status_block(st))
         return
-    if a.action == "on":
-        try:
-            os.makedirs(DELEGATE, exist_ok=True)
-            with open(marker, "a"):
-                pass
-        except OSError as e:
-            die(f"cannot enable delegation for {sid}: {e}")
-    else:
+    if a.action == "model":
+        if not want:
+            die("ds delegate model NAME (e.g. flash, muse)")
+        if st is None:
+            die("delegation is off in this chat; turn it on with ds delegate on --model " + want)
+        st["model"] = want
+        write_marker_state(marker, st)
+        print(delegate_status_block(st))
+        return
+    if a.action == "off":
         try:
             os.remove(marker)
         except FileNotFoundError:
             pass
         except OSError as e:
             die(f"cannot disable delegation for {sid}: {e}")
+        prune_delegates()
+        print(delegate_status_block(None))
+        return
+    # on
+    first = st is None or not st.get("shown")
+    st = dict(st or {})
+    if want:
+        st["model"] = want
+    st["shown"] = True            # the hook then won't inject the playbook a second time
+    try:
+        write_marker_state(marker, st)
+    except OSError as e:
+        die(f"cannot enable delegation for {sid}: {e}")
     prune_delegates()
-    print("delegation mode: " + ("on" if a.action == "on" else "off"))
-    if a.action == "on":
+    print(delegate_status_block(st))
+    if first:
         print("\nRead these rules now; every brief and revise follows them.\n")
         print(playbook_text())
-        try:
-            with open(marker, "w") as f:     # the hook then won't inject it a second time
-                json.dump({"shown": True}, f)
-        except OSError:
-            pass
+    else:
+        print("\n(rules already shown in this chat: ds playbook prints them again)")
 
 
 def cmd_playbook(a):
@@ -3349,7 +3424,9 @@ def main():
     r = s.add_parser("log"); r.add_argument("job")
     r.add_argument("--tools-only", action="store_true"); r.set_defaults(fn=cmd_log)
     r = s.add_parser("delegate")
-    r.add_argument("action", choices=["on", "off", "status"])
+    r.add_argument("action", choices=["on", "off", "status", "model"])
+    r.add_argument("model", nargs="?")
+    r.add_argument("--model", dest="model_opt")
     r.add_argument("--session")
     r.set_defaults(fn=cmd_delegate)
     s.add_parser("playbook").set_defaults(fn=cmd_playbook)

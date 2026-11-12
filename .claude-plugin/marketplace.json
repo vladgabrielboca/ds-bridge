@@ -1,0 +1,11 @@
+{
+  "name": "ds-bridge",
+  "owner": { "name": "ds-bridge" },
+  "plugins": [
+    {
+      "name": "ds",
+      "source": "./plugin",
+      "description": "Delegation commands for ds-bridge: /ds:on, /ds:muse, /ds:flash, /ds:off, /ds:status"
+    }
+  ]
+}
