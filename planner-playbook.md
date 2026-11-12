@@ -34,8 +34,7 @@ Claude turn re-reads the whole chat, so: few turns, short messages, no re-checki
   JOB`, then run the check yourself.
 - `PARTIAL` after the soft deadline: the step was too big; split it before trying again.
 - `FAIL` / `PARTIAL` / `CONFLICT`: follow the block's `next:` line. Default: ask the user one question:
-  a Sonnet subagent finishes it (Agent tool, model sonnet, given the task, the found: note and the
-  job's files), `ds revise` with the findings, or stop. With `"takeover": "sonnet"` the block says to
+  `ds revise` with the findings, you finish it yourself, or stop. With `"takeover": "sonnet"` the block says to
   hand it to Sonnet in the job's directory straight away, then `ds approve`. Don't take it over yourself.
 - `PROVIDER` / `ERROR`: tell the user and stop; don't do the work yourself.
 - `LIMIT`: a usage limit (e.g. Go's 5 h window): tell the user which one and when it resets; don't retry.

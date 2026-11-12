@@ -202,8 +202,8 @@ def pre(p):
             return
         if tool == "Bash" and (DS_ANY.search(cmd) or DS_CMD.search(cmd) or READ_BASH.match(cmd)):
             return
-        deny("The worker did not finish this step: ask the user first with one question (a Sonnet "
-             "subagent finishes it from the found: note, ds revise with the findings, or stop), "
+        deny("The worker did not finish this step: ask the user first with one question (ds revise "
+             "with the findings; you finish it yourself; or stop), "
              "then do what they pick. Don't take it over yourself.")
 
 
