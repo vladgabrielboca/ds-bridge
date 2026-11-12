@@ -10,8 +10,8 @@ Adapted from cheap-agent's hook (src/hook.ts, MIT), only for chats with delegati
   * after "notdone": only reads, ds commands, asking the user (AskUserQuestion) and loading tools
     pass; anything else is denied until the user has been asked, then the state clears
     (a FAIL with check=env, where the check could not run at all, is not "notdone").
-- PreToolUse (Bash), always: commands that write project files (redirects, tee, cp/mv targets,
-  sed -i, scripts opening files for writing) are denied; /tmp, ~/.claude, ds state and .plan/
+- PreToolUse (Bash), always: commands that write project files (redirects, tee, sed -i,
+  scripts opening files for writing) are denied (cp/mv are allowed: no content goes through Claude); /tmp, ~/.claude, ds state and .plan/
   stay free, and a ds brief inside a heredoc is ignored.
 A new user prompt starts fresh (state is keyed by Claude Code's prompt_id, or by our own counter
 that the UserPromptSubmit event advances when prompt_id is missing). Never breaks the session: any error
@@ -37,8 +37,8 @@ ENV_FAIL = re.compile(r"^FAIL\s+\S+.*\bcheck=env\b", re.M)
 # Bash forms that write a file (cheap-agent's hook: the benchmark showed Claude writing whole files
 # this way to get past the edit guard). Heredoc bodies are stripped first: ds briefs travel in them.
 BASH_WRITES = [re.compile(r"(?:^|[^<>0-9&])>{1,2}\s*[\"']?(?P<path>[^\s\"'|;&()]+)"),
-               re.compile(r"\btee\s+(?:-a\s+)?[\"']?(?P<path>[^\s\"'|;&]+)"),
-               re.compile(r"\b(?:cp|mv)\s+(?:-\S+\s+)*\S+\s+[\"']?(?P<path>[^\s\"'|;&]+)")]
+               re.compile(r"\btee\s+(?:-a\s+)?[\"']?(?P<path>[^\s\"'|;&]+)")]
+# cp/mv stay allowed: copying existing files puts no file content through Claude (unlike cheap-agent)
 BASH_INPLACE = re.compile(r"\b(?:sed|perl)\s+(?:-[a-zA-Z]*i|--in-place)\b")
 BASH_CODE_WRITES = re.compile(r"\b(?:python3?|node)\b[\s\S]*(?:open\([^)]*[\"'][wa]|writeFile|\.write_text|\.write_bytes)")
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\s*(?:\n|$)", re.S)
@@ -146,11 +146,18 @@ def bash_write(cmd, cwd):
     """The file a Bash command writes outside scratch space, or a description of an in-place edit."""
     body = HEREDOC.sub("\n", cmd)
     plan_heredoc = re.search(r"<<", cmd) and re.search(r"(?:^|[\s;&|/])ds\s+(run|revise|batch|research)\b", cmd)
-    targets = [m.group("path") for rx in BASH_WRITES for m in rx.finditer(body)]
-    for t in targets:
+    # resolve each part against the folder the command is in at that point (`cd X && …`)
+    targets, cur = [], cwd or os.getcwd()
+    for part in re.split(r"&&|\|\||;|\n", body):
+        cd = re.match(r"\s*(?:pushd|cd)\s+(?P<d>[^\s;&|]+)\s*$", part)
+        if cd:
+            cur = os.path.join(cur, os.path.expanduser(cd.group("d").strip("\"'")))
+            continue
+        targets += [(m.group("path"), cur) for rx in BASH_WRITES for m in rx.finditer(part)]
+    for t, base in targets:
         if t.startswith("&") or t in ("/dev/null", "-"):
             continue
-        full = os.path.realpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(t)))
+        full = os.path.realpath(os.path.join(base, os.path.expanduser(t)))
         if not full.startswith(FREE_PREFIXES) and "/.plan/" not in full:   # ds batch plans may live in .plan/
             return full
     if BASH_INPLACE.search(body):

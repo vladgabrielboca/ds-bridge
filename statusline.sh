@@ -28,7 +28,7 @@ idle() {
     IFS=$'\x1f' read -r day jobs saved <<< "$data"
     [ "$day" = "$(date +%F)" ] || return 0
     [ "$jobs" -gt 0 ] 2>/dev/null || return 0
-    printf 'DeepSeek idle · %s jobs today · ≈%s tok saved\n' \
+    printf 'ds idle · %s jobs today · ≈%s tok saved\n' \
         "$jobs" "$(fmt_num "$saved")"
 }
 
@@ -71,10 +71,16 @@ for f in "${files[@]}"; do
                    (.tok_s // ""), ((.pid // 0) | floor), (.phase // ""),
                    (.live_tok_s // ""), ((.tool_since // 0) | floor),
                    (.args_tool // ""), ((.args_since // 0) | floor),
-                   (.ttft_s // ""), (.owner // "")]
+                   (.ttft_s // ""), (.owner // ""), (.model // "")]
                   | map(tostring) | join("\u001f")' "$f" 2>/dev/null) || continue
     [ -n "$data" ] || continue
-    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s pid phase live_tok_s tool_since args_tool args_since ttft_s owner <<< "$data"
+    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s pid phase live_tok_s tool_since args_tool args_since ttft_s owner model <<< "$data"
+    # the worker's model, not a fixed "DeepSeek": Muse, Flash, or the model id
+    case "$model" in
+        *muse*) wl="Muse" ;;
+        *deepseek*flash*|"") wl="Flash" ;;
+        *) wl="${model##*/}" ;;
+    esac
     last=${last//$'\t'/ }
     last=${last//$'\n'/ }
 
@@ -103,7 +109,7 @@ for f in "${files[@]}"; do
             fi
             if [ "$alive" = "0" ]; then
                 [ "$age" -le 120 ] || continue
-                line=$(printf '✗ DeepSeek %s interrupted' "$job")
+                line=$(printf '✗ %s %s interrupted' "$wl" "$job")
             else
                 live_seg="$tok_s_seg"
                 case "$phase" in
@@ -137,12 +143,12 @@ for f in "${files[@]}"; do
                         ;;
                 esac
                 if [ "$age" -gt 1800 ]; then
-                    line=$(printf 'DeepSeek %s stalled?' "$job")
+                    line=$(printf '%s %s stalled?' "$wl" "$job")
                 else
                     spinners=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
                     sp=${spinners[$((now % 10))]}
-                    line=$(printf '%s DeepSeek %s r%s · %s · step %s · %s tools · %s tok%s · ▸ %s' \
-                        "$sp" "$job" "$round" "$(fmt_secs $((now - started)))" \
+                    line=$(printf '%s %s %s r%s · %s · step %s · %s tools · %s tok%s · ▸ %s' \
+                        "$sp" "$wl" "$job" "$round" "$(fmt_secs $((now - started)))" \
                         "$steps" "$tools" "$(fmt_tok "$out_tokens")" "$live_seg" "$last")
                 fi
                 is_running=1
@@ -151,14 +157,14 @@ for f in "${files[@]}"; do
             ;;
         done)
             [ $((now - updated)) -le 120 ] || continue
-            line=$(printf '✓ DeepSeek %s done in %s%s%s' "$job" "$(fmt_secs "$secs")" "$tok_s_seg" "$ttft_seg")
+            line=$(printf '✓ %s %s done in %s%s%s' "$wl" "$job" "$(fmt_secs "$secs")" "$tok_s_seg" "$ttft_seg")
             ;;
         error)
             [ $((now - updated)) -le 120 ] || continue
             if [ "$last" = "interrupted" ]; then
-                line=$(printf '✗ DeepSeek %s interrupted' "$job")
+                line=$(printf '✗ %s %s interrupted' "$wl" "$job")
             else
-                line=$(printf '✗ DeepSeek %s failed in %s' "$job" "$(fmt_secs "$secs")")
+                line=$(printf '✗ %s %s failed in %s' "$wl" "$job" "$(fmt_secs "$secs")")
             fi
             ;;
         *)
@@ -182,9 +188,9 @@ done
 others_line() {
     [ "$others" -gt 0 ] || return 0
     if [ "$others" -eq 1 ]; then
-        printf '+1 DeepSeek job in another chat\n'
+        printf '+1 ds job in another chat\n'
     else
-        printf '+%d DeepSeek jobs in other chats\n' "$others"
+        printf '+%d ds jobs in other chats\n' "$others"
     fi
 }
 
@@ -209,7 +215,7 @@ if [ "$n" -gt 4 ] && [ "$running" -gt 3 ]; then
         [ "$is_running" = "1" ] && shown_running=$((shown_running + 1))
         printf '%s\n' "$line"
     done
-    printf '+%d more DeepSeek jobs running\n' $((running - shown_running))
+    printf '+%d more ds jobs running\n' $((running - shown_running))
 else
     for ((i = 0; i < n && i < 4; i++)); do
         print_record "${sorted[$i]}"

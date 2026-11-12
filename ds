@@ -2371,7 +2371,7 @@ def notify_cmd(job, res):
     lim = res.get("limit")
     if lim and shutil.which("notify-send"):
         # a plan limit is always worth a notification, however fast it came back
-        return ["notify-send", "-a", "ds-bridge", "-u", "critical", "DeepSeek: usage limit reached",
+        return ["notify-send", "-a", "ds-bridge", "-u", "critical", f"{short_model(job.get('model') or '').capitalize() or 'ds'}: usage limit reached",
                 lim["message"] + (f" · resets {lim['resets']}" if lim.get("resets") else "")]
     if secs < min_s or not shutil.which("notify-send"):
         return None
@@ -2379,10 +2379,10 @@ def notify_cmd(job, res):
     when = f"{secs // 60}:{secs % 60:02d}"
     errs = res.get("errors") or []
     if errs:
-        title = f"DeepSeek {job['id']} failed"
+        title = f"{short_model(job.get('model') or '').capitalize() or 'ds'} {job['id']} failed"
         body = f"{base} · {when} · {str(errs[0])[:100]}"
     else:
-        title = f"DeepSeek {job['id']} done"
+        title = f"{short_model(job.get('model') or '').capitalize() or 'ds'} {job['id']} done"
         body = f"{base} · {when}"
         chk = res.get("check")
         if chk:
