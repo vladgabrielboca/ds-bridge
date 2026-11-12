@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code hook: enforce the two rules that save the most Claude usage after a ds result.
+"""Claude Code hook: enforce the rules that save the most Claude usage around ds results.
 
 Adapted from cheap-agent's hook (src/hook.ts, MIT), only for chats with delegation on
 (`ds delegate on`):
@@ -8,7 +8,11 @@ Adapted from cheap-agent's hook (src/hook.ts, MIT), only for chats with delegati
 - PreToolUse (any tool), same prompt only:
   * after "ok": running tests again is denied (the check already passed in the worker's copy);
   * after "notdone": only reads, ds commands, asking the user (AskUserQuestion) and loading tools
-    pass; anything else is denied until the user has been asked, then the state clears.
+    pass; anything else is denied until the user has been asked, then the state clears
+    (a FAIL with check=env, where the check could not run at all, is not "notdone").
+- PreToolUse (Bash), always: commands that write project files (redirects, tee, cp/mv targets,
+  sed -i, scripts opening files for writing) are denied; /tmp, ~/.claude, ds state and .plan/
+  stay free, and a ds brief inside a heredoc is ignored.
 A new user prompt starts fresh (state is keyed by Claude Code's prompt_id, or by our own counter
 that the UserPromptSubmit event advances when prompt_id is missing). Never breaks the session: any error
 allows the call.
@@ -29,6 +33,17 @@ READ_TOOLS = {"Read", "Grep", "Glob", "LS", "ToolSearch", "AskUserQuestion", "Ta
 READ_BASH = re.compile(r"^\s*(git (diff|log|show|status)|cat|head|tail|ls|grep|rg|wc|find|pwd|echo)\b")
 NOT_DONE = re.compile(r"^(FAIL|PARTIAL|CONFLICT|BLOCKED)\s+\S+", re.M)
 OK_PASSED = re.compile(r"^OK\s+\S+.*\bcheck=pass\b", re.M)
+ENV_FAIL = re.compile(r"^FAIL\s+\S+.*\bcheck=env\b", re.M)
+# Bash forms that write a file (cheap-agent's hook: the benchmark showed Claude writing whole files
+# this way to get past the edit guard). Heredoc bodies are stripped first: ds briefs travel in them.
+BASH_WRITES = [re.compile(r"(?:^|[^<>0-9&])>{1,2}\s*[\"']?(?P<path>[^\s\"'|;&()]+)"),
+               re.compile(r"\btee\s+(?:-a\s+)?[\"']?(?P<path>[^\s\"'|;&]+)"),
+               re.compile(r"\b(?:cp|mv)\s+(?:-\S+\s+)*\S+\s+[\"']?(?P<path>[^\s\"'|;&]+)")]
+BASH_INPLACE = re.compile(r"\b(?:sed|perl)\s+(?:-[a-zA-Z]*i|--in-place)\b")
+BASH_CODE_WRITES = re.compile(r"\b(?:python3?|node)\b[\s\S]*(?:open\([^)]*[\"'][wa]|writeFile|\.write_text|\.write_bytes)")
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\s*(?:\n|$)", re.S)
+FREE_PREFIXES = ("/tmp/", "/dev/", os.path.expanduser("~/.claude/"), os.path.expanduser("~/.local/share/ds-bridge/"),
+                 os.path.expanduser("~/.local/state/ds-bridge/"))
 BATCH_OK = re.compile(r"^BATCH\s+\S+.*\bnot_ok=0\b.*\bintegration=(none|pass)", re.M)
 
 
@@ -107,21 +122,49 @@ def post(p):
     if not DS_CMD.search(cmd):
         return
     out = text_of(p.get("tool_response"))
-    if NOT_DONE.search(out):
+    # a check that could not run at all (check=env) is not the worker failing: nothing to take over
+    if NOT_DONE.search(out) and not ENV_FAIL.search(out):
         save(sid, {"prompt": prompt, "state": "notdone"})
     elif OK_PASSED.search(out) or BATCH_OK.search(out):
         save(sid, {"prompt": prompt, "state": "ok"})
+
+
+def bash_write(cmd, cwd):
+    """The file a Bash command writes outside scratch space, or a description of an in-place edit."""
+    body = HEREDOC.sub("\n", cmd)
+    plan_heredoc = re.search(r"<<", cmd) and re.search(r"(?:^|[\s;&|/])ds\s+(run|revise|batch|research)\b", cmd)
+    targets = [m.group("path") for rx in BASH_WRITES for m in rx.finditer(body)]
+    for t in targets:
+        if t.startswith("&") or t in ("/dev/null", "-"):
+            continue
+        full = os.path.realpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(t)))
+        if not full.startswith(FREE_PREFIXES) and "/.plan/" not in full:   # ds batch plans may live in .plan/
+            return full
+    if BASH_INPLACE.search(body):
+        return "an in-place sed/perl edit"
+    if BASH_CODE_WRITES.search(cmd if not plan_heredoc else body):
+        # code that writes files: allowed only when every quoted path in it is scratch space
+        quoted = re.findall(r"[\"']((?:/|~/)[^\"'\n]+)[\"']", cmd)
+        if not quoted or any(not os.path.realpath(os.path.expanduser(q)).startswith(FREE_PREFIXES) for q in quoted):
+            return "a script that writes files"
+    return None
 
 
 def pre(p):
     sid, prompt = p.get("session_id"), prompt_of(p)
     if p.get("agent_id") or not on(sid) or not prompt:
         return
+    tool = p.get("tool_name") or ""
+    cmd = (p.get("tool_input") or {}).get("command") or "" if tool == "Bash" else ""
+    if tool == "Bash" and cmd:
+        what = bash_write(cmd, p.get("cwd"))
+        if what:
+            deny(f"Bash writing {what}: that is editing a project file, which the edit guard covers "
+                 "(small edits with Edit/Write are fine). Delegate bigger changes with ds run; "
+                 "scratch files belong in /tmp.")
     st = load(sid)
     if st.get("prompt") != prompt:
         return
-    tool = p.get("tool_name") or ""
-    cmd = (p.get("tool_input") or {}).get("command") or "" if tool == "Bash" else ""
     if st.get("state") == "ok":
         if tool == "Bash" and TEST_CMD.search(cmd) and not DS_ANY.search(cmd) and not DS_CMD.search(cmd):
             deny("ds already ran this check and it passed in the worker's copy: don't re-run tests. "

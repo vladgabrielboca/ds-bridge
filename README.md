@@ -169,7 +169,7 @@ Every step needs `files:` (the job's `--paths`). Groups (`--steps "1-2,3"`, defa
 
 ### The discipline hook
 
-`hooks/discipline.py` (installed by `install.sh`, active only in chats with delegation on) enforces the two rules that save the most Claude usage, after cheap-agent's hook: after a passed result, running tests again is denied until the next user prompt; after a result that did not finish, only reads, ds commands and one question to the user pass, then the state clears.
+`hooks/discipline.py` (installed by `install.sh`, active only in chats with delegation on) enforces the rules that save the most Claude usage, after cheap-agent's hook: after a passed result, running tests again is denied until the next user prompt; after a result that did not finish, only reads, ds commands and one question to the user pass, then the state clears (a `FAIL … check=env`, where the check could not run at all, doesn't count). Bash commands that write project files (redirects, heredocs into files, `tee`, `cp`/`mv` targets, `sed -i`, scripts that open files for writing) are denied too, since they get past the Edit/Write guard; `/tmp`, `~/.claude`, ds state and `.plan/` stay free, and the brief inside a `ds run - <<EOF` heredoc is ignored.
 
 ### Where the rules live
 
@@ -199,11 +199,11 @@ Merge logic adapted from cheap-agent's `src/workspace.ts` (MIT).
 - The report shows a condensed failure instead of raw output: up to 3 distinct failures (repeats counted ×N), each with its message, expected/got lines and the first frame in the project, at most 25 lines (ported from cheap-agent's `errorTail`). The worker still gets the last 60 raw lines.
 - If a fix round ends with the same failure as the round before (numbers ignored), the loop stops instead of spending the remaining rounds; the check line says `stopped: the same failure repeated`.
 - When the check still fails, the worker is asked for a `FOUND:` note (at most 600 characters: where the problem is, its best hypothesis, what it ruled out), shown under `--- found`. BLOCKED and unfinished reports start their NOTES with the same.
-- A report that is not finished (check FAIL, BLOCKED, errors, repro FAILED/WEAK) ends with a line telling Claude to ask the user: a Sonnet subagent finishes it from the `found:` note, `ds revise`, or stop. Claude doesn't take it over with Opus.
+- A report that is not finished (check FAIL, BLOCKED, errors, repro FAILED) ends with a line telling Claude to ask the user: a Sonnet subagent finishes it from the `found:` note, `ds revise`, or stop. Claude doesn't take it over with Opus.
 
 ### `--fix`: proven bug fixes
 
-`ds run --fix` adds a rule to the brief: write a test that reproduces the bug and see it fail, then fix, and report `REPRO: <command running only that test>`. ds then runs that command on the new code (must pass) and on a copy where every non-test change is reverted (must fail), and prints `--- repro: fail→pass verified`, `WEAK` (the test passes on the old code too), `FAILED` or `unverified: <why>`. A repro that is not verified also brings back the full diff.
+`ds run --fix` adds a rule to the brief: make the fix as soon as it is known, then write a test covering every case the task names, never revert the fix to check it, and report `REPRO: <command running only that test>`. ds then runs that command on the new code (must pass) and on a copy where every non-test change is reverted (must fail), and prints `--- repro: fail→pass verified`, `WEAK` (the test passes on the old code too), `FAILED` or `unverified: <why>`. Only `FAILED` fails the job: a weak or unverified test still lands a fix whose check passed, with a `repro:` line to read. (cheap-agent ticket 52: "test first, see it fail" made workers revert correct fixes or burn turns hunting a failing test.)
 
 ### Benchmark
 
@@ -225,7 +225,7 @@ A worker call that passes `soft_timeout_frac × timeout_s` (default `0.8`, so 24
 
 ### Provider overload
 
-OpenCode already retries a model request for about two minutes when the provider answers "overloaded" or rate-limited. If it still gives up, ds waits (`overload_wait_s`, default 30 s then 90 s, at most `overload_retries` times) and continues the same session, asking the worker to pick up where it left off. The status line shows `provider overloaded · retry N/M` while waiting, the report gets a `NOTE: provider overloaded` line, and a retry is skipped when the job's time budget can't fit it.
+OpenCode already retries a model request for about two minutes when the provider answers "overloaded" or rate-limited. If it still gives up, ds waits (`overload_wait_s`, default 30 s then 90 s, at most `overload_retries` times) and continues in a fork of the session (`opencode run --fork`: new id, same history), asking the worker to pick up where it left off. OpenCode Go pins a session id to one backend cell, so retrying the same id keeps hitting the same overloaded one (found by cheap-agent). The status line shows `provider overloaded · retry N/M` while waiting, the report gets a `NOTE: provider overloaded` line, and a retry is skipped when the job's time budget can't fit it.
 
 ### Model failover
 
@@ -336,6 +336,8 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `research_words` | `200` | Default word limit for `ds research` (max 600). |
 | `research_agent` | `researcher` | OpenCode agent for `ds research`. |
 | `fallback_model` | `""` (off) | Model to continue on when the main model fails on the provider side. |
+| `escalation_model` | `""` (off) | After the auto-fix rounds still fail the check (or a round changes nothing), one more round on this model in the same session (cheap-agent's escalation). The block shows `esc=<model>`. |
+| `worker_rules` | `"agent"` | Where the worker's rules live: `"agent"` = the OpenCode agent's system prompt (worker-prompt.md); `"message"` = at the top of the first message, for an agent without its own prompt (`worker-lean`), which keeps OpenCode's default system prompt. One-off override: `DS_AGENT=worker-lean DS_WORKER_RULES=message ds run …`. |
 | `auto_land` | `true` | Land a job whose check passed without a separate `ds approve`. |
 | `wait_s` | `540` | How long `ds run` blocks before it detaches the job and prints `RUNNING` (0 = never detach). |
 | `max_block_chars` | `1600` | Cap on the result block (the diff, when shown, comes after it). |

@@ -79,6 +79,7 @@ DELEGATE = os.path.join(HOME, ".local/state/ds-bridge/delegate")
 DELEGATE_TTL = 30 * 24 * 60 * 60
 SERVICE_JSON = os.path.join(HOME, ".local/state/opencode/service.json")
 DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
+            "escalation_model": "", "worker_rules": "agent",
             "max_diff_lines": 250, "max_report_chars": 1500, "timeout_s": 1800,
             "soft_timeout_frac": 0.8, "wrapup_s": 180,
             "max_files": 20000, "big_file_mb": 5,
@@ -139,7 +140,7 @@ def cfg():
         with open(CONF) as f:
             data = json.load(f)
     except FileNotFoundError:
-        _CONFIG_CACHE = c
+        _CONFIG_CACHE = env_overrides(c)
         return c
     except ValueError as e:
         die(f"config.json invalid: {e}")
@@ -148,7 +149,15 @@ def cfg():
     if not isinstance(data, dict):
         die("config.json invalid: top-level value must be an object")
     c.update(data)
-    _CONFIG_CACHE = c
+    _CONFIG_CACHE = env_overrides(c)
+    return c
+
+
+def env_overrides(c):
+    """DS_AGENT / DS_WORKER_RULES override the config for one invocation (worker A/B tests)."""
+    for env, key in (("DS_AGENT", "agent"), ("DS_WORKER_RULES", "worker_rules")):
+        if os.environ.get(env):
+            c[key] = os.environ[env]
     return c
 
 
@@ -171,6 +180,11 @@ VAGUE_WORDS = [r"\betc\b", r"\band so on\b", r"\bas needed\b", r"\bif needed\b",
 # "GOAL: text", "GOAL:" or a bare "GOAL" line (optionally "## GOAL" / "**GOAL**") all count
 _HEAD = re.compile(r"^[ \t]*(?:#+[ \t]*)?\**[ \t]*(" + "|".join(BRIEF_SECTIONS)
                    + r")[ \t]*\**[ \t]*(?::|$)", re.M)
+
+
+def worker_rules_text():
+    with open(os.path.join(os.path.dirname(PLAYBOOK), "worker-prompt.md")) as f:
+        return f.read().strip()
 
 
 def playbook_text():
@@ -646,12 +660,17 @@ def to_copy(text, d, w):
     return re.sub(re.escape(d) + r"(?=$|[/\s\"'`:;,)\]])", w, text)
 
 
-FIX_NOTE = ("\n\nBUG FIX RULE: before changing any code, write a test that reproduces the bug "
-            "(in the project's test style and test folder), run it and see it fail. Then fix "
-            "the code until that test passes. Add one line to your final report block: "
+# cheap-agent ticket 52: "test first, see it fail" made workers revert correct fixes or burn turns
+# hunting a failing test. Fix first, then a test; ds itself runs it against the old code.
+FIX_NOTE = ("\n\nBUG FIX RULE: make the fix as soon as you know it. Then write a small test that "
+            "shows the problem (project's test style and folder) and covers every case the task "
+            "or SOURCE names (each value, order, boundary; empty/zero/missing inputs where they "
+            "apply), asserting the exact expected values, not just \"does not crash\". Run it with "
+            "the task's check command. Do not try to make it fail yourself and never undo or "
+            "revert the fix to check it: ds runs your test against the original code after you "
+            "finish. Keep both the fix and the test. Add one line to your final report block: "
             "`REPRO: <exact command that runs only your new test>` (or `REPRO: none: <why>` if "
-            "the bug cannot be reproduced by a test). The reviewer runs that command on the old "
-            "code (must fail) and the new code (must pass).")
+            "it cannot be shown by a test).")
 TEST_RUNNERS = ["pytest", "python -m pytest", "python3 -m pytest", "npm test", "npm run test",
                 "node --test", "npx vitest", "npx jest", "go test", "cargo test", "bun test",
                 "make test", "~/Projects/videos/.venv/bin/python -m pytest"]
@@ -953,7 +972,7 @@ def _live_rate(segs, now_ms, cpt):
 
 
 def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
-                 limit_s=None, wrapup=False, deadline=None):
+                 limit_s=None, wrapup=False, deadline=None, fork=False):
     c = cfg()
     limit_s = limit_s if limit_s is not None else c["timeout_s"]
     try:
@@ -964,6 +983,11 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
     cmd = ["opencode", "run", "--format", "json", "--auto", "--agent", agent, "-m", model]
     if session:
         cmd += ["-s", session]
+        if fork:
+            # OpenCode Go pins a session id to one backend cell, so retrying the same id keeps
+            # hitting the same overloaded one; a fork (new id, same history) can land elsewhere
+            # (cheap-agent ticket 50, anomalyco/opencode#62306)
+            cmd.append("--fork")
     for f in files:
         cmd += ["-f", f]
     cmd.append(msg)
@@ -1486,7 +1510,7 @@ def run_retrying(d, msg, model, agent, session=None, files=(), job=None,
         time.sleep(wait)
         lim = None if limit_s is None else max(1.0, limit_s - (time.time() - t0))
         nxt = run_opencode(d, OVERLOAD_MSG, model, agent, session=sid, job=job,
-                           limit_s=lim, deadline=deadline)
+                           limit_s=lim, deadline=deadline, fork=True)
         res = merge_results(res, nxt)
     if tries:
         res["overload_retries"] = tries
@@ -1665,26 +1689,36 @@ def run_with_check(job, msg, session=None, files=(), budget_s=None):
         return res
     tries = max(0, int(job.get("fix_tries") or 0))
     timeout_s = c["check_timeout_s"]
-    results, rounds, skipped, stuck, prev = [res], 0, 0, False, None
+    esc_model = (c.get("escalation_model") or "").strip()
+    results, rounds, skipped, stuck, prev, escalated = [res], 0, 0, False, None, None
     while True:
         write_check_progress(job, job["model"], check)
         chk = run_check(d, check, limit(timeout_s))
         tail = error_tail(chk["output"], d)
-        if chk["pass"] or rounds >= tries or chk.get("env"):
+        if chk["pass"] or chk.get("env") or escalated:
             break
-        if prev is not None and same_failure(prev, tail):
+        out_of_rounds = rounds >= tries
+        if not out_of_rounds and prev is not None and same_failure(prev, tail):
             stuck = True   # the last fix round changed nothing about the failure
-            break
+            out_of_rounds = True
+        model = job["model"]
+        if out_of_rounds:
+            # cheap-agent's escalation: after the fix rounds, one round on a second model (a different model may get unstuck where the first is going in circles)
+            # in the same session (config "escalation_model", off when empty)
+            if not esc_model or esc_model == job["model"] or remaining() < FIX_MIN_S:
+                break
+            model = escalated = esc_model
         prev = tail
         if remaining() < FIX_MIN_S:
             skipped = tries - rounds
             break
-        rounds += 1
+        if not escalated:
+            rounds += 1
         fmsg = (f"AUTOMATED CHECK FAILED (not the reviewer). Command: {check}\n"
                 f"Exit: {chk['code']}\nLast output lines:\n{chk['output']}\n"
                 "Fix the cause within the original task scope, then reply with the "
                 "final report block.")
-        res = run_retrying(d, fmsg, job["model"], job["agent"],
+        res = run_retrying(d, fmsg, model, job["agent"],
                            session=res.get("session") or job.get("session"), job=job,
                            limit_s=limit(c["timeout_s"]), deadline=deadline)
         results.append(res)
@@ -1710,6 +1744,7 @@ def run_with_check(job, msg, session=None, files=(), budget_s=None):
         out["overload_retries"] = retried
     out["check"] = {"cmd": check, "pass": chk["pass"], "code": chk["code"],
                     "output": chk["output"], "tail": tail, "rounds": rounds, "stuck": stuck,
+                    **({"escalated": escalated} if escalated else {}),
                     **({"env": chk["env"]} if chk.get("env") else {})}
     if not chk["pass"] and not chk.get("env") and not last["errors"] and remaining() > 60:
         fr = run_retrying(d, FOUND_MSG, job["model"], job["agent"],
@@ -1897,7 +1932,8 @@ def job_status(res, rep):
         return "BLOCKED"
     if chk and not chk.get("pass"):
         return "FAIL"
-    if (res.get("repro") or "").startswith(("FAILED", "WEAK")):
+    # a weak test never throws away a passing fix (cheap-agent ticket 52): it lands with a repro: risk line
+    if (res.get("repro") or "").startswith("FAILED"):
         return "FAIL"
     if res.get("soft_deadline"):
         return "PARTIAL"
@@ -1979,6 +2015,8 @@ def render_block(job, res, rep, raw, status, landed, conflict):
     head = [status, jid, f"files={len(files)}", f"+{add}/-{dele}"]
     if chk:
         head.append("check=" + ("pass" if chk.get("pass") else "env" if chk.get("env") else "fail"))
+        if chk.get("escalated"):
+            head.append("esc=" + chk["escalated"].split("/")[-1])
     repro = res.get("repro") or ""
     if repro:
         head.append("repro=" + ("fail→pass" if repro.startswith("fail→pass") else repro.split(":")[0].split()[0].lower()))
@@ -2335,6 +2373,10 @@ def cmd_run(a):
             work = w
     if getattr(a, "fix", False):
         task = task + FIX_NOTE
+    if c.get("worker_rules") == "message":
+        # the agent keeps OpenCode's own system prompt (cheap-agent ticket 63: their custom agent
+        # prompt made the worker slower); our rules travel at the top of the first message instead
+        task = worker_rules_text() + "\n\n=====\n\n" + task
     if work != d:
         task = COPY_NOTE.format(w=work, d=d) + to_copy(task, d, work)
         if a.check:
