@@ -79,7 +79,8 @@ DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
             "fix_tries": 2, "check_timeout_s": 600, "job_budget_s": 1800,
             "overload_retries": 2, "overload_wait_s": [30, 90],
             "excluded_note": True, "diff_on_pass": "stat", "research_words": 200,
-            "research_agent": "researcher", "guard_lines": 20, "guard_edits_per_file": 2,
+            "research_agent": "researcher", "guard_lines": 20,
+            "fallback_model": "", "guard_edits_per_file": 2,
             "notify": True, "notify_min_s": 15,
             "outside_ignore": [".git", "__pycache__", "media*", "*.log",
                                "node_modules", ".venv"]}
@@ -1334,6 +1335,25 @@ OVERLOAD_RE = re.compile(r"overloaded|rate.?limit|too many requests|retry shortl
                          r"|\b(429|503|529)\b", re.I)
 
 
+# Provider-side failures worth switching models for: overload/rate limits that survived
+# the retries, plus quota, billing, auth-on-model and 5xx errors (waiting won't fix those).
+PROVIDER_FAIL_RE = re.compile(r"overloaded|rate.?limit|too many requests|retry shortly|quota"
+                              r"|insufficient|exceeded|billing|credit|unavailable|bad gateway"
+                              r"|\b(402|429|500|502|503|504|529)\b", re.I)
+
+
+def is_provider_failure(errors):
+    return (any(PROVIDER_FAIL_RE.search(str(e)) for e in errors)
+            and not any(str(e).startswith("timeout after") for e in errors))
+
+
+FAILOVER_MSG = (
+    "Your previous request failed on the model provider's side (not your fault); you are "
+    "now running on a different model in the same session. Continue the task where it "
+    "left off: check what is already done before redoing anything, then reply with the "
+    "usual final report block.")
+
+
 def is_overload(errors):
     # OpenCode also exits non-zero after giving up, which adds an "opencode
     # exited" error next to the provider's; timeouts never match.
@@ -1397,6 +1417,29 @@ def run_retrying(d, msg, model, agent, session=None, files=(), job=None,
         if res["errors"]:
             res["errors"] = res["errors"] + [f"still failing after {tries} overload "
                                              "retr" + ("y" if tries == 1 else "ies")]
+    fb = (c.get("fallback_model") or "").strip()
+    sid = res.get("session") or session
+    if (fb and fb != model and job is not None and sid and res["errors"]
+            and is_provider_failure(res["errors"])):
+        left = [x for x in (
+            (limit_s - (time.time() - t0)) if limit_s is not None else None,
+            (deadline - time.time()) if deadline is not None else None) if x is not None]
+        if not left or min(left) > FIX_MIN_S:
+            first_err = str(res["errors"][0])[:160]
+            write_progress_file(job, fb, state="running", last=f"failover to {fb}",
+                                phase="tool", tool_since=int(time.time()), live_tok_s=None,
+                                args_tool=None, args_since=None)
+            lim = None if limit_s is None else max(1.0, limit_s - (time.time() - t0))
+            nxt = run_opencode(d, FAILOVER_MSG, fb, agent, session=sid, job=job,
+                               limit_s=lim, deadline=deadline)
+            prev_errors = res["errors"]
+            res = merge_results(res, nxt)
+            res["errors"] = nxt["errors"]   # the fallback's outcome decides the job
+            res["failover"] = {"from": model, "to": fb, "reason": first_err,
+                               "ok": not nxt["errors"], "first_errors": prev_errors[:2]}
+            # later calls of this invocation (fix rounds, found note) stay on the fallback
+            job.setdefault("model_primary", model)
+            job["model"] = fb
     return res
 
 
@@ -1744,6 +1787,10 @@ def emit(job, res):
     if soft:
         out.append(f"SOFT DEADLINE HIT: worker stopped at {soft['at']}s "
                    f"({soft['frac']:g} × {soft['limit_s']}s) and was asked to wrap up.")
+    fo = res.get("failover")
+    if fo:
+        out.append(f"FAILOVER: {fo['from']} failed on the provider side ({fo['reason']}); "
+                   f"continued on {fo['to']}" + ("" if fo["ok"] else " (it failed too)"))
     if res.get("overload_retries"):
         n = res["overload_retries"]
         out.append(f"NOTE: provider overloaded; continued the session {n} time"
@@ -1792,9 +1839,11 @@ def emit(job, res):
     elif body:
         out.append("--- diff")
         out.append(body)
-    failed = (res["errors"] or (chk and not chk.get("pass"))
+    failed = (not res["errors"]) and ((chk and not chk.get("pass"))
               or re.search(r"^\s*STATUS:\s*BLOCKED", rep, re.M)
               or (res.get("repro") or "").startswith(("FAILED", "WEAK")))
+    if res["errors"]:
+        out.append("--- ds/provider error: tell the user and stop; don't do the work yourself.")
     out.append(f"--- next: ds approve {job['id']} | ds revise {job['id']} \"...\" | ds reject {job['id']}")
     if failed:
         out.append("--- not finished: ask the user one question: a Sonnet subagent finishes it "
@@ -2106,6 +2155,8 @@ def finish_research(job, res, words):
            f"(cache {tk['cache_read']}) out {tk['output']}  cost ${res['cost']:.4f}"]
     if res["errors"]:
         out.append("ERRORS: " + " | ".join(e[:300] for e in res["errors"]))
+    if res.get("failover"):
+        out.append(f"FAILOVER: continued on {res['failover']['to']} ({res['failover']['reason']})")
     out.append(rep)
     if changed and job.get("project"):
         out.append("--- NOTE: the researcher changed files in its private copy; discarded")
@@ -2145,6 +2196,8 @@ def cmd_revise(a):
     try:
         # The chat that revises owns the job's status line from now on.
         job["owner"] = os.environ.get("CLAUDE_CODE_SESSION_ID") or job.get("owner") or ""
+        if job.get("model_primary"):
+            job["model"] = job.pop("model_primary")
         job["round"] += 1
         job["round_base"] = snapshot(job["dir"], job["shadow"], f"{job['id']} r{job['round']}",
                                      job_index(job["id"]), job["id"], paths)

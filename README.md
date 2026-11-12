@@ -181,6 +181,10 @@ A worker call that passes `soft_timeout_frac × timeout_s` (default `0.8`, so 24
 
 OpenCode already retries a model request for about two minutes when the provider answers "overloaded" or rate-limited. If it still gives up, ds waits (`overload_wait_s`, default 30 s then 90 s, at most `overload_retries` times) and continues the same session, asking the worker to pick up where it left off. The status line shows `provider overloaded · retry N/M` while waiting, the report gets a `NOTE: provider overloaded` line, and a retry is skipped when the job's time budget can't fit it.
 
+### Model failover
+
+If the worker's model still fails on the provider side after the overload retries (overload, rate limit, quota, billing, 5xx), ds continues the same session once on `fallback_model` (off by default; set a model id to enable). Note: OpenCode Go's `muse-spark-*-contributor` models train on request data and only run after you allow that in the OpenCode console privacy settings. The rest of that invocation (fix rounds, the findings note) stays on the fallback; the next `ds revise` starts on the main model again. The report shows a `FAILOVER:` line. A job whose work failed is not failed over: that goes to the ask-the-user step. 
+
 ### Job time budget
 
 `job_budget_s` (default `1800`) caps a whole `ds run`, `ds init` or `ds revise` invocation, including check runs and auto-fix rounds; `--timeout S` overrides it for one invocation. Each worker call gets `min(timeout_s, remaining)` and each check gets `min(check_timeout_s, remaining)`; the soft-deadline fraction applies to that per-call limit. If fewer than 60 seconds remain before a fix round, the round is skipped and the `--- check` section says `budget exhausted, N fix rounds skipped`. The budget is mentioned only when it is hit.
@@ -285,6 +289,7 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `diff_on_pass` | `"stat"` | `"stat"`: a passed check shows only the diff stat; `"full"`: always show the diff. |
 | `research_words` | `200` | Default word limit for `ds research` (max 600). |
 | `research_agent` | `researcher` | OpenCode agent for `ds research`. |
+| `fallback_model` | `""` (off) | Model to continue on when the main model fails on the provider side. |
 
 ## Safety
 
