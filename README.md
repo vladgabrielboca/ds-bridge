@@ -169,7 +169,7 @@ Every step needs `files:` (the job's `--paths`). Groups (`--steps "1-2,3"`, defa
 
 ### The discipline hook
 
-`hooks/discipline.py` (installed by `install.sh`, active only in chats with delegation on) enforces the rules that save the most Claude usage, after cheap-agent's hook: after a passed result, running tests again is denied until the next user prompt; after a result that did not finish, only reads, ds commands and one question to the user pass, then the state clears (a `FAIL … check=env`, where the check could not run at all, doesn't count). Bash commands that write project files (redirects, heredocs into files, `tee`, `cp`/`mv` targets, `sed -i`, scripts that open files for writing) are denied too, since they get past the Edit/Write guard; `/tmp`, `~/.claude`, ds state and `.plan/` stay free, and the brief inside a `ds run - <<EOF` heredoc is ignored.
+`hooks/discipline.py` (installed by `install.sh`, active only in chats with delegation on) enforces the rules that save the most Claude usage, after cheap-agent's hook: after a passed result, running tests again is denied until the next user prompt; after a result that did not finish, only reads, ds commands and one question to the user pass (with `"takeover": "sonnet"`: the Agent tool instead), then the state clears (a `FAIL … check=env`, where the check could not run at all, doesn't count). Bash commands that write project files (redirects, heredocs into files, `tee`, `cp`/`mv` targets, `sed -i`, scripts that open files for writing) are denied too, since they get past the Edit/Write guard; `/tmp`, `~/.claude`, ds state and `.plan/` stay free, and the brief inside a `ds run - <<EOF` heredoc is ignored.
 
 ### Where the rules live
 
@@ -222,6 +222,14 @@ This matters for cost: an image costs Claude about 1.5–1.8k tokens and stays i
 ### Soft deadline
 
 A worker call that passes `soft_timeout_frac × timeout_s` (default `0.8`, so 24 minutes of a 30-minute run) is stopped and the same session is asked for its final report, including anything unfinished. That wrap-up call has its own limit, `wrapup_s` (default `180`). The `--check` still runs afterwards, and the report starts with `SOFT DEADLINE HIT`. This applies to `ds run`, `ds init` and `ds revise`, including auto-fix rounds. Both the hard timeout and the soft deadline interrupt the session through the OpenCode service, not just the `opencode run` client, so the worker stops running tools; the wrap-up call then reaches an idle session. ds chooses the session id itself before the worker starts, so interrupt works from the first second.
+
+### Usage limits
+
+When the worker's model hits a plan limit (OpenCode Go's 5-hour, weekly or monthly window, a workspace budget or a model's spend limit), OpenCode reports it as an error and ds ends the job with `LIMIT`: a `limit:` line names the limit and when it resets (from the provider's retry-after, when it sends one), a critical desktop notification goes out, and the `next:` line tells Claude to tell you and not retry. With `fallback_model` set, ds first tries that model; the block says if it was limited too.
+
+### Secrets
+
+The worker, `worker-lean` and researcher agents may not read `.env`, `.env.*` (except `.env.example` / `.env.sample`) with the read tool, edit them, or name them in shell commands. A recursive grep in the shell still prints their lines: OpenCode 2.x has no plugin hook on tool output to filter that (cheap-agent's grep filter targets OpenCode 1.x), so that gap is left as is.
 
 ### Provider overload
 
@@ -336,6 +344,7 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `research_words` | `200` | Default word limit for `ds research` (max 600). |
 | `research_agent` | `researcher` | OpenCode agent for `ds research`. |
 | `fallback_model` | `""` (off) | Model to continue on when the main model fails on the provider side. |
+| `takeover` | `"ask"` | After a FAIL/PARTIAL/CONFLICT: `"ask"` = Claude asks you (Sonnet subagent, `ds revise`, or stop); `"sonnet"` = Claude hands the step to a Sonnet subagent at once, working in the job's directory, then `ds approve` (the discipline hook enforces either). cheap-agent measured a Sonnet takeover at 100k+ Claude tokens per failed step, hence ask by default. |
 | `escalation_model` | `""` (off) | After the auto-fix rounds still fail the check (or a round changes nothing), one more round on this model in the same session (cheap-agent's escalation). The block shows `esc=<model>`. |
 | `worker_rules` | `"agent"` | Where the worker's rules live: `"agent"` = the OpenCode agent's system prompt (worker-prompt.md); `"message"` = at the top of the first message, for an agent without its own prompt (`worker-lean`), which keeps OpenCode's default system prompt. One-off override: `DS_AGENT=worker-lean DS_WORKER_RULES=message ds run …`. |
 | `auto_land` | `true` | Land a job whose check passed without a separate `ds approve`. |

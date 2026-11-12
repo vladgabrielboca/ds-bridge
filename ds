@@ -79,7 +79,7 @@ DELEGATE = os.path.join(HOME, ".local/state/ds-bridge/delegate")
 DELEGATE_TTL = 30 * 24 * 60 * 60
 SERVICE_JSON = os.path.join(HOME, ".local/state/opencode/service.json")
 DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
-            "escalation_model": "", "worker_rules": "agent",
+            "escalation_model": "", "worker_rules": "agent", "takeover": "ask",
             "max_diff_lines": 250, "max_report_chars": 1500, "timeout_s": 1800,
             "soft_timeout_frac": 0.8, "wrapup_s": 180,
             "max_files": 20000, "big_file_mb": 5,
@@ -1000,7 +1000,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
     if job is not None:
         job["_prog"] = {"steps": base_steps, "tools": base_tools,
                         "out": base_out, "started": inv_started}
-    sid, texts, errors = session, [], []
+    sid, texts, errors, error_raw = session, [], [], []
     tok = {"input": 0, "output": 0, "cache_read": 0}
     cost, tools, steps = 0.0, 0, 0
     step_open = False
@@ -1331,7 +1331,11 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                 tok["cache_read"] += (tk.get("cache") or {}).get("read", 0)
                 cost += part.get("cost") or 0
             elif t == "error":
-                errors.append((ev.get("error") or {}).get("message", "unknown error"))
+                err = ev.get("error") or {}
+                msg = (err.get("message") or (err.get("data") or {}).get("message")
+                       or json.dumps(err)[:300] or "unknown error")
+                errors.append(msg)
+                error_raw.append(json.dumps(err)[:2000])
             write_progress("running")
         if not timed_out and not soft_hit:
             p.wait()
@@ -1399,6 +1403,9 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
            "cost": cost, "tools": tools, "secs": secs, "tok_s": tok_s(),
            "dec_tokens": live["dec_tokens"], "dec_ms": live["dec_ms"],
            "ttft": list(live["ttft"])}
+    lim = limit_info(errors, error_raw, model)
+    if lim:
+        res["limit"] = lim
     if soft_hit:
         if sid:
             wrap_limit = c["wrapup_s"]
@@ -1437,9 +1444,35 @@ OVERLOAD_RE = re.compile(r"overloaded|rate.?limit|too many requests|retry shortl
 
 # Provider-side failures worth switching models for: overload/rate limits that survived
 # the retries, plus quota, billing, auth-on-model and 5xx errors (waiting won't fix those).
-PROVIDER_FAIL_RE = re.compile(r"overloaded|rate.?limit|too many requests|retry shortly|quota"
+PROVIDER_FAIL_RE = re.compile(r"overloaded|rate.?limit|too many requests|retry shortly|quota|usage limit|spend limit"
                               r"|insufficient|exceeded|billing|credit|unavailable|bad gateway"
                               r"|\b(402|429|500|502|503|504|529)\b", re.I)
+
+
+# OpenCode 2.x turns a plan limit into an error: "OpenCode Go <window> usage limit reached. …"
+# (provider.go-limit), "Workspace usage limit reached", "You've reached the spend limit for this
+# model", "Free usage limit reached", with retryAfterMs when the provider sent one.
+LIMIT_RE = re.compile(r"usage limit reached|reached the spend limit|budget limit|limit resets", re.I)
+
+
+def limit_info(errors, raw=(), model=None):
+    """{model, message, resets} when an error is a plan/usage limit (not a blip), else None."""
+    text = " ".join(str(e) for e in errors)
+    if not LIMIT_RE.search(text + " ".join(raw)):
+        return None
+    msg = next((str(e) for e in errors if LIMIT_RE.search(str(e))), text)
+    msg = re.split(r"\. (?:Switch|Connect|Or turn on|Check)", msg)[0].strip().rstrip(".")
+    resets = None
+    m = re.search(r'"retryAfterMs"\s*:\s*(\d+)', " ".join(raw))
+    if m and int(m.group(1)) > 60_000:
+        t = time.time() + int(m.group(1)) / 1000
+        lt = time.localtime(t)
+        resets = time.strftime("%H:%M" if lt.tm_yday == time.localtime().tm_yday else "%b %d %H:%M", lt)
+    else:
+        m = re.search(r"[Rr]esets? (?:in |at )?([^.]{2,40})", text)
+        if m:
+            resets = m.group(1).strip()
+    return {"model": model, "message": msg[:200], "resets": resets}
 
 
 def is_provider_failure(errors):
@@ -1535,6 +1568,10 @@ def run_retrying(d, msg, model, agent, session=None, files=(), job=None,
             prev_errors = res["errors"]
             res = merge_results(res, nxt)
             res["errors"] = nxt["errors"]   # the fallback's outcome decides the job
+            if nxt.get("limit"):
+                res["limit"] = {**nxt["limit"], "also": res.get("limit")}
+            else:
+                res.pop("limit", None)
             res["failover"] = {"from": model, "to": fb, "reason": first_err,
                                "ok": not nxt["errors"], "first_errors": prev_errors[:2]}
             # later calls of this invocation (fix rounds, found note) stay on the fallback
@@ -1927,6 +1964,8 @@ def numstat(job, since=None):
 def job_status(res, rep):
     chk = res.get("check")
     if res["errors"]:
+        if res.get("limit"):
+            return "LIMIT"
         return "PROVIDER" if is_provider_failure(res["errors"]) else "ERROR"
     if rep.get("STATUS", "").upper().startswith("BLOCKED"):
         return "BLOCKED"
@@ -2055,7 +2094,12 @@ def render_block(job, res, rep, raw, status, landed, conflict):
                        + ("; the same failure repeated" if chk.get("stuck") else ""))
             for line in (chk.get("tail") or chk["output"].splitlines()[-15:])[:15]:
                 out.append("  " + line)
-    if res["errors"]:
+    lim = res.get("limit")
+    if lim:
+        out.append("limit: " + lim["message"] + (f" (resets {lim['resets']})" if lim.get("resets") else
+                                                 " (reset time not given)")
+                   + (f"; {lim['also']['message']} too" if lim.get("also") else ""))
+    elif res["errors"]:
         out.append("error: " + _clip(" | ".join(e[:300] for e in res["errors"]), 500))
     fo = res.get("failover")
     if fo:
@@ -2078,7 +2122,7 @@ def render_block(job, res, rep, raw, status, landed, conflict):
     trusted = (chk and chk.get("pass") and c.get("diff_on_pass", "stat") == "stat"
                and status in ("OK", "CONFLICT") and not res.get("outside"))
     tail = []
-    if status not in ("BLOCKED", "PROVIDER", "ERROR") and not trusted:
+    if status not in ("BLOCKED", "PROVIDER", "ERROR", "LIMIT") and not trusted:
         stat, body = diff_text(job, since=rb)
         if body:
             tail += ["--- diff" + (f" (this round; cumulative: ds diff {jid})" if rb else ""), body]
@@ -2090,8 +2134,15 @@ def render_block(job, res, rep, raw, status, landed, conflict):
         tail.append(f"next: ds reply {jid} <option letter or short answer>")
     elif status == "CONFLICT":
         tail.append(f"next: ds revise {jid} \"1. In <file>, resolve ...\" | ds reject {jid}")
+    elif status == "LIMIT":
+        tail.append("next: usage limit: tell the user which limit and when it resets; don't retry, "
+                    "don't do the work yourself.")
     elif status in ("PROVIDER", "ERROR"):
         tail.append("next: ds/provider error: tell the user and stop; don't do the work yourself.")
+    elif c.get("takeover") == "sonnet":
+        tail.append(f"next: not finished: hand it to the Agent tool with model sonnet, working in {job['dir']} "
+                    "(give it the task, the user's words, found:, error: and the check command; it fixes "
+                    f"and runs the check there), then ds approve {jid}. Report its answer; don't do it yourself.")
     else:
         tail.append("next: not finished: ask the user one question: a Sonnet subagent finishes it (from found: "
                     f"and the job's files; costs Claude usage), ds revise {jid} with the findings, or stop. "
@@ -2128,6 +2179,11 @@ def notify_cmd(job, res):
     except (TypeError, ValueError):
         min_s = 15
     secs = int(res.get("secs") or 0)
+    lim = res.get("limit")
+    if lim and shutil.which("notify-send"):
+        # a plan limit is always worth a notification, however fast it came back
+        return ["notify-send", "-a", "ds-bridge", "-u", "critical", "DeepSeek: usage limit reached",
+                lim["message"] + (f" · resets {lim['resets']}" if lim.get("resets") else "")]
     if secs < min_s or not shutil.which("notify-send"):
         return None
     base = os.path.basename(proj(job).rstrip("/")) or proj(job)
@@ -2472,7 +2528,11 @@ def finish_research(job, res, words):
         rep = rep[:cap] + " …[answer truncated]"
     tk = res["tokens"]
     out = [f"RESEARCH {job['id']} {res['secs']}s (pass it on: ds run --brief {job['id']})"]
-    if res["errors"]:
+    if res.get("limit"):
+        lim = res["limit"]
+        out.append("LIMIT: " + lim["message"] + (f" (resets {lim['resets']})" if lim.get("resets") else "")
+                   + " — tell the user; don't retry")
+    elif res["errors"]:
         out.append("ERRORS: " + " | ".join(e[:300] for e in res["errors"]))
     if res.get("failover"):
         out.append(f"FAILOVER: continued on {res['failover']['to']} ({res['failover']['reason']})")
@@ -2756,7 +2816,7 @@ def cmd_batch(a):
         out = (r.stdout or "") + (("\n" + r.stderr.strip()) if r.returncode and r.stderr.strip() else "")
         first = out.strip().splitlines()[0] if out.strip() else f"ERROR step {labels[i]}: no output"
         status = first.split()[0] if first.split() else "ERROR"
-        if status not in ("OK", "FAIL", "BLOCKED", "CONFLICT", "PARTIAL", "PROVIDER", "ERROR"):
+        if status not in ("OK", "FAIL", "BLOCKED", "CONFLICT", "PARTIAL", "PROVIDER", "ERROR", "LIMIT"):
             status = "ERROR"
         with lock:
             results[i] = {"status": status, "line": f"{first}  (step {labels[i]})", "block": out.strip(),
@@ -2921,6 +2981,10 @@ def cmd_approve(a):
         die(f"job {a.job} is {job['status']}; nothing to approve")
     extra = ""
     if job.get("project"):
+        # whatever is in the copy now lands, including edits made after the worker finished
+        # (a Sonnet takeover works in the copy, then approves)
+        job["post"] = snapshot(job["dir"], job["shadow"], f"post approve {job['id']}",
+                               job_index(job["id"]), job["id"], job.get("paths"))
         marked = leftover_markers(job)
         if marked:
             die(f"job {a.job} still has conflict markers in: {', '.join(marked)}; "

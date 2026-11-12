@@ -26,13 +26,13 @@ Re-check only what upstream changes after `892de9c`: `git -C ~/Work/cheap-ag log
 | Landing conflict → one automatic redo with conflict markers | **have** |
 | Batch: parallel groups, `needs:`, file-overlap serialisation, `max_parallel`, integration check + fix job | **have** (`ds batch`) |
 | Transient provider error → retry once in a **forked** session (Go pins a session to one cell) | **adopted**: overload retries use `opencode run --fork` |
-| Provider limit → next model in a fallback chain; all limited → BUDGET with reset time | partly **have**: one `fallback_model` on provider failure; skipped the chain and Go window ledger (you use only Flash + Muse Spark) |
+| Provider limit → next model in a fallback chain; all limited → BUDGET with reset time | **adopted**: `LIMIT` status with the limit name and reset time + critical notification (read from OpenCode 2.x's limit error); one `fallback_model` instead of a chain; no spend ledger of our own |
 | Ticket 63: OpenCode's default agent beat their custom agent prompt on bug fixes | **adopted as an option**: agent `worker-lean` + `worker_rules: "message"`; A/B on the fixture decides the default (see below) |
 | Turn cap (25 × difficulty), cost cap ($0.50), minute cap paused while BLOCKED | ds uses a time budget (`job_budget_s`) + soft deadline → PARTIAL; skipped turn/cost caps (Go is flat-rate) |
 | Difficulty (easy/medium/hard) picks the worker model and turn cap | skipped: only one worker model worth using |
 | `repro_by_turns` early stop | skipped: their own default never fires |
 | Rejected tool calls counted → risk line | skipped (minor) |
-| `.env` hidden from grep, worker can't edit `.git`/`.env`/lockfiles | skipped: your projects hold no secrets in `.env`; git commit/push/reset/checkout already denied |
+| `.env` hidden, worker can't edit `.git`/`.env`/lockfiles | **adopted** for `.env`: read/edit/shell-name denied in all ds agents; recursive grep still shows lines (OpenCode 2.x has no tool-output plugin hook; left as is). Lockfiles not protected |
 | Crash recovery (RUNNING job of a dead process → CANCELLED) | **have** (`mark_interrupted`, pid checks) |
 | Cleanup: unlanded worktrees 2 d, logs 7 d, events gzipped | **have** (landed gc after 1 d, shadow gc daily) |
 | Live progress under the tool call, `cheapag watch` | **have**: status line with live tok/s, `ds log` |
@@ -44,7 +44,7 @@ Re-check only what upstream changes after `892de9c`: `git -C ~/Work/cheap-ag log
 | Rules in MCP server instructions (cached prefix), tools always loaded | ds: playbook injected once + 1-line reminder per turn (~60 tokens); same effect |
 | "An OK is done: don't re-run its tests or read its diff" + hook denies test re-runs after OK | **have** (playbook + discipline hook) |
 | Takeover `ask` (default): after FAIL/PARTIAL only reads + one question pass | **have** (discipline hook) |
-| Takeover `sonnet` / `self` (capped at 15 calls) | skipped: you chose ask |
+| Takeover `sonnet` / `self` (capped at 15 calls) | **adopted** `sonnet` (`"takeover": "sonnet"`; Sonnet works in the job's copy, `ds approve` lands it; hook enforces); `self` skipped |
 | "Don't open source files before delegating; use research" | **have** (playbook; not enforced by either tool) |
 | Tests: only the concerned file, once before/after, never the whole suite, chain with `&&` | **adopted** (playbook) |
 | Edit guard: >20 lines or 3rd edit per file per turn denied | **have** (guard.py, same numbers) |

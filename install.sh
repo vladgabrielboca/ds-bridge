@@ -89,7 +89,7 @@ if not isinstance(agents, dict) or not ({"worker", "researcher"} & set(agents)):
     print("opencode.json: ds agents not set, nothing to remove")
     sys.exit(0)
 
-for name in ("worker", "researcher"):
+for name in ("worker", "worker-lean", "researcher"):
     agents.pop(name, None)
 if not agents:
     cfg.pop("agent", None)

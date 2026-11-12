@@ -47,6 +47,19 @@ FREE_PREFIXES = ("/tmp/", "/dev/", os.path.expanduser("~/.claude/"), os.path.exp
 BATCH_OK = re.compile(r"^BATCH\s+\S+.*\bnot_ok=0\b.*\bintegration=(none|pass)", re.M)
 
 
+CONF = os.path.expanduser("~/.config/ds-bridge/config.json")
+
+
+def takeover():
+    """ds config "takeover": "ask" (default) or "sonnet"."""
+    try:
+        with open(CONF) as f:
+            v = json.load(f).get("takeover")
+        return v if v in ("ask", "sonnet") else "ask"
+    except (OSError, ValueError, AttributeError):
+        return "ask"
+
+
 def on(sid):
     return bool(sid) and os.path.exists(os.path.join(DELEGATE, sid))
 
@@ -162,6 +175,7 @@ def pre(p):
             deny(f"Bash writing {what}: that is editing a project file, which the edit guard covers "
                  "(small edits with Edit/Write are fine). Delegate bigger changes with ds run; "
                  "scratch files belong in /tmp.")
+            return
     st = load(sid)
     if st.get("prompt") != prompt:
         return
@@ -171,8 +185,18 @@ def pre(p):
                  "Report the result, or start the next step.")
         return
     if st.get("state") == "notdone":
-        if tool == "AskUserQuestion":
-            save(sid, {})   # the user is being asked: whatever they pick is theirs
+        mode = takeover()
+        if tool == "AskUserQuestion" or (mode == "sonnet" and tool in ("Agent", "Task")):
+            save(sid, {})   # the user is asked, or the step is handed to Sonnet: the guard is done
+            return
+        if mode == "sonnet" and tool in READ_TOOLS or mode == "sonnet" and tool == "Bash" and (
+                DS_ANY.search(cmd) or DS_CMD.search(cmd) or READ_BASH.match(cmd)):
+            return
+        if mode == "sonnet":
+            deny("The worker did not finish this step: hand it to your Agent tool with model sonnet, "
+                 "working in the job's directory from the ds block (the task, the user's words, found:, "
+                 "error: and the check), then ds approve the job and report its answer. "
+                 "Don't do it yourself. (The user can set \"takeover\": \"ask\" in the ds config.)")
             return
         if tool in READ_TOOLS:
             return

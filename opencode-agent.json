@@ -6,7 +6,13 @@
       "model": "opencode-go/deepseek-v4.1-flash",
       "prompt": "{file:__DS_BRIDGE_DIR__/worker-prompt.md}",
       "permission": {
-        "edit": "allow",
+        "edit": {
+          "*": "allow",
+          ".env": "deny",
+          ".env.*": "deny",
+          "*/.env": "deny",
+          "*/.env.*": "deny"
+        },
         "webfetch": "allow",
         "bash": {
           "*": "allow",
@@ -26,7 +32,24 @@
           "pacman *": "deny",
           "yay *": "deny",
           "paru *": "deny",
-          "*--break-system-packages*": "deny"
+          "*--break-system-packages*": "deny",
+          "* .env": "deny",
+          "* .env.*": "deny",
+          "*/.env": "deny",
+          "*/.env.*": "deny",
+          "* .env.example*": "allow",
+          "*/.env.example*": "allow"
+        },
+        "read": {
+          "*": "allow",
+          ".env": "deny",
+          ".env.*": "deny",
+          "*/.env": "deny",
+          "*/.env.*": "deny",
+          ".env.example": "allow",
+          "*/.env.example": "allow",
+          ".env.sample": "allow",
+          "*/.env.sample": "allow"
         }
       }
     },
@@ -60,7 +83,76 @@
           "pacman *": "deny",
           "yay *": "deny",
           "paru *": "deny",
-          "*--break-system-packages*": "deny"
+          "*--break-system-packages*": "deny",
+          "* .env": "deny",
+          "* .env.*": "deny",
+          "*/.env": "deny",
+          "*/.env.*": "deny",
+          "* .env.example*": "allow",
+          "*/.env.example*": "allow"
+        },
+        "read": {
+          "*": "allow",
+          ".env": "deny",
+          ".env.*": "deny",
+          "*/.env": "deny",
+          "*/.env.*": "deny",
+          ".env.example": "allow",
+          "*/.env.example": "allow",
+          ".env.sample": "allow",
+          "*/.env.sample": "allow"
+        }
+      }
+    },
+    "worker-lean": {
+      "description": "Execution worker (ds-bridge) with OpenCode's own system prompt; ds sends the rules in the message (worker_rules: message)",
+      "mode": "primary",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "permission": {
+        "edit": {
+          "*": "allow",
+          ".env": "deny",
+          ".env.*": "deny",
+          "*/.env": "deny",
+          "*/.env.*": "deny"
+        },
+        "webfetch": "allow",
+        "bash": {
+          "*": "allow",
+          "git commit*": "deny",
+          "git push*": "deny",
+          "git reset*": "deny",
+          "git checkout*": "deny",
+          "rm -rf /*": "deny",
+          "sudo *": "deny",
+          "pip install*": "deny",
+          "pip3 install*": "deny",
+          "uv pip*": "deny",
+          "uv tool*": "deny",
+          "pipx*": "deny",
+          "npm install -g*": "deny",
+          "npm i -g*": "deny",
+          "pacman *": "deny",
+          "yay *": "deny",
+          "paru *": "deny",
+          "*--break-system-packages*": "deny",
+          "* .env": "deny",
+          "* .env.*": "deny",
+          "*/.env": "deny",
+          "*/.env.*": "deny",
+          "* .env.example*": "allow",
+          "*/.env.example*": "allow"
+        },
+        "read": {
+          "*": "allow",
+          ".env": "deny",
+          ".env.*": "deny",
+          "*/.env": "deny",
+          "*/.env.*": "deny",
+          ".env.example": "allow",
+          "*/.env.example": "allow",
+          ".env.sample": "allow",
+          "*/.env.sample": "allow"
         }
       }
     }
