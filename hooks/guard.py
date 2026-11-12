@@ -83,6 +83,10 @@ def allowed(path, cwd, session_id=None):
         return True
     if p.startswith("/tmp/claude-"):
         return True
+    # Plans are how Claude delegates, so any size is fine (like cheap-ag's isPlan;
+    # discipline.py and the playbook use the same .plan/ rule).
+    if os.sep + ".plan" + os.sep in p:
+        return True
 
     if delegation_on(session_id):
         return False
