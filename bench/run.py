@@ -36,9 +36,24 @@ ALLOWED = ["Read", "Glob", "Grep", "Edit", "Write", "Bash(node:*)", "Bash(npm te
            "Bash(npm run test:*)", "Bash(ds:*)", f"Bash({DS}:*)", "Bash(ls:*)", "Bash(cat:*)",
            "Bash(grep:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(wc:*)", "Bash(find:*)",
            "Bash(git diff:*)", "Bash(git status:*)"]
-# claude -p ends its turn when the model stops, so background jobs would be lost
-FOREGROUND = ("Non-interactive benchmark run: start ds commands in the foreground "
-              "(Bash timeout 600000), not with run_in_background.")
+# Same lean, byte-stable prefix in both arms (cheap-agent's bench, ticket 23.1): no user settings,
+# CLAUDE.md, plugins or MCP servers, no per-machine prompt sections; the same verification budget.
+LEAN = ["--setting-sources", "project", "--exclude-dynamic-system-prompt-sections", "--strict-mcp-config"]
+VERIFY_RULE = ("Tests: run only the test file or id the task concerns, once before if it names a failure "
+               "and once after; never the whole suite; chain commands with &&.")
+HOOKS = os.path.join(os.path.dirname(HERE), "hooks")
+
+
+def ds_settings():
+    """The ds arm's hooks, exactly as install.sh sets them: guard, delegate (rules), discipline."""
+    g, dl, dc = (os.path.join(HOOKS, n) for n in ("guard.py", "delegate.py", "discipline.py"))
+    cmd = lambda c: {"type": "command", "command": c}
+    return json.dumps({"hooks": {
+        "PreToolUse": [{"matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [cmd(g)]},
+                       {"matcher": "*", "hooks": [cmd(dc)]}],
+        "PostToolUse": [{"matcher": "Bash", "hooks": [cmd(dc)]}],
+        "UserPromptSubmit": [{"hooks": [cmd(dl)]}, {"hooks": [cmd(dc)]}],
+        "SessionStart": [{"matcher": "compact", "hooks": [cmd(dl)]}]}})
 
 
 def copy_fixture(dst):
@@ -81,17 +96,29 @@ def grade(task, d, before, answer):
     return r.returncode == 0, " | ".join(counts + failed)
 
 
+# OpenCode Go bills by subscription (ds shows $0), so the worker is priced at list rates
+# per million tokens from OpenCode's catalog: input, cache read, output.
+PRICES = {"default": (0.15, 0.003, 0.60)}   # deepseek-v4.1-flash
+
+
 def worker_usage(d, t0):
-    jobs, secs = set(), 0
+    jobs, secs, cost, tin, tout = set(), 0, 0.0, 0, 0
+    pin, pcache, pout = PRICES["default"]
     try:
         for line in open(LEDGER):
             e = json.loads(line)
             if e.get("ts", 0) >= t0 and os.path.realpath(e.get("dir", "")) == d:
                 jobs.add(e["job"])
                 secs += e.get("secs") or 0
+                fresh = max(0, (e.get("worker_in") or 0))
+                cache = e.get("worker_cache") or 0
+                out = e.get("worker_out") or 0
+                tin += fresh + cache
+                tout += out
+                cost += (fresh * pin + cache * pcache + out * pout) / 1e6
     except OSError:
         pass
-    return len(jobs), secs
+    return len(jobs), secs, round(cost, 4), tin, tout
 
 
 def run_one(task, arm, n, model, timeout_min):
@@ -100,11 +127,15 @@ def run_one(task, arm, n, model, timeout_min):
     before = snapshot_tree(d)
     sid = str(uuid.uuid4())
     args = ["claude", "-p", task["prompt"], "--output-format", "json", "--model", model,
-            "--session-id", sid, "--permission-mode", "acceptEdits",
-            "--allowedTools", *ALLOWED]
+            "--session-id", sid, "--permission-mode", "acceptEdits", *LEAN,
+            "--append-system-prompt", VERIFY_RULE, "--allowedTools", *ALLOWED]
     if arm == "ds":
         subprocess.run([DS, "delegate", "on", "--session", sid], capture_output=True, check=True)
-        args += ["--append-system-prompt", FOREGROUND]
+        # `ds delegate on` printed the rules to us, not to Claude, and marked them shown: clear the
+        # mark so the delegate hook injects them into the first prompt, as in a real delegating chat
+        with open(os.path.expanduser(f"~/.local/state/ds-bridge/delegate/{sid}"), "w") as f:
+            f.write("{}")
+        args += ["--settings", ds_settings()]
     t0 = time.time()
     try:
         r = subprocess.run(args, cwd=d, capture_output=True, text=True, timeout=timeout_min * 60)
@@ -116,22 +147,33 @@ def run_one(task, arm, n, model, timeout_min):
     finally:
         if arm == "ds":
             subprocess.run([DS, "delegate", "off", "--session", sid], capture_output=True)
-    u = out.get("usage") or {}
+    # the top-level "usage" is not the session total; modelUsage (per model) is
+    mu = out.get("modelUsage") or {}
+    u = {"input_tokens": sum(m.get("inputTokens", 0) for m in mu.values()),
+         "cache_creation_input_tokens": sum(m.get("cacheCreationInputTokens", 0) for m in mu.values()),
+         "cache_read_input_tokens": sum(m.get("cacheReadInputTokens", 0) for m in mu.values()),
+         "output_tokens": sum(m.get("outputTokens", 0) for m in mu.values())} if mu else (out.get("usage") or {})
     ok, detail = grade(task, d, before, out.get("result", ""))
-    jobs, wsecs = worker_usage(d, t0)
+    jobs, wsecs, wcost, win, wout = worker_usage(d, t0)
     row = {"ts": int(t0), "task": task["id"], "arm": arm, "run": n, "model": model,
            "pass": ok, "detail": detail[:300],
            "claude_tokens": sum(u.get(k, 0) or 0 for k in
                                 ("input_tokens", "cache_creation_input_tokens",
                                  "cache_read_input_tokens", "output_tokens")),
            "output_tokens": u.get("output_tokens", 0),
+           "input_tokens": u.get("input_tokens", 0),
+           "cache_write_tokens": u.get("cache_creation_input_tokens", 0),
+           "cache_read_tokens": u.get("cache_read_input_tokens", 0),
+           "model_usage": out.get("modelUsage"),
            "cost_usd": out.get("total_cost_usd"), "turns": out.get("num_turns"),
            "secs": round(time.time() - t0), "ds_jobs": jobs, "worker_secs": wsecs,
+           "worker_cost_usd": wcost, "worker_tokens_in": win, "worker_tokens_out": wout,
            "timed_out": bool(out.get("timed_out")), "dir": d}
     with open(RESULTS, "a") as f:
         f.write(json.dumps(row) + "\n")
     print(f"{row['task']} {arm} #{n}: {'PASS' if ok else 'FAIL'} tokens={row['claude_tokens']} "
-          f"cost=${row['cost_usd'] or 0:.3f} {row['secs']}s ds_jobs={jobs} ({detail[:80]})",
+          f"cost=${row['cost_usd'] or 0:.3f} worker=${wcost:.4f} {row['secs']}s ds_jobs={jobs} "
+          f"({detail[:80]})",
           flush=True)
     return row
 
@@ -141,19 +183,32 @@ def report():
     cells = {}
     for r in rows:
         cells.setdefault((r["task"], r["arm"]), []).append(r)
-    print(f"{'task':16} {'arm':9} {'runs':>4} {'pass':>5} {'tokens (median)':>16} {'cost':>7} {'secs':>5}")
+    print(f"{'task':16} {'arm':9} {'runs':>4} {'pass':>5} {'claude tokens':>14} {'claude $':>9} "
+          f"{'worker $':>9} {'secs':>5}")
     totals = {}
+    paired = {t for (t, a) in cells if (t, "baseline") in cells and (t, "ds") in cells}
     for (task, arm), rs in sorted(cells.items()):
         tok = statistics.median(r["claude_tokens"] for r in rs)
         cost = statistics.median((r["cost_usd"] or 0) for r in rs)
         secs = statistics.median(r["secs"] for r in rs)
-        totals.setdefault(arm, []).append(tok)
+        wcost = statistics.median((r.get("worker_cost_usd") or 0) for r in rs)
+        if task not in paired:
+            print(f"{task:16} {arm:9} {len(rs):>4}   (no pair yet, not in totals)")
+            continue
+        t = totals.setdefault(arm, {"tok": 0, "cost": 0, "wcost": 0, "pass": 0, "n": 0})
+        t["tok"] += tok; t["cost"] += cost; t["wcost"] += wcost
+        t["pass"] += sum(r["pass"] for r in rs); t["n"] += len(rs)
         print(f"{task:16} {arm:9} {len(rs):>4} {sum(r['pass'] for r in rs):>3}/{len(rs):<1} "
-              f"{tok:>16,.0f} {cost:>7.3f} {secs:>5.0f}")
+              f"{tok:>14,.0f} {cost:>9.3f} {wcost:>9.4f} {secs:>5.0f}")
     if "baseline" in totals and "ds" in totals:
-        b, d = sum(totals["baseline"]), sum(totals["ds"])
-        print(f"sum of medians: baseline {b:,.0f}  ds {d:,.0f}  ({(1 - d / b) * 100:+.0f}% saved)"
-              if b else "")
+        b, d = totals["baseline"], totals["ds"]
+        print(f"\nsum of medians over {len(paired)} paired tasks   (DeepSeek not counted)")
+        print(f"{'':16} {'claude tokens':>13} {'claude $':>10}   pass")
+        for name, t in (("opus alone", b), ("opus + ds", d)):
+            print(f"{name:16} {t['tok']:>13,.0f} {t['cost']:>10.3f}   {t['pass']}/{t['n']}")
+        if d["cost"]:
+            print(f"Claude usage: opus + ds costs {d['cost'] / b['cost']:.2f}x of opus alone "
+                  f"({(1 - d['cost'] / b['cost']) * 100:+.0f}% saved)")
 
 
 def main():

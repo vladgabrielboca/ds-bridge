@@ -4,9 +4,7 @@ Claude plans and reviews, DeepSeek types. A cheap OpenCode worker for Claude Cod
 
 ## Why
 
-Claude usage is expensive, but delegating only saves money if the orchestrator doesn't re-read everything afterwards. ds-bridge keeps Claude's input to a ≤150-word report plus a diff the bridge computes itself — it doesn't trust the worker's account of what it changed — capped at 250 lines.
-
-Measured: reviewing a job costs Claude roughly 600–900 tokens. A revision round shows only that round's delta, so iterating stays cheap too.
+Claude usage is expensive, and delegating only saves it if Claude spends fewer turns and tokens than doing the work itself. Every Claude turn re-reads the whole conversation, so ds-bridge is built around one call per job: Claude sends a short task with a check, the call blocks until the worker is done, a passed check lands the change by itself, and Claude reads a result block of a few lines (about 100–150 tokens). The diff is computed by the bridge, not reported by the worker, and Claude only sees it when something needs a look.
 
 This README, the installer and the live-progress feature were written by the worker through ds-bridge itself, then reviewed by Claude.
 
@@ -113,11 +111,14 @@ The final report's `tok/s` is decode speed: output tokens per second while the m
 
 | Command | Description |
 | --- | --- |
-| `ds run -C <dir> "<task>"` | Start a job: snapshot, run the worker (and optional check/fix loop), print report + diff. |
+| `ds run -C <dir> --check "<cmd>" "<task>"` | Quick task: the worker explores, ds checks; a pass lands by itself. `--files`, `--source`, `--brief <research id>`, `--fix`. A full brief (GOAL/…/DONE WHEN) also works. |
+| `ds batch -C <dir> plan.md [--steps "1-2,3"]` | Run a plan's steps as parallel jobs, land them, run the integration check; one block back. |
+| `ds reply JOB <a-d or answer>` | Answer a BLOCKED job's question in the same session. |
+| `ds wait JOB` | Result of a job that was still `RUNNING` when `ds run` returned. |
 | `ds init [-C <dir>] [--refresh]` | Start a job that writes or refreshes `AGENTS.md` at the project root. |
 | `ds revise JOB "<points>"` | Send numbered feedback in the same session; shows only this round's diff. |
 | `ds diff JOB [PATH…]` | Re-show the diff, optionally `--full` or for specific paths. |
-| `ds approve JOB` | Mark the job accepted; the changes stay in place. |
+| `ds approve JOB` | Accept a job that did not land by itself (no check), or finalize a landed one. |
 | `ds reject JOB [--force]` | Undo only the job's own file changes; files changed since the job are skipped unless `--force`. |
 | `ds list` | List recent jobs with status and round. |
 | `ds stats [--days N \| --all]` | Summarise the ledger: jobs, rounds, worker tokens, Claude's reads and estimated savings. |
@@ -128,6 +129,51 @@ The final report's `tok/s` is decode speed: output tokens per second while the m
 | `ds playbook` | Print the planner playbook: Claude's rules for briefs and reviews, with the brief template. |
 
 Flags: `-C DIR` sets the project directory (`run` and `init`), `-m MODEL` overrides the model for one job, `-f FILE` attaches a file to the brief (repeatable, also on `revise`; images become reference pictures the worker can see), `--paths P…` limits the job's file scope, `--timeout S` overrides `job_budget_s` for this invocation (`run`, `init`, `revise`), and `--check CMD` / `--fix-tries N` control the acceptance check (also on `revise`), and `--fix` turns on the reproduction-test rule.
+
+### The default flow
+
+```
+ds run -C <dir> --check "node --test test/pricing.test.js" --files "src/pricing.js, test/pricing.test.js" - <<'EOF'
+Bug: total() ignores discount. A fractional discount must reduce the subtotal before tax, rounded to the cent. Fix it and add a regression test.
+EOF
+```
+
+- **Quick task.** A few plain lines plus `--check`; the worker finds the exact places itself. `--source` passes the user's words verbatim so the worker can flag where the task and the request disagree; `--brief <id>` hands it a `ds research` answer instead of Claude copying it. A brief with all six sections (GOAL, CONTEXT, FILES, STEPS, DO NOT, DONE WHEN) still works and is linted as before; it is meant for work a check cannot judge, such as visual or creative work.
+- **One blocking call.** `ds run` waits up to `wait_s` (540 s, under the Bash tool's 10-minute limit). A longer job keeps running detached and `ds run` prints `RUNNING <job>; next: ds wait <job>`.
+- **Auto-land.** A job whose check passed (no worker errors, no changes outside `--paths`, no failed reproduction) lands at once: a private copy is 3-way applied to the project, an in-place job simply stays. If the project changed under it, ds rebuilds the copy, re-applies the change with conflict markers and asks the same worker session to resolve them (one automatic redo) before giving up with `CONFLICT`. `ds reject JOB` undoes a landed job for a day; after that it is finalized. Set `auto_land` to `false` to approve by hand.
+- **The result block.** The first word decides: `OK`, `FAIL`, `BLOCKED`, `CONFLICT`, `PARTIAL`, `PROVIDER` or `ERROR`. Then `summary:`, `changed:` (files with +/-), and only the lines that carry information: `risks:`, `review:` (at most 5 `path:start-end` ranges), `missing:`, `disagree:`, `visual:`, `question:` (with a-d options), `found:`, `error:` (the condensed check failure), notes. The block is capped at `max_block_chars` (1,600). The diff follows only when nothing vouches for the change (no check, or a failure), and a `next:` line names the one action left.
+- **A check that cannot run** (exit 126/127, `command not found`, missing pytest) is reported as `check=env` and skips the fix rounds: no code edit fixes a missing tool.
+
+### Batches
+
+`ds batch -C <dir> plan.md` runs a plan file's steps as parallel jobs, each in its own private copy, and prints one block:
+
+```
+# Shopkeep: removeItem, discount fix, CLI docs
+Node ESM project; keep the code style.
+check: `node --test`
+
+## 1 removeItem
+files: src/inventory.js, test/inventory.test.js
+do: Add removeItem(inv, sku) ... and tests.
+done-when: `node --test test/inventory.test.js`
+
+## 2 CLI docs
+files: README.md
+do: Document the CLI under ## CLI ...
+done-when: `grep -q "## CLI" README.md`
+needs: 1
+```
+
+Every step needs `files:` (the job's `--paths`). Groups (`--steps "1-2,3"`, default one per step) run up to `--parallel` at a time; overlapping files run one after another and `needs:` waits for that step to land (a failed dependency skips the step). Each group's backticked `done-when` commands become its check, and passing groups land as they finish. When all have landed, the plan's `check:` (or `--check`) runs on the combined project; if it fails, one fix job gets the failure and the same check. The block shows one headline per group and the full block only for groups that need action.
+
+### The discipline hook
+
+`hooks/discipline.py` (installed by `install.sh`, active only in chats with delegation on) enforces the two rules that save the most Claude usage, after cheap-agent's hook: after a passed result, running tests again is denied until the next user prompt; after a result that did not finish, only reads, ds commands and one question to the user pass, then the state clears.
+
+### Where the rules live
+
+`~/.claude/CLAUDE.md` holds only a short pointer (delegation is opt-in, `/delegate` turns it on). The full rules are `planner-playbook.md`: `ds delegate on` prints them, the delegation hook brings them back after a compaction, and a one-line reminder repeats each turn. A chat that never delegates pays for none of it.
 
 ### `ds research`: learn the code without reading it
 
@@ -290,6 +336,9 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `research_words` | `200` | Default word limit for `ds research` (max 600). |
 | `research_agent` | `researcher` | OpenCode agent for `ds research`. |
 | `fallback_model` | `""` (off) | Model to continue on when the main model fails on the provider side. |
+| `auto_land` | `true` | Land a job whose check passed without a separate `ds approve`. |
+| `wait_s` | `540` | How long `ds run` blocks before it detaches the job and prints `RUNNING` (0 = never detach). |
+| `max_block_chars` | `1600` | Cap on the result block (the diff, when shown, comes after it). |
 
 ## Safety
 

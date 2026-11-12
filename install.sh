@@ -374,6 +374,61 @@ print("settings.json: removed the ds-bridge delegate hook")
 PY
 }
 
+py_set_discipline() {
+    DIR="$DIR" SETTINGS="$SETTINGS" ACTION="${1:-set}" python3 - <<'PY'
+import json, os, sys
+
+path = os.environ["SETTINGS"]
+cmd = os.environ["DIR"] + "/hooks/discipline.py"
+action = os.environ["ACTION"]
+# PostToolUse(Bash): record ds results; PreToolUse(any): enforce; UserPromptSubmit: prompt counter
+events = (("PostToolUse", "Bash"), ("PreToolUse", "*"), ("UserPromptSubmit", None))
+
+if os.path.exists(path):
+    try:
+        cfg = json.load(open(path))
+    except (ValueError, OSError) as e:
+        sys.exit(f"install.sh: cannot parse {path}: {e}")
+elif action == "remove":
+    sys.exit(0)
+else:
+    cfg = {}
+hooks = cfg.setdefault("hooks", {})
+changed = False
+for event, matcher in events:
+    lst = hooks.setdefault(event, [])
+    ours = [e for e in lst if isinstance(e, dict) and any(
+        isinstance(h, dict) and h.get("command") == cmd for h in e.get("hooks") or [])]
+    if action == "remove":
+        if ours:
+            hooks[event] = [e for e in lst if e not in ours]
+            if not hooks[event]:
+                del hooks[event]
+            changed = True
+        elif not lst:
+            del hooks[event]
+        continue
+    if ours:
+        continue
+    e = {"hooks": [{"type": "command", "command": cmd}]}
+    if matcher:
+        e["matcher"] = matcher
+    lst.append(e)
+    changed = True
+if not hooks:
+    cfg.pop("hooks", None)
+if not changed:
+    print(f"settings.json: discipline hook {'not set' if action == 'remove' else 'already configured'}")
+    sys.exit(0)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+print(f"settings.json: discipline hook {'removed' if action == 'remove' else 'configured'}")
+PY
+}
+
 link_ds() {
     mkdir -p "$BIN_DIR"
     ln -sfn "$DIR/ds" "$LINK"
@@ -430,6 +485,7 @@ do_uninstall() {
     py_remove_statusline
     py_remove_guard
     py_remove_delegate
+    py_set_discipline remove
     unlink_skill
 }
 
@@ -450,6 +506,7 @@ do_install() {
     py_set_statusline
     py_set_guard
     py_set_delegate
+    py_set_discipline
     link_skill
     mkdir -p "$HOME/.config/ds-bridge"
     touch "$HOME/.config/ds-bridge/guard-off"

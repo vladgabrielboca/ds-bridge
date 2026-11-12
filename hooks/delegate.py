@@ -16,9 +16,9 @@ import sys
 DELEGATE = os.path.expanduser("~/.local/state/ds-bridge/delegate")
 EDITS = os.path.expanduser("~/.local/state/ds-bridge/edits")
 REMINDER = (
-    "Delegation ON: edits over 20 lines go through `ds run -C <dir> -` (run_in_background); "
-    "learn code with `ds research`, not Read; briefs follow the planner playbook (reread: "
-    "`ds playbook`); then approve/revise/reject. Off: `ds delegate off`."
+    "Delegation ON: edits over 20 lines: `ds run -C <dir> --check \"<cmd>\" - <<'EOF'` short task, "
+    "foreground (RUNNING -> `ds wait`); OK landed = done, no re-checks. Rules: `ds playbook`. "
+    "Off: `ds delegate off`."
 )
 PLAYBOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
                         "planner-playbook.md")
