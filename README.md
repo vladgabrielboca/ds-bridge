@@ -123,9 +123,51 @@ The final report's `tok/s` is decode speed: output tokens per second while the m
 | `ds stats [--days N \| --all]` | Summarise the ledger: jobs, rounds, worker tokens, Claude's reads and estimated savings. |
 | `ds log JOB [--tools-only]` | Print a readable transcript of the job's OpenCode session. |
 | `ds delegate on\|off\|status [--session ID]` | Per-chat delegation mode (session defaults to `CLAUDE_CODE_SESSION_ID`); `on` prints the planner playbook. |
+| `ds research [-C DIR] [--paths P…] [--words N] "question"` | Read-only answer with refs, no diff. |
+| `ds rebase JOB` | Fresh private copy + the job's changes, conflicts left as markers. |
 | `ds playbook` | Print the planner playbook: Claude's rules for briefs and reviews, with the brief template. |
 
-Flags: `-C DIR` sets the project directory (`run` and `init`), `-m MODEL` overrides the model for one job, `-f FILE` attaches a file to the brief (repeatable), `--paths P…` limits the job's file scope, `--timeout S` overrides `job_budget_s` for this invocation (`run`, `init`, `revise`), and `--check CMD` / `--fix-tries N` control the acceptance check (also on `revise`).
+Flags: `-C DIR` sets the project directory (`run` and `init`), `-m MODEL` overrides the model for one job, `-f FILE` attaches a file to the brief (repeatable, also on `revise`; images become reference pictures the worker can see), `--paths P…` limits the job's file scope, `--timeout S` overrides `job_budget_s` for this invocation (`run`, `init`, `revise`), and `--check CMD` / `--fix-tries N` control the acceptance check (also on `revise`), and `--fix` turns on the reproduction-test rule.
+
+### `ds research`: learn the code without reading it
+
+`ds research -C <dir> "<question>"` runs a read-only researcher (OpenCode agent `researcher`: edits denied, state-changing git and `rm`/`mv` denied) that answers one question in at most `research_words` words (default 200, `--words N`, max 600), with up to 6 refs as `path:start-end` plus the verbatim anchor line, the commands it ran to verify, a confidence and what it could not determine. `--paths` limits where it looks, `-f` attaches files or images. The output has no diff. Snapshots are taken around the run as for a job; if the researcher changed anything anyway, ds restores it and prints a warning. Planning from this answer instead of opening files keeps source code out of Claude's context (cheap-ag measured Claude reading about two files before each delegation).
+
+### Trusted checks
+
+When the job's `--check` passes, the report shows only the diff stat and `ds diff JOB` for the full diff (config `diff_on_pass`, `"stat"` by default, `"full"` for the old behaviour). The full diff is still shown without a check, on a failed check, on worker errors, a soft deadline or changes outside `--paths`. cheap-ag's measurements: reading every passing diff cost +28% tokens and caught no wrong fix.
+
+### Private copies for parallel jobs
+
+A job with `--paths` (config `isolate`: `"paths"` by default, `"always"`, `"never"`) runs in a copy-on-write copy of the project under `~/.local/share/ds-bridge/work/<job>` (`cp -a --reflink=always`: on btrfs/XFS a 785 MB project copies in 0.3 s and uses no extra space until files change). The worker, its `--check` and any renders run there, so a job never sees another job's half-written files. Absolute project paths in the brief, the check and `-f` files are pointed at the copy, and the worker is told to stay inside it. `ds research` always runs in a copy.
+
+- `ds approve` lands the job: its diff is 3-way applied to the project under a lock (`git apply --3way` through a throwaway index, so the project's own git index is untouched). Files the snapshots skip that the job created or changed in its copy (renders, media, big files) are reflinked back too, unless the project's version changed meanwhile.
+- If the changes no longer apply (someone edited the same lines), approve prints `CONFLICT` and changes nothing. `ds rebase JOB` makes a fresh copy of the current project and 3-way applies the job onto it, leaving conflict markers; `ds revise` resolves them. Approve refuses while conflict markers remain.
+- `ds reject` just deletes the copy; the project was never touched.
+- Without reflink support (tmpfs, ext4) the job runs in place as before and the report says why.
+
+Merge logic adapted from cheap-agent's `src/workspace.ts` (MIT).
+
+### Failed checks: short output, early stop, findings
+
+- The report shows a condensed failure instead of raw output: up to 3 distinct failures (repeats counted ×N), each with its message, expected/got lines and the first frame in the project, at most 25 lines (ported from cheap-agent's `errorTail`). The worker still gets the last 60 raw lines.
+- If a fix round ends with the same failure as the round before (numbers ignored), the loop stops instead of spending the remaining rounds; the check line says `stopped: the same failure repeated`.
+- When the check still fails, the worker is asked for a `FOUND:` note (at most 600 characters: where the problem is, its best hypothesis, what it ruled out), shown under `--- found`. BLOCKED and unfinished reports start their NOTES with the same.
+- A report that is not finished (check FAIL, BLOCKED, errors, repro FAILED/WEAK) ends with a line telling Claude to ask the user: a Sonnet subagent finishes it from the `found:` note, `ds revise`, or stop. Claude doesn't take it over with Opus.
+
+### `--fix`: proven bug fixes
+
+`ds run --fix` adds a rule to the brief: write a test that reproduces the bug and see it fail, then fix, and report `REPRO: <command running only that test>`. ds then runs that command on the new code (must pass) and on a copy where every non-test change is reverted (must fail), and prints `--- repro: fail→pass verified`, `WEAK` (the test passes on the old code too), `FAILED` or `unverified: <why>`. A repro that is not verified also brings back the full diff.
+
+### Benchmark
+
+`bench/` measures Claude tokens with and without ds on cheap-agent's fixture and tasks (hidden tests grade the result). See `bench/README.md`.
+
+### Vision: the worker looks at its own output
+
+DeepSeek v4.1 Flash accepts images, so the worker checks visible results itself instead of sending every render back to Claude. When a task produces something visible (UI, web page, plot, image, video frame, slide, PDF), the worker prompt tells it to take a screenshot or extract a frame (`chromium --headless --screenshot`, `ffmpeg`, `magick`), open the PNG with its read tool, crop and enlarge before judging fine detail, fix problems its own change caused, and look again. The report gets a `VISUAL:` line naming each image checked and any problem with its location; doubtful ones are marked `UNSURE` and left unchanged. Scratch images go to `/tmp/ds-*`.
+
+This matters for cost: an image costs Claude about 1.5–1.8k tokens and stays in its context for the rest of the chat, while the `VISUAL:` line costs a few dozen. The images live in DeepSeek's context instead. The playbook tells Claude to add a LOOK step to briefs with visible output (the command, the image path, what must be visible where) and to open an image itself only to confirm a flagged problem or for a final sign-off. Visual reports are a first pass: in tests the worker found real defects but also invented fine detail on small images, which is why it is told to zoom first and to report only problems it can locate.
 
 ### `--check` and the fix loop
 
@@ -179,6 +221,8 @@ By default Claude works directly; delegation is switched on per chat. Type `/del
 
 `install.sh` adds a Claude Code `PreToolUse` hook (`hooks/guard.py`) for `Edit`, `Write`, `MultiEdit` and `NotebookEdit`. Direct edits to project files are blocked with a message to delegate through `ds`; `~/.claude/`, `/tmp/claude-*` scratchpads and globs in `guard_allow` are allowed. Set `guard_mode` to `"warn"` to warn instead of blocking: the edit is not blocked by the hook, you see a warning, and Claude gets a reminder about the delegation rule. Pause it with `touch ~/.config/ds-bridge/guard-off` or `DS_GUARD_OFF=1`. It can't stop edits made through Bash (heredocs, sed), so it is a guardrail, not a sandbox.
 
+Small edits pass even in delegation mode: at most `guard_lines` changed lines per edit (default 20) and `guard_edits_per_file` edits per file per turn (default 2). Delegating a one-liner costs Claude more (a brief plus a review) than making it. The counts live in `~/.local/state/ds-bridge/edits/<session>.json` and the delegation hook clears them on every new user prompt. Set either value to 0 to block all direct edits again.
+
 ### Stats and log
 
 Every report appends one line to `~/.local/share/ds-bridge/ledger.jsonl`. `ds stats` prints jobs (distinct ids), rounds (ledger rows), worker tokens in/cache/out, what Claude read, an estimated saving, and (when known) the median decode speed and TTFT across rounds:
@@ -216,7 +260,7 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `model` | `opencode-go/deepseek-v4.1-flash` | Model used by the worker. |
 | `agent` | `worker` | OpenCode agent to run. |
 | `max_diff_lines` | `250` | Lines of diff shown to Claude before truncation. |
-| `max_report_chars` | `1500` | Cap on the worker's report (about 150 words). |
+| `max_report_chars` | `1500` | Cap on the worker's report (about 180 words). |
 | `timeout_s` | `1800` | Per-run timeout. |
 | `soft_timeout_frac` | `0.8` | Fraction of `timeout_s` after which the worker is stopped and asked to wrap up. |
 | `wrapup_s` | `180` | Time limit for the wrap-up call that writes the final report. |
@@ -235,6 +279,12 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `outside_ignore` | `[".git", "__pycache__", "media*", "*.log", "node_modules", ".venv"]` | Globs ignored by the `--paths` outside-change warning. |
 | `guard_allow` | `[]` | Globs of paths the guard hook always allows (for example `~/work/sandbox/*`). |
 | `guard_mode` | `"block"` | Guard hook behaviour for blocked paths: `"block"` (message to stderr, exit 2) or `"warn"` (allow the edit, show a warning to you and add context for Claude). |
+| `guard_lines` | `20` | In delegation mode, the most changed lines one direct edit may have (0 blocks all direct edits). |
+| `guard_edits_per_file` | `2` | In delegation mode, direct edits allowed per file per turn. |
+| `isolate` | `"paths"` | When jobs run in a private copy: `"paths"` (jobs with `--paths`), `"always"` or `"never"`. |
+| `diff_on_pass` | `"stat"` | `"stat"`: a passed check shows only the diff stat; `"full"`: always show the diff. |
+| `research_words` | `200` | Default word limit for `ds research` (max 600). |
+| `research_agent` | `researcher` | OpenCode agent for `ds research`. |
 
 ## Safety
 

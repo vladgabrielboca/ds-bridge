@@ -85,11 +85,12 @@ except (ValueError, OSError) as e:
     sys.exit(f"install.sh: cannot parse {path}: {e}")
 
 agents = cfg.get("agent")
-if not isinstance(agents, dict) or "worker" not in agents:
-    print("opencode.json: worker agent not set, nothing to remove")
+if not isinstance(agents, dict) or not ({"worker", "researcher"} & set(agents)):
+    print("opencode.json: ds agents not set, nothing to remove")
     sys.exit(0)
 
-del agents["worker"]
+for name in ("worker", "researcher"):
+    agents.pop(name, None)
 if not agents:
     cfg.pop("agent", None)
 
@@ -441,7 +442,7 @@ do_install() {
         say "backed up $OC -> $OC_BAK"
     fi
     py_merge_agent
-    say "merged worker agent into $OC"
+    say "merged worker + researcher agents into $OC"
 
     link_ds
 

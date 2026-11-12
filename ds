@@ -6,12 +6,17 @@ The bridge itself computes the diff from a shadow-git snapshot, so Claude
 only ever reads: the worker's short report + a capped diff.
 
   ds run  [-C DIR] [-m MODEL] [-f FILE]... [--paths P ...]
-          [--check CMD] [--fix-tries N] "task"      new job
+          [--check CMD] [--fix-tries N] [--fix] "task"   new job
+                                                   (--fix: worker writes a repro test; ds verifies fail→pass)
   ds init [-C DIR] [--refresh]                      job that writes AGENTS.md
-  ds revise JOB "feedback" [--check CMD]           same session, keeps DeepSeek's context
+  ds research [-C DIR] [--paths P ...] [--words N] "question"
+                                                   read-only answer + refs, no diff
+  ds revise JOB "feedback" [-f FILE]... [--check CMD]  same session, keeps DeepSeek's context
   ds diff   JOB [--full] [PATH...]                 re-show diff (optionally full / per path)
-  ds approve JOB                                   accept, drop snapshot
+  ds approve JOB                                   accept (private copy: land its changes)
   ds reject  JOB                                   restore files to pre-job snapshot
+                                                   (private copy: just delete it)
+  ds rebase  JOB                                   fresh copy + job's changes, conflicts as markers
   ds list                                          recent jobs
   ds stats [--days N | --all]                      token savings from the ledger
   ds log   JOB [--tools-only]                      readable session transcript
@@ -52,6 +57,7 @@ session, at most "overload_retries" times (default 2).
 """
 import hashlib, json, os, signal, subprocess, sys, time, argparse, shutil, queue, threading, fcntl
 import fnmatch, re, tempfile, base64, collections, urllib.request, urllib.parse, secrets
+import contextlib, io
 
 HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".local/share/ds-bridge")
@@ -61,6 +67,7 @@ PROGRESS = os.path.join(STATE, "progress")
 RUNNING = os.path.join(STATE, "running")
 LEDGER = os.path.join(STATE, "ledger.jsonl")
 TODAY = os.path.join(STATE, "today.json")
+WORK = os.path.join(STATE, "work")
 CONF = os.path.join(HOME, ".config/ds-bridge/config.json")
 DELEGATE = os.path.join(HOME, ".local/state/ds-bridge/delegate")
 DELEGATE_TTL = 30 * 24 * 60 * 60
@@ -71,7 +78,8 @@ DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
             "max_files": 20000, "big_file_mb": 5,
             "fix_tries": 2, "check_timeout_s": 600, "job_budget_s": 1800,
             "overload_retries": 2, "overload_wait_s": [30, 90],
-            "excluded_note": True,
+            "excluded_note": True, "diff_on_pass": "stat", "research_words": 200,
+            "research_agent": "researcher", "guard_lines": 20, "guard_edits_per_file": 2,
             "notify": True, "notify_min_s": 15,
             "outside_ignore": [".git", "__pycache__", "media*", "*.log",
                                "node_modules", ".venv"]}
@@ -583,6 +591,112 @@ def clear_marker(jid):
         os.remove(os.path.join(RUNNING, jid + ".json"))
     except OSError:
         pass
+
+
+def proj(job):
+    """The user's project dir; job["dir"] is the private copy when the job has one."""
+    return job.get("project") or job["dir"]
+
+
+def want_copy(c, paths, force=False):
+    mode = c.get("isolate", "paths")
+    if force or mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return bool(paths)
+
+
+def make_copy(d, name):
+    """Copy-on-write copy of d under WORK; (path, None) or (None, reason)."""
+    os.makedirs(WORK, exist_ok=True)
+    dst = os.path.join(WORK, name)
+    if os.path.exists(dst):
+        shutil.rmtree(dst, ignore_errors=True)
+    r = subprocess.run(["cp", "-a", "--reflink=always", d + "/.", dst],
+                       capture_output=True, text=True)
+    if r.returncode:
+        shutil.rmtree(dst, ignore_errors=True)
+        why = (r.stderr or "").strip().splitlines()
+        return None, (why[-1][:160] if why else f"cp exit {r.returncode}")
+    return dst, None
+
+
+def drop_copy(job):
+    w = job.get("dir")
+    if job.get("project") and w and os.path.realpath(w).startswith(os.path.realpath(WORK) + os.sep):
+        shutil.rmtree(w, ignore_errors=True)
+
+
+def to_copy(text, d, w):
+    """Point absolute paths into the project at the private copy instead."""
+    if not text or not w or w == d:
+        return text
+    return re.sub(re.escape(d) + r"(?=$|[/\s\"'`:;,)\]])", w, text)
+
+
+FIX_NOTE = ("\n\nBUG FIX RULE: before changing any code, write a test that reproduces the bug "
+            "(in the project's test style and test folder), run it and see it fail. Then fix "
+            "the code until that test passes. Add one line to your final report block: "
+            "`REPRO: <exact command that runs only your new test>` (or `REPRO: none: <why>` if "
+            "the bug cannot be reproduced by a test). The reviewer runs that command on the old "
+            "code (must fail) and the new code (must pass).")
+TEST_PATH = re.compile(r"(^|/)(tests?|spec|__tests__)/|(^|/)test_[^/]*$|_test\.[^/]+$"
+                       r"|\.(test|spec)\.[^/]+$")
+
+
+def verify_repro(job, report):
+    """Run the worker's REPRO command on the new code (must pass) and on a copy where every
+    non-test change is reverted (must fail). Returns a one-line verdict."""
+    m = re.search(r"^\s*REPRO:\s*(.+)$", report or "", re.M)
+    if m:
+        job["repro_cmd"] = m.group(1).strip().strip("`").strip()
+    cmd = job.get("repro_cmd")
+    if not cmd:
+        return "unverified: the worker reported no REPRO line"
+    if cmd.lower().startswith("none"):
+        return "none: " + cmd.split(":", 1)[-1].strip()[:200]
+    c = cfg()
+    w, gd = job["dir"], job["shadow"]
+    post = job.get("post") or job["base"]
+    new = run_check(w, cmd, c["check_timeout_s"])
+    if not new["pass"]:
+        return f"FAILED: `{cmd}` does not pass on the new code (exit {new['code']})"
+    names = [f for f in git(gd, w, "diff", "--name-only", "-z", "--no-renames",
+                            job["base"], post).split("\0") if f]
+    tests = [f for f in names if TEST_PATH.search(f)]
+    if not tests:
+        return f"unverified: `{cmd}` passes, but the diff has no test file"
+    old, err = make_copy(w, job["id"] + "-repro")
+    if not old:
+        return f"unverified: `{cmd}` passes; no copy for the old-code run ({err})"
+    try:
+        for f in names:
+            if f in tests:
+                continue
+            dst = os.path.join(old, f)
+            if commit_blob(gd, w, job["base"], f) == "absent":
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+            else:
+                blob = subprocess.run(["git", f"--git-dir={gd}", "show", f"{job['base']}:{f}"],
+                                      capture_output=True)
+                os.makedirs(os.path.dirname(dst) or old, exist_ok=True)
+                with open(dst, "wb") as fh:
+                    fh.write(blob.stdout)
+        before = run_check(old, to_copy(cmd, w, old), c["check_timeout_s"])
+    finally:
+        shutil.rmtree(old, ignore_errors=True)
+    if before["pass"]:
+        return f"WEAK: `{cmd}` also passes on the old code, so it does not reproduce the bug"
+    return f"fail→pass verified: `{cmd}`"
+
+
+COPY_NOTE = ("WORKSPACE: you work in a private copy of the project at {w} (the current "
+             "directory). Never read or write the original at {d}; use paths relative to "
+             "the current directory.\n\n")
 
 
 def claim_job(jid, d, paths):
@@ -1294,7 +1408,7 @@ def write_progress_file(job, model, **fields):
         obj = {"state": "running", "started": time.time(), "steps": 0, "tools": 0,
                "out_tokens": 0, "tok_s": None, "ttft_s": None,
                "job": job["id"], "round": job["round"],
-               "model": model, "dir": os.path.basename(job["dir"])}
+               "model": model, "dir": os.path.basename(proj(job))}
     obj["owner"] = job.get("owner") or ""
     obj.update(fields)
     obj["pid"] = os.getpid()
@@ -1333,6 +1447,68 @@ def run_check(d, cmd, timeout_s):
     return {"pass": code == 0, "code": code, "output": "\n".join(lines[-60:])}
 
 
+# Failure condensing, ported from cheap-ag's errorTail (src/verify.ts, MIT).
+_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_MARKER = re.compile(r"✗|✘|×|\bFAIL\b|Error:|error TS\d+|AssertionError|Traceback|panicked|^E\s{2,}")
+_DETAIL = re.compile(r"expected|received|\bgot\b|\bwant\b|^\s*[-+] ", re.I)
+_FRAME = re.compile(r'^\s*(at |File ")|\.(ts|tsx|js|mjs|cjs|py|go|rs):\d+')
+_NOISE = re.compile(r"^\s*(✓|√|PASS\b|ok\b)|^\s*(Tests?|Test Files|Suites?)\b.*\bpassed\b"
+                    r"|^\s*[.·•⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]+$")
+
+
+def error_tail(output, root=None, max_failures=3, max_lines=25):
+    """Up to 3 distinct failures (repeats counted ×N), each with its message, expected/got
+    lines and first in-repo frame; at most 25 lines of 200 chars. Falls back to the last
+    lines when no failure marker is found."""
+    text = _ANSI.sub("", output or "")
+    if root:
+        text = text.replace(root.rstrip("/") + "/", "")
+    lines = [l.replace("\t", "  ").rstrip() for l in text.splitlines()]
+    lines = [l for l in lines if l.strip() and (_MARKER.search(l) or not _NOISE.search(l))]
+    fails = []
+    i = 0
+    while i < len(lines):
+        if not _MARKER.search(lines[i]):
+            i += 1
+            continue
+        block, frame, j = [lines[i].strip()], False, i + 1
+        while j < len(lines) and j <= i + 12 and not _MARKER.search(lines[j]):
+            if _DETAIL.search(lines[j]) and len(block) < 5:
+                block.append("  " + lines[j].strip())
+            elif (not frame and _FRAME.search(lines[j])
+                  and not re.search(r"node_modules|node:internal|site-packages", lines[j])):
+                block.append("  " + lines[j].strip())
+                frame = True
+            j += 1
+        key = re.sub(r"\d+", "#", block[0])
+        same = next((f for f in fails if f["key"] == key), None)
+        if same:
+            same["n"] += 1
+        else:
+            fails.append({"key": key, "lines": block, "n": 1})
+        i = max(i + 1, j)
+    if fails:
+        body = []
+        for f in fails[:max_failures]:
+            head = f["lines"][0] + (f" (×{f['n']})" if f["n"] > 1 else "")
+            body += [head] + f["lines"][1:]
+    else:
+        body = lines[-(max_lines - 1):]
+    clip = lambda l: l if len(l) <= 200 else l[:120] + " … " + l[-77:]
+    return [clip(l) for l in body[:max_lines]]
+
+
+def same_failure(a, b):
+    norm = lambda t: re.sub(r"\d+", "#", "\n".join(t))
+    return norm(a) == norm(b)
+
+
+FOUND_MSG = ("STOP. The check still fails and there will be no more fix rounds. Do not edit "
+             "anything. Reply with ONLY one line starting `FOUND:` (at most 600 characters): "
+             "where the problem is (file, function, line), your best hypothesis for the cause, "
+             "and what you ruled out.")
+
+
 def run_with_check(job, msg, session=None, files=(), budget_s=None):
     """Run the worker, then keep auto-fixing until the job's check passes."""
     d = job["dir"]
@@ -1358,12 +1534,17 @@ def run_with_check(job, msg, session=None, files=(), budget_s=None):
         return res
     tries = max(0, int(job.get("fix_tries") or 0))
     timeout_s = c["check_timeout_s"]
-    results, rounds, skipped = [res], 0, 0
+    results, rounds, skipped, stuck, prev = [res], 0, 0, False, None
     while True:
         write_check_progress(job, job["model"], check)
         chk = run_check(d, check, limit(timeout_s))
+        tail = error_tail(chk["output"], d)
         if chk["pass"] or rounds >= tries:
             break
+        if prev is not None and same_failure(prev, tail):
+            stuck = True   # the last fix round changed nothing about the failure
+            break
+        prev = tail
         if remaining() < FIX_MIN_S:
             skipped = tries - rounds
             break
@@ -1397,7 +1578,14 @@ def run_with_check(job, msg, session=None, files=(), budget_s=None):
     if retried:
         out["overload_retries"] = retried
     out["check"] = {"cmd": check, "pass": chk["pass"], "code": chk["code"],
-                    "output": chk["output"], "rounds": rounds}
+                    "output": chk["output"], "tail": tail, "rounds": rounds, "stuck": stuck}
+    if not chk["pass"] and not last["errors"] and remaining() > 60:
+        fr = run_retrying(d, FOUND_MSG, job["model"], job["agent"],
+                          session=last.get("session") or job.get("session"), job=job,
+                          limit_s=limit(180), deadline=deadline)
+        m = re.search(r"FOUND:\s*(.+)", fr.get("report") or "", re.S)
+        if m:
+            out["found"] = " ".join(m.group(1).split())[:600]
     if skipped:
         out["check"]["budget_skipped"] = skipped
     ttft_med = _median(out["ttft"])
@@ -1514,7 +1702,7 @@ def record_ledger(job, res, claude_chars):
     tk = res["tokens"]
     ttft_med = _median(res.get("ttft") or [])
     entry = {"ts": int(time.time()), "job": job["id"], "round": job["round"],
-             "dir": job["dir"], "worker_in": tk["input"],
+             "dir": proj(job), "worker_in": tk["input"],
              "worker_cache": tk["cache_read"], "worker_out": tk["output"],
              "claude_chars": claude_chars, "secs": res.get("secs"),
              "tok_s": res.get("tok_s"),
@@ -1540,7 +1728,10 @@ def emit(job, res):
     rb = job.get("round_base")
     stat, body = diff_text(job, since=rb)
     tk = res["tokens"]
-    out = [f"JOB {job['id']}  round {job['round']}  dir {job['dir']}"]
+    out = [f"JOB {job['id']}  round {job['round']}  dir {proj(job)}"
+           + ("  (private copy; lands on approve)" if job.get("project") else "")]
+    if job.get("copy_error"):
+        out.append(f"NOTE: no private copy ({job['copy_error']}); ran in place")
     line = (f"worker: {job['model']}  {res['secs']}s  tok in {tk['input']} "
             f"(cache {tk['cache_read']}) out {tk['output']}  cost ${res['cost']:.4f}")
     if res.get("tok_s") is not None:
@@ -1569,11 +1760,18 @@ def emit(job, res):
             out.append(f"PASS  {chk['cmd']}{extra}")
         else:
             out.append(f"FAIL  {chk['cmd']}  exit {chk['code']}  "
-                       f"after {chk['rounds']} auto-fix rounds")
-            if chk["output"]:
-                out.append("\n".join(chk["output"].splitlines()[-30:]))
+                       f"after {chk['rounds']} auto-fix rounds"
+                       + ("; stopped: the same failure repeated" if chk.get("stuck") else ""))
+            tail = chk.get("tail") or chk["output"].splitlines()[-30:]
+            if tail:
+                out.append("\n".join(tail))
         if chk.get("budget_skipped"):
             out.append(f"budget exhausted, {chk['budget_skipped']} fix rounds skipped")
+    if res.get("repro"):
+        out.append("--- repro: " + res["repro"])
+    if res.get("found"):
+        out.append("--- found (worker's findings for whoever takes over)")
+        out.append(res["found"])
     if res.get("outside"):
         out.append("--- WARNING: changes outside --paths")
         out.extend(res["outside"])
@@ -1583,10 +1781,25 @@ def emit(job, res):
         out.append(f"--- this round only (cumulative: ds diff {job['id']})")
     out.append("--- diff stat")
     out.append(stat.rstrip() or "(no changes)")
-    if body:
+    # A passed check is trusted (cheap-ag's measurements: reading every passing diff cost
+    # +28% tokens and caught no wrong fix). Full diff only without a check, on a failed
+    # check, worker errors or changes outside --paths.
+    trusted = (c.get("diff_on_pass", "stat") == "stat" and chk and chk.get("pass")
+               and not res["errors"] and not res.get("outside") and not res.get("soft_deadline")
+               and not (res.get("repro") and not res["repro"].startswith("fail→pass")))
+    if body and trusted:
+        out.append(f"--- diff omitted: check passed (full: ds diff {job['id']})")
+    elif body:
         out.append("--- diff")
         out.append(body)
+    failed = (res["errors"] or (chk and not chk.get("pass"))
+              or re.search(r"^\s*STATUS:\s*BLOCKED", rep, re.M)
+              or (res.get("repro") or "").startswith(("FAILED", "WEAK")))
     out.append(f"--- next: ds approve {job['id']} | ds revise {job['id']} \"...\" | ds reject {job['id']}")
+    if failed:
+        out.append("--- not finished: ask the user one question: a Sonnet subagent finishes it "
+                   "(from found: and the job's copy; costs Claude usage), ds revise with the "
+                   "findings, or stop. Don't pick for them; don't take it over yourself.")
     text = "\n".join(out) + "\n"
     sys.stdout.write(text)
     record_ledger(job, res, len(text))
@@ -1604,7 +1817,7 @@ def notify_cmd(job, res):
     secs = int(res.get("secs") or 0)
     if secs < min_s or not shutil.which("notify-send"):
         return None
-    base = os.path.basename(job["dir"].rstrip("/")) or job["dir"]
+    base = os.path.basename(proj(job).rstrip("/")) or proj(job)
     when = f"{secs // 60}:{secs % 60:02d}"
     errs = res.get("errors") or []
     if errs:
@@ -1792,36 +2005,58 @@ def cmd_run(a):
         raise
     job = None
     post_taken = False
+    work, copy_err = d, None
+    if want_copy(c, paths, force=getattr(a, "research", False)):
+        w, copy_err = make_copy(d, jid)
+        if w:
+            work = w
+    if getattr(a, "fix", False):
+        task = task + FIX_NOTE
+    if work != d:
+        task = COPY_NOTE.format(w=work, d=d) + to_copy(task, d, work)
+        if a.check:
+            a.check = to_copy(a.check, d, work)
+        if a.f:
+            a.f = [to_copy(f, d, work) for f in a.f]
     try:
-        base = snapshot(d, gd, f"pre {jid}", job_index(jid), jid, paths)
-        job = {"id": jid, "dir": d, "shadow": gd, "base": base, "model": a.m or c["model"],
-               "agent": c["agent"], "session": new_session_id(), "round": 1, "status": "open",
+        base = snapshot(work, gd, f"pre {jid}", job_index(jid), jid, paths)
+        job = {"id": jid, "dir": work, "shadow": gd, "base": base, "model": a.m or c["model"],
+               "agent": getattr(a, "agent", None) or c["agent"], "session": new_session_id(),
+               "round": 1, "status": "open",
                "paths": paths, "task": task, "check": a.check,
                "owner": os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
+               "started": time.time(), "fix": bool(getattr(a, "fix", False)),
+               **({"project": d} if work != d else {}),
+               **({"copy_error": copy_err} if copy_err else {}),
                "fix_tries": a.fix_tries if a.fix_tries is not None else c["fix_tries"]}
         save(job)
-        outside = outside_listing(d, paths) if paths else None
+        outside = outside_listing(work, paths) if paths else None
         want_note = c.get("excluded_note", True)
-        excluded = excluded_listing(d, paths) if want_note else None
+        excluded = excluded_listing(work, paths) if want_note else None
         res = run_with_check(job, task, session=job["session"], files=a.f or (),
                              budget_s=budget)
         if outside is not None:
-            res["outside"] = outside_changes(outside, outside_listing(d, paths))
+            res["outside"] = outside_changes(outside, outside_listing(work, paths))
         if excluded is not None:
-            note = excluded_note(excluded, excluded_listing(d, paths), c)
+            note = excluded_note(excluded, excluded_listing(work, paths), c)
             if note:
                 res["excluded_note"] = note
-        job["post"] = snapshot(d, gd, f"post r{job['round']}", job_index(jid), jid, paths)
+        job["post"] = snapshot(work, gd, f"post r{job['round']}", job_index(jid), jid, paths)
         post_taken = True
         if res.get("session"):
             job["session"] = res["session"]
+        if job.get("fix") and not res["errors"]:
+            res["repro"] = verify_repro(job, res.get("report"))
         save(job)
-        emit(job, res)
+        if getattr(a, "research", False):
+            finish_research(job, res, a.words)
+        else:
+            emit(job, res)
         notify_done(job, res)
     finally:
         if job is not None and not post_taken:
             try:
-                job["post"] = snapshot(d, gd, f"post r{job['round']}",
+                job["post"] = snapshot(work, gd, f"post r{job['round']}",
                                        job_index(jid), jid, paths)
                 save(job)
             except BaseException:
@@ -1829,6 +2064,69 @@ def cmd_run(a):
         mark_interrupted(jid)
         clear_marker(jid)
         cleanup_progress()
+
+
+RESEARCH_TASK = (
+    "QUESTION: {q}\n{scope}"
+    "Answer in at most {w} words (REFS and VERIFIED lines do not count). "
+    "Change nothing in the project. Reply with only the ANSWER/REFS/VERIFIED/CONFIDENCE/UNSURE block.")
+
+
+def cmd_research(a):
+    """Read-only job: a researcher answers one question so Claude plans without reading files."""
+    c = cfg()
+    q = a.question if a.question != "-" else sys.stdin.read()
+    if not q or not q.strip():
+        die("research needs a question")
+    try:
+        words = int(a.words if a.words is not None else c.get("research_words", 200))
+    except (TypeError, ValueError):
+        words = 200
+    words = max(30, min(words, 600))
+    scope = f"SCOPE: look only under {', '.join(a.paths)}; cite only files there.\n" if a.paths else ""
+    task = RESEARCH_TASK.format(q=q.strip(), scope=scope, w=words)
+    ns = argparse.Namespace(C=a.C, m=a.m, paths=None, check=None, fix_tries=0, f=a.f,
+                            task=task, timeout=a.timeout, internal=True, research=True,
+                            words=words, agent=c.get("research_agent", "researcher"))
+    cmd_run(ns)
+
+
+def finish_research(job, res, words):
+    """Print the answer only; undo anything the researcher changed; close the job."""
+    c = cfg()
+    stat, _ = diff_text(job)
+    changed = bool(stat.strip())
+    rep = (res["report"] or "(researcher gave no answer)").strip()
+    cap = max(c["max_report_chars"], int(words) * 9 + 900)
+    if len(rep) > cap:
+        rep = rep[:cap] + " …[answer truncated]"
+    tk = res["tokens"]
+    out = [f"RESEARCH {job['id']}  dir {proj(job)}",
+           f"researcher: {job['model']}  {res['secs']}s  tok in {tk['input']} "
+           f"(cache {tk['cache_read']}) out {tk['output']}  cost ${res['cost']:.4f}"]
+    if res["errors"]:
+        out.append("ERRORS: " + " | ".join(e[:300] for e in res["errors"]))
+    out.append(rep)
+    if changed and job.get("project"):
+        out.append("--- NOTE: the researcher changed files in its private copy; discarded")
+        drop_copy(job)
+        job["status"] = "approved"
+        save(job)
+        cleanup_shadow(job)
+    elif changed:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_reject(argparse.Namespace(job=job["id"], force=False))
+        out.append("--- WARNING: the researcher changed files; restored: "
+                   + buf.getvalue().strip().splitlines()[-1][:200])
+    else:
+        drop_copy(job)
+        job["status"] = "approved"
+        save(job)
+        cleanup_shadow(job)
+    text = "\n".join(out) + "\n"
+    sys.stdout.write(text)
+    record_ledger(job, res, len(text))
 
 
 def cmd_revise(a):
@@ -1842,7 +2140,7 @@ def cmd_revise(a):
             refuse_brief("revise", probs)
     budget = a.timeout if a.timeout is not None else c["job_budget_s"]
     paths = job.get("paths")
-    claim_job(job["id"], job["dir"], paths)
+    claim_job(job["id"], proj(job), paths)
     post_taken = False
     try:
         # The chat that revises owns the job's status line from now on.
@@ -1862,7 +2160,8 @@ def cmd_revise(a):
         outside = outside_listing(job["dir"], paths) if paths else None
         want_note = c.get("excluded_note", True)
         excluded = excluded_listing(job["dir"], paths) if want_note else None
-        res = run_with_check(job, msg, session=job["session"], budget_s=budget)
+        res = run_with_check(job, msg, session=job["session"], files=a.f or (),
+                             budget_s=budget)
         if outside is not None:
             res["outside"] = outside_changes(outside, outside_listing(job["dir"], paths))
         if excluded is not None:
@@ -1872,6 +2171,8 @@ def cmd_revise(a):
         job["post"] = snapshot(job["dir"], job["shadow"], f"post r{job['round']}",
                                job_index(job["id"]), job["id"], paths)
         post_taken = True
+        if job.get("fix") and not res["errors"]:
+            res["repro"] = verify_repro(job, res.get("report"))
         save(job)
         emit(job, res)
         notify_done(job, res)
@@ -1897,14 +2198,166 @@ def cmd_diff(a):
     print(body)
 
 
+def _apply_3way(gd, wt, patch, files, index):
+    """3-way apply patch onto wt through a throwaway index synced to wt's current files.
+    Returns (ok, output). The user's own git index is never touched."""
+    try:
+        os.remove(index)
+    except OSError:
+        pass
+    present = [f for f in files if os.path.lexists(os.path.join(wt, f))]
+    if present:
+        git(gd, wt, "add", "-A", "-f", "--", *present, index=index)
+    env = dict(os.environ, GIT_INDEX_FILE=index)
+    base = ["git", "-c", "core.quotePath=false", f"--git-dir={gd}", f"--work-tree={wt}"]
+    chk = subprocess.run(base + ["apply", "--3way", "--check", "-"], input=patch,
+                         capture_output=True, text=True, cwd=wt, env=env)
+    out = (chk.stdout or "") + (chk.stderr or "")
+    # `apply --3way --check` exits 0 even when it would leave conflict markers
+    if chk.returncode or "with conflicts" in out:
+        return False, out.strip() or "patch does not apply"
+    r = subprocess.run(base + ["apply", "--3way", "-"], input=patch,
+                       capture_output=True, text=True, cwd=wt, env=env)
+    return r.returncode == 0, ((r.stdout or "") + (r.stderr or "")).strip()
+
+
+def _job_patch(job):
+    gd, w = job["shadow"], job["dir"]
+    post = job.get("post") or job["base"]
+    names = [f for f in git(gd, w, "diff", "--name-only", "-z", "--no-renames",
+                            job["base"], post).split("\0") if f]
+    patch = git(gd, w, "diff", "--binary", "--no-renames", job["base"], post) if names else ""
+    return patch, names
+
+
+def copy_back_untracked(job):
+    """Files the job created or changed in its copy that snapshots skip (renders, media,
+    big files): reflink them into the project. Returns (copied, skipped)."""
+    w, d = job["dir"], job["project"]
+    post = job.get("post") or job["base"]
+    tracked = set(f for f in git(job["shadow"], w, "ls-tree", "-r", "-z", "--name-only",
+                                 post).split("\0") if f)
+    t0 = float(job.get("started") or 0)
+    copied, skipped = 0, []
+    for root, dirs, files in os.walk(w):
+        dirs[:] = [x for x in dirs if x not in EXCLUDED_PRUNE]
+        for name in files:
+            src = os.path.join(root, name)
+            rel = os.path.relpath(src, w)
+            try:
+                if rel in tracked or os.lstat(src).st_mtime <= t0:
+                    continue
+            except OSError:
+                continue
+            dst = os.path.join(d, rel)
+            try:
+                if os.path.lexists(dst) and os.lstat(dst).st_mtime > t0:
+                    skipped.append(rel)   # changed in the project meanwhile: keep that
+                    continue
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                subprocess.run(["cp", "-a", "--reflink=auto", src, dst], check=True,
+                               capture_output=True)
+                copied += 1
+            except (OSError, subprocess.CalledProcessError):
+                skipped.append(rel)
+    return copied, skipped
+
+
+def leftover_markers(job):
+    """Files whose job changes still add conflict marker lines."""
+    post = job.get("post") or job["base"]
+    out = git(job["shadow"], job["dir"], "diff", "--check", job["base"], post, check=False)
+    return sorted(set(re.findall(r"^(.+?):\d+: leftover conflict marker$", out, re.M)))
+
+
+def land(job):
+    """Apply a copied job's changes to the project. Returns None or the conflict text."""
+    d, gd = job["project"], job["shadow"]
+    patch, names = _job_patch(job)
+    with open(gd + ".land.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if patch.strip():
+            ok, out = _apply_3way(gd, d, patch, names,
+                                  os.path.join(JOBS, job["id"], "land.index"))
+            if not ok:
+                return out
+        job["copied_back"] = copy_back_untracked(job)
+    return None
+
+
 def cmd_approve(a):
     job = load(a.job)
     if job["status"] != "open":
         die(f"job {a.job} is {job['status']}; nothing to approve")
+    extra = ""
+    if job.get("project"):
+        marked = leftover_markers(job)
+        if marked:
+            die(f"job {a.job} still has conflict markers in: {', '.join(marked)}; "
+                f"ds revise {a.job} \"1. resolve the conflict markers in ...\" first")
+        conflict = land(job)
+        if conflict:
+            print(f"CONFLICT {a.job}: its changes no longer apply cleanly to {job['project']}; "
+                  "nothing was changed there.")
+            print("\n".join(conflict.splitlines()[:15]))
+            print(f"--- next: ds rebase {a.job} (fresh copy, conflict markers for the worker), "
+                  f"then ds revise {a.job} \"1. resolve the conflict markers in ...\"; "
+                  f"or ds reject {a.job}")
+            sys.exit(1)
+        n, skipped = job.get("copied_back") or (0, [])
+        if n:
+            extra += f"; copied back {n} untracked files (renders, media)"
+        if skipped:
+            extra += f"; kept the project's newer {len(skipped)}: " + ", ".join(skipped[:5])
+        drop_copy(job)
+        extra = f": landed in {job['project']}" + extra
     job["status"] = "approved"
     save(job)
     cleanup_shadow(job)
-    print(f"approved {a.job}")
+    print(f"approved {a.job}{extra}")
+
+
+def cmd_rebase(a):
+    """Fresh copy of the project, then the job's changes 3-way applied onto it; clashing
+    hunks stay as conflict markers for `ds revise` to resolve."""
+    job = load(a.job)
+    if job["status"] != "open" or not job.get("project"):
+        die(f"job {a.job} is not an open job with a private copy")
+    d, gd, jid = job["project"], job["shadow"], job["id"]
+    patch, names = _job_patch(job)
+    job["rebases"] = int(job.get("rebases") or 0) + 1
+    w2, err = make_copy(d, f"{jid}-r{job['rebases']}")
+    if not w2:
+        die(f"could not make a fresh copy: {err}")
+    old = job["dir"]
+    base2 = snapshot(w2, gd, f"rebase {jid}", job_index(jid), jid, job.get("paths"))
+    idx = os.path.join(JOBS, jid, "rebase.index")
+    try:
+        os.remove(idx)
+    except OSError:
+        pass
+    present = [f for f in names if os.path.lexists(os.path.join(w2, f))]
+    if present:
+        git(gd, w2, "add", "-A", "-f", "--", *present, index=idx)
+    r = subprocess.run(["git", "-c", "core.quotePath=false", f"--git-dir={gd}",
+                        f"--work-tree={w2}", "apply", "--3way", "-"], input=patch,
+                       capture_output=True, text=True, cwd=w2,
+                       env=dict(os.environ, GIT_INDEX_FILE=idx))
+    unmerged = git(gd, w2, "ls-files", "-u", "-z", index=idx, check=False).split("\0")
+    conflicted = sorted(set(e.split("\t", 1)[1] for e in unmerged if "\t" in e))
+    job.update(dir=w2, base=base2, round_base=None, started=time.time())
+    job["post"] = snapshot(w2, gd, f"post rebase {jid}", job_index(jid), jid, job.get("paths"))
+    save(job)
+    if os.path.realpath(old).startswith(os.path.realpath(WORK) + os.sep):
+        shutil.rmtree(old, ignore_errors=True)
+    conflicted = sorted(set(conflicted) | set(leftover_markers(job)))
+    if r.returncode and not conflicted:
+        print(f"rebased {jid}: patch did not apply: {(r.stderr or '').strip()[:300]}")
+    elif conflicted:
+        print(f"rebased {jid} onto the current project; conflict markers in: " + ", ".join(conflicted))
+        print(f"--- next: ds revise {jid} \"1. In <file>, resolve the conflict markers: ...\"")
+    else:
+        print(f"rebased {jid} onto the current project; no conflicts. ds approve {jid}")
 
 
 def commit_blob(gd, wt, commit, path):
@@ -1953,6 +2406,13 @@ def cmd_reject(a):
     job = load(a.job)
     if job["status"] != "open":
         die(f"job {a.job} is {job['status']}; nothing to reject")
+    if job.get("project"):
+        drop_copy(job)
+        job["status"] = "rejected"
+        save(job)
+        cleanup_shadow(job)
+        print(f"rejected {a.job}: private copy deleted; {job['project']} was never changed")
+        return
     d, gd = job["dir"], job["shadow"]
     idx = job_index(job["id"])
     paths = job.get("paths")
@@ -2107,18 +2567,24 @@ def main():
     r = s.add_parser("run"); r.add_argument("-C"); r.add_argument("-m")
     r.add_argument("-f", action="append"); r.add_argument("--paths", nargs="+")
     r.add_argument("--check"); r.add_argument("--fix-tries", type=int)
+    r.add_argument("--fix", action="store_true")
     r.add_argument("--timeout", type=int)
     r.add_argument("task", nargs="?")
     r.set_defaults(fn=cmd_run)
     r = s.add_parser("init"); r.add_argument("-C")
     r.add_argument("--refresh", action="store_true")
     r.add_argument("--timeout", type=int); r.set_defaults(fn=cmd_init)
+    r = s.add_parser("research"); r.add_argument("-C"); r.add_argument("-m")
+    r.add_argument("-f", action="append"); r.add_argument("--paths", nargs="+")
+    r.add_argument("--words", type=int); r.add_argument("--timeout", type=int)
+    r.add_argument("question", nargs="?"); r.set_defaults(fn=cmd_research)
     r = s.add_parser("revise"); r.add_argument("job"); r.add_argument("feedback")
-    r.add_argument("--check"); r.add_argument("--timeout", type=int)
+    r.add_argument("-f", action="append"); r.add_argument("--check"); r.add_argument("--timeout", type=int)
     r.set_defaults(fn=cmd_revise)
     r = s.add_parser("diff"); r.add_argument("job"); r.add_argument("--full", action="store_true")
     r.add_argument("paths", nargs="*"); r.set_defaults(fn=cmd_diff)
     r = s.add_parser("approve"); r.add_argument("job"); r.set_defaults(fn=cmd_approve)
+    r = s.add_parser("rebase"); r.add_argument("job"); r.set_defaults(fn=cmd_rebase)
     r = s.add_parser("reject"); r.add_argument("job")
     r.add_argument("--force", action="store_true"); r.set_defaults(fn=cmd_reject)
     s.add_parser("list").set_defaults(fn=cmd_list)
@@ -2132,6 +2598,18 @@ def main():
     r.set_defaults(fn=cmd_delegate)
     s.add_parser("playbook").set_defaults(fn=cmd_playbook)
     a = p.parse_args()
+    if getattr(a, "f", None):
+        # opencode resolves -f against the job dir ($PWD); make paths absolute
+        # from the caller's cwd and refuse missing files before any job starts.
+        a.f = [os.path.abspath(os.path.expanduser(f)) for f in a.f]
+        for f in a.f:
+            if not os.path.isfile(f):
+                die(f"-f {f}: no such file")
+    if a.cmd == "research" and a.question is None:
+        if a.paths and len(a.paths) > 1:
+            a.question = a.paths.pop()
+        else:
+            die("research needs a question (or - for stdin)")
     if a.cmd == "run" and a.task is None:
         # --paths uses nargs="+"; when it comes before the task, argparse
         # greedily takes the task too. The task is the last value it took.

@@ -15,7 +15,52 @@
           "git reset*": "deny",
           "git checkout*": "deny",
           "rm -rf /*": "deny",
-          "sudo *": "deny"
+          "sudo *": "deny",
+          "pip install*": "deny",
+          "pip3 install*": "deny",
+          "uv pip*": "deny",
+          "uv tool*": "deny",
+          "pipx*": "deny",
+          "npm install -g*": "deny",
+          "npm i -g*": "deny",
+          "pacman *": "deny",
+          "yay *": "deny",
+          "paru *": "deny",
+          "*--break-system-packages*": "deny"
+        }
+      }
+    },
+    "researcher": {
+      "description": "Read-only research worker driven by Claude via ds-bridge (ds research)",
+      "mode": "primary",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "prompt": "{file:__DS_BRIDGE_DIR__/research-prompt.md}",
+      "permission": {
+        "edit": "deny",
+        "webfetch": "allow",
+        "bash": {
+          "*": "allow",
+          "git commit*": "deny",
+          "git push*": "deny",
+          "git reset*": "deny",
+          "git checkout*": "deny",
+          "git stash*": "deny",
+          "git add*": "deny",
+          "rm *": "deny",
+          "mv *": "deny",
+          "rm -rf /*": "deny",
+          "sudo *": "deny",
+          "pip install*": "deny",
+          "pip3 install*": "deny",
+          "uv pip*": "deny",
+          "uv tool*": "deny",
+          "pipx*": "deny",
+          "npm install -g*": "deny",
+          "npm i -g*": "deny",
+          "pacman *": "deny",
+          "yay *": "deny",
+          "paru *": "deny",
+          "*--break-system-packages*": "deny"
         }
       }
     }

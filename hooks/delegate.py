@@ -14,10 +14,11 @@ import os
 import sys
 
 DELEGATE = os.path.expanduser("~/.local/state/ds-bridge/delegate")
+EDITS = os.path.expanduser("~/.local/state/ds-bridge/edits")
 REMINDER = (
-    "Delegation ON: all edits go through `ds run -C <dir> -` (run_in_background); "
-    "briefs follow the planner playbook in context (reread: `ds playbook`); review step "
-    "by step, then approve/revise/reject. Off: `ds delegate off`."
+    "Delegation ON: edits over 20 lines go through `ds run -C <dir> -` (run_in_background); "
+    "learn code with `ds research`, not Read; briefs follow the planner playbook (reread: "
+    "`ds playbook`); then approve/revise/reject. Off: `ds delegate off`."
 )
 PLAYBOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
                         "planner-playbook.md")
@@ -118,6 +119,11 @@ def main():
                 st["pending"] = True
                 save_state(marker, st)
             return 0
+        # a new user turn: the guard's small-edit counts start over
+        try:
+            os.remove(os.path.join(EDITS, session_id.strip() + ".json"))
+        except OSError:
+            pass
         # UserPromptSubmit: one line, plus the playbook if this chat never saw it or a
         # compaction happened that the SessionStart hook did not cover (backup guard)
         text = REMINDER
