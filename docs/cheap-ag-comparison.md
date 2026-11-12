@@ -12,8 +12,8 @@ Re-check only what upstream changes after `892de9c`: `git -C ~/Work/cheap-ag log
 | cheap-agent | ds |
 |---|---|
 | Inline task or plan + steps; `files`, `done_when`, `note`, `source`, `brief` (research id) | **have**: `ds run --check/--files/--source/--brief`, `ds batch plan.md` (plan step text, incl. `dont:`/`kind:`, reaches the worker whole) |
-| Every job in an isolated copy (git worktree), lands only on pass | **have**: private reflink copy of the whole folder (works without git, carries renders/media), 3-way land under lock |
-| Requires a git repo with a commit | ds does not: plain folders work |
+| Every job in a git worktree, dependency dirs symlinked (`link_dirs`), lands only on pass, never commits | **adopted** (2026-11-12): worktree per job; every ignored folder linked (media/renders/.venv), lands uncommitted |
+| Requires a git repo with a commit | ds runs `git init` itself (refusing folders of projects / oversized ones) and needs no commit: the worktree base is a commit object no branch points to |
 | Done-when commands run by the server, 2 self-fix rounds, same-failure stop | **have** (`fix_tries` 2, `same_failure`) |
 | Escalation: one more round on another model after the fixes fail (theirs is a stronger one) | **adopted**: `escalation_model`, one round on a second model in the same session (off until set; locally Muse Spark 1.3) |
 | Error tail: 3 distinct failures, ≤25 lines | **have** (`error_tail`, ported) |

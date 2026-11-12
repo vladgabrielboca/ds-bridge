@@ -9,6 +9,8 @@ Claude turn re-reads the whole chat, so: few turns, short messages, no re-checki
   with a short task (what to change, which files, how to check), then `EOF`. Don't read the code
   first; the worker explores. Facts needed to plan: `ds research -C <dir> "<question>"`, then pass
   its id with `--brief <id>` instead of copying the answer.
+- `-C` is always the project folder (never ~/Work or a folder of projects); ds git-inits it if it
+  has no repo (no commit needed), and every job runs in its own git worktree. ds never commits.
 - Model: DeepSeek Flash by default; add `-m muse` (Muse Spark: faster, slightly weaker) when the user
   asks for Muse (`run`, `research`, `batch`).
 - Run ds in the foreground (Bash timeout 600000). If it prints RUNNING, call `ds wait <job>`.
