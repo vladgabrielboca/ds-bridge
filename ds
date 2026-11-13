@@ -1209,7 +1209,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             "done_out": 0,
             "last_delta_ms": None, "last_gen_ms": None, "tools": {}, "args": {},
             "step_start_ms": None, "first_gen_ms": None, "last_step_gen_ms": None,
-            "dec_tokens": 0, "dec_ms": 0, "ttft": []}
+            "dec_tokens": 0, "dec_ms": 0, "ttft": [], "reason_chars": 0}
     progress_lock = threading.Lock()
 
     def current_out():
@@ -1366,12 +1366,15 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                                 live["segs"].append((created, created, 0))
                             live["last_delta_ms"] = created
                             live["step_chars"] += n
+                            if ty == "session.reasoning.delta":
+                                live["reason_chars"] += n
                         live["last_gen_ms"] = created
                         if live["first_gen_ms"] is None:
                             live["first_gen_ms"] = created
                         live["last_step_gen_ms"] = created
                     elif ty == "session.step.started":
                         live["step_chars"] = 0
+                        live["reason_chars"] = 0
                         started = data.get("started")
                         try:
                             live["step_start_ms"] = (int(started)
@@ -1388,13 +1391,20 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                         first_gen = live["first_gen_ms"]
                         last_gen = live["last_step_gen_ms"]
                         step_start = live["step_start_ms"]
+                        # Hidden reasoning (Muse Spark: reasoning tokens billed, reasoning text empty)
+                        # is generated before the first streamed event, so a first-to-last window
+                        # counts those tokens without their time (988 tok/s for a ~75 tok/s model).
+                        # Such a step is timed from its start, and its "TTFT" is really thinking time.
+                        hidden = (int(tk.get("reasoning") or 0) > 0
+                                  and live["reason_chars"] < 0.5 * int(tk.get("reasoning") or 0))
                         if (out_tok > 0 and first_gen is not None
                                 and last_gen is not None and step_start is not None):
-                            span = last_gen - first_gen
+                            span = last_gen - (step_start if hidden else first_gen)
                             if span >= 100:
                                 live["dec_tokens"] += out_tok
                                 live["dec_ms"] += span
-                                live["ttft"].append(max(0, first_gen - step_start))
+                                if not hidden:
+                                    live["ttft"].append(max(0, first_gen - step_start))
                         live["cal_chars"] += live["step_chars"]
                         live["cal_tokens"] += out_tok
                         live["done_out"] += out_tok
