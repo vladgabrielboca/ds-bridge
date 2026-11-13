@@ -5,6 +5,10 @@ Adapted from cheap-agent's hook (src/hook.ts, MIT), only for chats with delegati
 (`ds delegate on`):
 - PostToolUse (Bash): a ds result block is recorded for this user prompt: OK with a passed check
   ("ok"), or not finished ("notdone": FAIL / PARTIAL / CONFLICT / BLOCKED).
+  ds also writes each finished job's or batch's outcome to <state>/<session>.result for the chat
+  that started it; the next PreToolUse adopts it. That covers results that arrive as a background
+  notice (`ds wait --until-done`), which no PostToolUse ever sees. A new prompt typed by the user
+  drops an unadopted result; a task notification does not.
 - PreToolUse (any tool), same prompt only:
   * after "ok": running tests again is denied (the check already passed in the worker's copy);
   * after "notdone": only reads, ds commands, asking the user (AskUserQuestion) and loading tools
@@ -116,10 +120,33 @@ def prompt_of(p):
         return None
 
 
+def result_path(sid):
+    return state_path(sid) + ".result"
+
+
+def adopt_result(sid, prompt):
+    """A result ds recorded for this chat becomes the state of the current prompt."""
+    try:
+        with open(result_path(sid)) as f:
+            r = json.load(f)
+        os.remove(result_path(sid))
+    except (OSError, ValueError):
+        return
+    if isinstance(r, dict) and r.get("state") in ("ok", "notdone"):
+        save(sid, {"prompt": prompt, "state": r["state"]})
+
+
 def new_prompt(p):
     sid = p.get("session_id")
     if not on(sid):
         return
+    # the user typed something: an older result no longer restricts this turn. A background task's
+    # completion notice is not the user speaking, so its result stays to be adopted.
+    if "<task-notification>" not in str(p.get("prompt") or ""):
+        try:
+            os.remove(result_path(sid))
+        except OSError:
+            pass
     os.makedirs(STATE, exist_ok=True)
     try:
         n = int(open(state_path(sid) + ".seq").read().strip() or 0) + 1
@@ -192,6 +219,7 @@ def pre(p):
                  "`ds wait <job> --until-done` with Bash run_in_background: true, then end your turn: "
                  "you get one notice with the result when it ends.")
             return
+    adopt_result(sid, prompt)
     st = load(sid)
     if st.get("prompt") != prompt:
         return

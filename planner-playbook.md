@@ -11,7 +11,7 @@ Claude turn re-reads the whole chat, so: few turns, short messages, no re-checki
   its id with `--brief <id>` instead of copying the answer.
 - `-C` is always the project folder (never ~/Work or a folder of projects); ds git-inits it if it
   has no repo (no commit needed), and every job runs in its own git worktree. ds never commits.
-- Model: DeepSeek Flash by default; add `-m muse` (Muse Spark: faster, slightly weaker) when the user
+- Model: DeepSeek Flash by default; add `-m muse` (Muse Spark: hides its reasoning, often slower) when the user
   asks for Muse (`run`, `research`, `batch`).
 - Run ds in the foreground (Bash timeout 600000). If it prints RUNNING, run `ds wait <job> --until-done`
   once with run_in_background: true and end your turn; the notice brings the result. Never poll.
@@ -19,7 +19,9 @@ Claude turn re-reads the whole chat, so: few turns, short messages, no re-checki
 - Bug fix: add `--fix` (the worker writes a reproduction test; ds proves fail→pass).
 - Several independent steps: a plan file and `ds batch -C <dir> plan.md` (one call, parallel, one
   block back). Plan: `# title`, shared context (a `check: \`cmd\`` line = integration check), then
-  per step `## <id> <title>`, `files: a, b`, `do: ...`, `done-when: \`cmd\``, optional `needs: <ids>`.
+  per step `## <id> <title>`, `files: a, b`, `do: ...`, `done-when: \`cmd\``, optional `needs: <ids>`
+  (a step that needs another starts only after that one has landed). Shared facts for every step:
+  `--brief <research id>`. Progress of a running batch: `ds status <batch id>` (one line per job).
 - Full brief (GOAL / CONTEXT / FILES / STEPS / DO NOT / DONE WHEN, every decision made, project
   rules copied word for word; the worker sees no skills or memories): only for work a check can't
   judge (visual or creative work, video scenes) or after a quick attempt failed.
@@ -35,7 +37,8 @@ Claude turn re-reads the whole chat, so: few turns, short messages, no re-checki
 - `BLOCKED`: `ds reply JOB <letter or short answer>`.
 - `FAIL … check=env`: the check could not run (missing tool), so the code may be fine: `ds approve
   JOB`, then run the check yourself.
-- `PARTIAL` after the soft deadline: the step was too big; split it before trying again.
+- `PARTIAL` after the soft deadline: the step was too big; split it, or give long steps
+  `--timeout <seconds>` (`run` and `batch`).
 - `FAIL` / `PARTIAL` / `CONFLICT`: follow the block's `next:` line. Default: ask the user one question:
   `ds revise` with the findings, you finish it yourself, or stop. With `"takeover": "sonnet"` the block says to
   hand it to Sonnet in the job's directory straight away, then `ds approve`. Don't take it over yourself.

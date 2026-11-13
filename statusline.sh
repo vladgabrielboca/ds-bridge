@@ -28,8 +28,7 @@ idle() {
     IFS=$'\x1f' read -r day jobs saved <<< "$data"
     [ "$day" = "$(date +%F)" ] || return 0
     [ "$jobs" -gt 0 ] 2>/dev/null || return 0
-    printf 'ds idle · %s jobs today · ≈%s tok saved\n' \
-        "$jobs" "$(fmt_num "$saved")"
+    printf 'ds idle · %s jobs today\n' "$jobs"
 }
 
 if [ ! -d "$P" ]; then
@@ -71,10 +70,10 @@ for f in "${files[@]}"; do
                    (.tok_s // ""), ((.pid // 0) | floor), (.phase // ""),
                    (.live_tok_s // ""), ((.tool_since // 0) | floor),
                    (.args_tool // ""), ((.args_since // 0) | floor),
-                   (.ttft_s // ""), (.owner // ""), (.model // "")]
+                   (.ttft_s // ""), (.owner // ""), (.model // ""), ((.out_est // 0) | floor), (.tok_kind // "")]
                   | map(tostring) | join("\u001f")' "$f" 2>/dev/null) || continue
     [ -n "$data" ] || continue
-    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s pid phase live_tok_s tool_since args_tool args_since ttft_s owner model <<< "$data"
+    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s pid phase live_tok_s tool_since args_tool args_since ttft_s owner model out_est tok_kind <<< "$data"
     # the worker's model, not a fixed "DeepSeek": Muse, Flash, or the model id
     case "$model" in
         *muse*) wl="Muse" ;;
@@ -87,7 +86,7 @@ for f in "${files[@]}"; do
     tok_s_seg=""
     case "$tok_s" in
         ''|*[!0-9]*) ;;
-        *) tok_s_seg=" · ${tok_s} tok/s" ;;
+        *) tok_s_seg=" · ${tok_s} tok/s"; [ "$tok_kind" = throughput ] && tok_s_seg="$tok_s_seg incl. wait" ;;
     esac
     ttft_seg=""
     case "$ttft_s" in
@@ -135,7 +134,7 @@ for f in "${files[@]}"; do
                     writing)
                         case "$live_tok_s" in
                             ''|*[!0-9]*) live_seg="$tok_s_seg" ;;
-                            *) live_seg=" · ▶ ${live_tok_s} tok/s" ;;
+                            *) live_seg=" · ▶ ~${live_tok_s} tok/s" ;;
                         esac
                         ;;
                     waiting)
@@ -149,7 +148,7 @@ for f in "${files[@]}"; do
                     sp=${spinners[$((now % 10))]}
                     line=$(printf '%s %s %s r%s · %s · step %s · %s tools · %s tok%s · ▸ %s' \
                         "$sp" "$wl" "$job" "$round" "$(fmt_secs $((now - started)))" \
-                        "$steps" "$tools" "$(fmt_tok "$out_tokens")" "$live_seg" "$last")
+                        "$steps" "$tools" "$([ "${out_est:-0}" -gt 0 ] 2>/dev/null && printf '~')$(fmt_tok "$out_tokens")" "$live_seg" "$last")
                 fi
                 is_running=1
                 running=$((running + 1))

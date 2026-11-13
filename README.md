@@ -96,7 +96,7 @@ Claude Code's status line can poll ds-bridge once a second (`refreshInterval: 1`
 ⠙ DeepSeek 1104-152510 r1 · 0:02 · step 1 · 1 tool · 18 tok · ⏸ 6s · ▸ bash sleep 6
 ⠹ DeepSeek 1104-152510 r1 · 0:04 · step 1 · 1 tool · 18 tok · … working · ▸ bash sleep 6
 ✓ DeepSeek 1104-152450 done in 0:11
-DeepSeek idle · 4 jobs today · ≈38k tok saved
+DeepSeek idle · 4 jobs today
 ```
 
 Each active job gets its own line, up to four; when nothing is running the line shows today's ledger instead. Every chat sees only its own jobs: ds records the Claude Code session that ran (or last revised) a job, and jobs from other chats collapse into one `+N DeepSeek jobs in other chats` line while they run. Jobs started outside Claude Code show in every chat. A run or revise that lasts at least `notify_min_s` seconds also sends a desktop notification with the job id, project, duration and check result.
@@ -105,7 +105,7 @@ There is no percentage. An agent can't know its step count in advance, so the li
 
 While a job runs, ds also reads the OpenCode service's event stream (`~/.local/state/opencode/service.json`). The status line shows the live generation rate (`▶ N tok/s`) while the model writes, `✎ tool Ns` while tool arguments are being generated, an elapsed tool timer (`⏸ Ns`) while a tool runs, and `… working` when no output is streaming (waiting for the first token, or the model writing tool arguments, which OpenCode does not stream). The live rate uses only active generation time in the last five seconds, calibrated against completed steps; long pauses and tool execution do not lower it. If the stream is unavailable, no live rate is shown.
 
-The final report's `tok/s` is decode speed: output tokens per second while the model is writing, measured from the event stream between the first and last generation event of each step. It excludes time to the first token and tool execution. The same measurement gives the time to first token (TTFT), shown after the rate as `· first token X.Xs`. When the event stream was unavailable, or no step completed, ds prints no speed rather than estimating one from `opencode run` stdout.
+The final report's `tok/s` is measured, not estimated: token counts are the provider's exact per-step numbers and times come from the OpenCode event stream. When the model streams its output (DeepSeek Flash) it is **decode speed**: tokens per second between the first and last generation event of each step, excluding the wait for the first token and tool execution; the time to first token follows as `· ttft X.Xs`. When the model hides its reasoning (Muse Spark bills reasoning tokens but streams no reasoning text) the generation time cannot be seen, so ds shows **throughput** instead, marked `incl. wait`: all generated tokens divided by model time from the start of each request. Both numbers go to the ledger (`dec_tok_s`, `thr_tok_s`). While a step is still streaming, the token count and live rate are estimates from characters and carry a `~`; they are replaced by the exact count when the step ends. Without the event stream ds prints no speed.
 
 ## Commands
 
@@ -121,7 +121,9 @@ The final report's `tok/s` is decode speed: output tokens per second while the m
 | `ds approve JOB [JOB …]` | Accept jobs that did not land by themselves (no check, changes outside `--paths`), or finalize landed ones. Several jobs in one call. |
 | `ds reject JOB [--force]` | Undo only the job's own file changes; files changed since the job are skipped unless `--force`. |
 | `ds list` | List recent jobs with status and round. |
-| `ds stats [--days N \| --all]` | Summarise the ledger: jobs, rounds, worker tokens, Claude's reads and estimated savings. |
+| `ds status [JOB\|BATCH]` | One line per running job (model, elapsed, step, tools, tokens, last action), or every job of one batch. |
+| `ds stats [--days N \| --all]` | Summarise the ledger: jobs, rounds, worker time, worker tokens (provider-reported), ds output read by Claude, median speeds. |
+| `ds cost [SESSION_ID]` | What a Claude Code chat cost, measured from its transcript: model calls, context growth, weighted tokens, and what the re-read context consisted of. |
 | `ds log JOB [--tools-only]` | Print a readable transcript of the job's OpenCode session. |
 | `ds delegate on\|off\|status [--session ID]` | Per-chat delegation mode (session defaults to `CLAUDE_CODE_SESSION_ID`); `on` prints the planner playbook. |
 | `ds research [-C DIR] [--paths P…] [--words N] "question"` | Read-only answer with refs, no diff. |
@@ -165,11 +167,11 @@ done-when: `grep -q "## CLI" README.md`
 needs: 1
 ```
 
-Every step needs `files:` (the job's `--paths`). Groups (`--steps "1-2,3"`, default one per step) run up to `--parallel` at a time; overlapping files run one after another and `needs:` waits for that step to land (a failed dependency skips the step). Each group's backticked `done-when` commands become its check, and passing groups land as they finish. A group that passed but could not land (for example it changed files outside its `files:`) is listed as `passed but NOT landed` with the reason, and the block ends with one `ds approve JOB JOB …` line for all of them; changes to git-ignored files (a check's generated output) never block landing. When all have landed, the plan's `check:` (or `--check`) runs on the combined project; if it fails, one fix job gets the failure and the same check. The block shows one headline per group and the full block only for groups that need action.
+Every step needs `files:` (the job's `--paths`). Groups (`--steps "1-2,3"`, default one per step) run up to `--parallel` at a time; overlapping files run one after another and `needs:` waits for that step to land (a dependency that failed, or passed without landing, skips the step: it would otherwise run against a project that lacks what it builds on). Step ids are numbers or words. `--brief <research id>` gives every step the same research answer; `--timeout <seconds>` sets each job's budget; up to `max_parallel` (6) groups run at once. Each group's backticked `done-when` commands become its check, and passing groups land as they finish. A group that passed but could not land (for example it changed files outside its `files:`) is listed as `passed but NOT landed` with the reason, and the block ends with one `ds approve JOB JOB …` line for all of them; changes to git-ignored files (a check's generated output) never block landing. When all have landed, the plan's `check:` (or `--check`) runs on the combined project; if it fails, one fix job gets the failure and the same check. The block shows one headline per group and the full block only for groups that need action.
 
 ### The discipline hook
 
-`hooks/discipline.py` (installed by `install.sh`, active only in chats with delegation on) enforces the rules that save the most Claude usage, after cheap-agent's hook: after a passed result, running tests again is denied until the next user prompt; after a result that did not finish, only reads, ds commands and one question to the user pass (with `"takeover": "sonnet"`: the Agent tool instead), then the state clears (a `FAIL … check=env`, where the check could not run at all, doesn't count). Bash commands that write project files (redirects, heredocs into files, `tee`, `sed -i`, scripts that open files for writing) are denied too; `cp`/`mv` stay allowed, since copying puts no file content through Claude, since they get past the Edit/Write guard; `/tmp`, `~/.claude`, ds state and `.plan/` stay free, and the brief inside a `ds run - <<EOF` heredoc is ignored.
+`hooks/discipline.py` (installed by `install.sh`, active only in chats with delegation on) enforces the rules that save the most Claude usage, after cheap-agent's hook: after a passed result, running tests again is denied until the next user prompt; after a result that did not finish, only reads, ds commands and one question to the user pass (with `"takeover": "sonnet"`: the Agent tool instead), then the state clears (a `FAIL … check=env`, where the check could not run at all, doesn't count). Bash commands that write project files (redirects, heredocs into files, `tee`, `sed -i`, scripts that open files for writing) are denied too; `cp`/`mv` stay allowed, since copying puts no file content through Claude, since they get past the Edit/Write guard; `/tmp`, `~/.claude`, ds state and `.plan/` stay free, and the brief inside a `ds run - <<EOF` heredoc is ignored. ds also records each finished job's or batch's outcome for the chat that started it, and the hook adopts it on Claude's next tool call, so the same rules hold when the result arrives as a background notice (`ds wait --until-done`) that no hook sees.
 
 ### Where the rules live
 
@@ -187,7 +189,7 @@ When the job's `--check` passes, the report shows only the diff stat and `ds dif
 
 A job with `--paths` (config `isolate`: `"paths"` by default, `"always"`, `"never"`) runs in a copy-on-write copy of the project under `~/.local/share/ds-bridge/work/<job>` (`cp -a --reflink=always`: on btrfs/XFS a 785 MB project copies in 0.3 s and uses no extra space until files change). The worker, its `--check` and any renders run there, so a job never sees another job's half-written files. Absolute project paths in the brief, the check and `-f` files are pointed at the copy, and the worker is told to stay inside it. `ds research` always runs in a copy.
 
-- `ds approve` lands the job: its diff is 3-way applied to the project under a lock (`git apply --3way` through a throwaway index, so the project's own git index is untouched). Files the snapshots skip that the job created or changed in its copy (renders, media, big files) are reflinked back too, unless the project's version changed meanwhile.
+- `ds approve` lands the job: its diff is 3-way applied to the project under a lock (`git apply --3way` through a throwaway index, so the project's own git index is untouched). Files the snapshots skip that the job created or changed in its copy (renders, media, big files) are reflinked back too, unless the project's version changed meanwhile. Only files a snapshot leaves out on purpose travel this way: git-ignored output, excluded media types and big files. A plain file the worker created or changed outside the job's `--paths` is never copied (that would be an unreviewed, unmerged change `ds reject` cannot undo): approve lists it as `NOT landed, outside the job's --paths`.
 - If the changes no longer apply (someone edited the same lines), approve prints `CONFLICT` and changes nothing. `ds rebase JOB` makes a fresh copy of the current project and 3-way applies the job onto it, leaving conflict markers; `ds revise` resolves them. Approve refuses while conflict markers remain.
 - `ds reject` just deletes the copy; the project was never touched.
 - Without reflink support (tmpfs, ext4) the job runs in place as before and the report says why.
@@ -221,7 +223,7 @@ This matters for cost: an image costs Claude about 1.5–1.8k tokens and stays i
 
 ### Soft deadline
 
-A worker call that passes `soft_timeout_frac × timeout_s` (default `0.8`, so 24 minutes of a 30-minute run) is stopped and the same session is asked for its final report, including anything unfinished. That wrap-up call has its own limit, `wrapup_s` (default `180`). The `--check` still runs afterwards, and the report starts with `SOFT DEADLINE HIT`. This applies to `ds run`, `ds init` and `ds revise`, including auto-fix rounds. Both the hard timeout and the soft deadline interrupt the session through the OpenCode service, not just the `opencode run` client, so the worker stops running tools; the wrap-up call then reaches an idle session. ds chooses the session id itself before the worker starts, so interrupt works from the first second.
+A worker call that passes `soft_timeout_frac × timeout_s` (default `0.8`, so 24 minutes of a 30-minute run) is stopped and the same session is asked for its final report, including anything unfinished. That wrap-up call has its own limit, `wrapup_s` (default `180`). The `--check` still runs afterwards, and the report starts with `SOFT DEADLINE HIT`. This applies to `ds run`, `ds init` and `ds revise`, including auto-fix rounds. Both the hard timeout and the soft deadline interrupt the session through the OpenCode service, not just the `opencode run` client, so the worker stops running tools; the wrap-up call then reaches an idle session. ds chooses the session id itself before the worker starts, so interrupt works from the first second. A job that hit the soft deadline is still `OK` when the worker's wrap-up report says `STATUS: DONE` with nothing under `MISSING` and the check passes; otherwise it is `PARTIAL`. Long steps: `--timeout <seconds>` on `run` and `batch`.
 
 ### Git: every project is a repo, every job a worktree
 
@@ -287,7 +289,7 @@ By default Claude works directly; delegation is switched on per chat. In Claude 
 | Command | What it does |
 |---|---|
 | `/ds:on` | Turn delegation on for this chat (worker: the chat's model, else the default Flash). Also "delegate to deepseek", "use ds". |
-| `/ds:muse` | On, with Muse Spark as this chat's worker (faster, slightly weaker). |
+| `/ds:muse` | On, with Muse Spark as this chat's worker (hides its reasoning; in a measured video build it ran at about 70 tok/s, slower than Flash). |
 | `/ds:flash` | On, with DeepSeek Flash as this chat's worker. |
 | `/ds:off` | Off: Claude works directly again. Also "stop delegating". |
 | `/ds:status` | Show the state: worker, fallback, extra round, what happens on failure. |
@@ -313,11 +315,11 @@ Small edits pass even in delegation mode: at most `guard_lines` changed lines pe
 
 ### Stats and log
 
-Every report appends one line to `~/.local/share/ds-bridge/ledger.jsonl`. `ds stats` prints jobs (distinct ids), rounds (ledger rows), worker tokens in/cache/out, what Claude read, an estimated saving, and (when known) the median decode speed and TTFT across rounds:
+Every report appends one line to `~/.local/share/ds-bridge/ledger.jsonl`. `ds stats` prints jobs (distinct ids), rounds (ledger rows), worker time, worker tokens in/cache/out as the provider reported them, how many characters of ds output Claude read, and the median speeds. It no longer prints a "saved" figure: that was the worker's own token count, not a measurement of anything Claude spent.
 
-> saved = worker input + 0.1 × worker cache reads + worker output − Claude's read characters / 4
+What a chat really cost Claude is measured by `ds cost [SESSION_ID]` from the Claude Code transcript (API usage of every model call): weighted tokens (cache read 0.1×, cache write 1.25×, output 5×) and the share of the re-read context that came from Claude's own output, shell output, ds output, images and the starting prompt. Compare two chats that did similar work, one with ds and one without, to see a saving.
 
-Plainly: the input-equivalent tokens the worker spent doing the job (cache reads counted at a tenth) minus the tokens Claude used reading the compact report and diff. It is an estimate, not a measurement. `ds log JOB` exports the session; `--tools-only` hides text and shows the tool calls.
+`ds log JOB` exports the session; `--tools-only` hides text and shows the tool calls.
 
 ## Install
 
@@ -374,7 +376,7 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `research_words` | `200` | Default word limit for `ds research` (max 600). |
 | `research_agent` | `researcher` | OpenCode agent for `ds research`. |
 | `fallback_model` | `""` (off) | Model to continue on when the main model fails on the provider side. |
-| `takeover` | `"ask"` | After a FAIL/PARTIAL/CONFLICT: `"ask"` = Claude asks you (Sonnet subagent, `ds revise`, or stop); `"sonnet"` = Claude hands the step to a Sonnet subagent at once, working in the job's directory, then `ds approve` (the discipline hook enforces either). cheap-agent measured a Sonnet takeover at 100k+ Claude tokens per failed step, hence ask by default. |
+| `takeover` | `"ask"` | After a FAIL/PARTIAL/CONFLICT: `"ask"` = Claude asks you (`ds revise`, Claude finishes it, or stop); `"sonnet"` = Claude hands the step to a Sonnet subagent at once, working in the job's directory, then `ds approve` (the discipline hook enforces either). cheap-agent measured a Sonnet takeover at 100k+ Claude tokens per failed step, hence ask by default. |
 | `models` | `{"flash": …deepseek-v4.1-flash, "muse": …muse-spark-1.3-contributor}` | Short names for `-m` on `run`, `research` and `batch` (`ds run -m muse …`). A job on a non-default model shows `model=<id>` in its headline; when the job's model is the `fallback_model` or `escalation_model` itself, those use the default model instead (a Muse job falls back to Flash). |
 | `isolate` | `"always"` | `"always"`: every job in a git worktree; `"paths"`: only `--paths` jobs; `"never"`: in place. |
 | `git_init` | `true` | Let ds `git init` a project folder that has no repo. |
@@ -382,6 +384,8 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `worker_rules` | `"agent"` | Where the worker's rules live: `"agent"` = the OpenCode agent's system prompt (worker-prompt.md); `"message"` = at the top of the first message, for an agent without its own prompt (`worker-lean`), which keeps OpenCode's default system prompt. One-off override: `DS_AGENT=worker-lean DS_WORKER_RULES=message ds run …`. |
 | `auto_land` | `true` | Land a job whose check passed without a separate `ds approve`. |
 | `wait_s` | `540` | How long `ds run` blocks before it detaches the job and prints `RUNNING` (0 = never detach). |
+| `max_parallel` | `6` | Batch groups running at once (`ds batch --parallel N` overrides). |
+| `link_skip` | `[]` | Extra ignored folder names a job gets as its own empty folder instead of a link to the project's (`media_check` and build/cache folders always are). |
 | `until_done_max_s` | `14400` | Ceiling for `ds wait --until-done` (a job killed hard leaves no result). |
 | `max_block_chars` | `1600` | Cap on the result block (the diff, when shown, comes after it). |
 
@@ -394,10 +398,26 @@ The worker's `bash` permission denies `git commit`, `git push`, `git reset`, `gi
 - No real percentage progress — the status line counts steps, not total work.
 - Files over 5 MB aren't snapshotted, so `ds reject` can't restore them.
 - The worker's quality is a flash model's; review is mandatory.
-- Token savings from `ds stats` are an estimate, not a measurement.
 - The guard hook covers Claude's edit tools only; it can't see Bash-based edits.
 - Auto-fix rounds restart the status-line timer for each worker call.
 
 ## License
 
 MIT. This project is not affiliated with Anthropic, DeepSeek or OpenCode.
+
+## Code layout
+
+`ds` only starts the program; the code is the `dslib/` package, each module building on the ones before it:
+
+| Module | What it holds |
+|---|---|
+| `core.py` | config, model names, brief lint, small helpers |
+| `workspace.py` | where a job works: shadow snapshots, git worktree copies, path rules, running markers |
+| `runner.py` | one worker call: `opencode run`, the live event stream, speeds, retries, checks and fix rounds |
+| `results.py` | what a finished job becomes: status, result block, landing, undo, ledger, notifications |
+| `jobs.py` | `run`, `research`, `revise`, `reply`, `wait`, `approve`, `reject`, `rebase`, `diff`, `init` |
+| `batch.py` | `ds batch`: a plan's steps as parallel jobs |
+| `info.py` | `list`, `status`, `stats`, `cost`, `log`, `delegate`, `playbook` |
+| `cli.py` | the argument parser |
+
+`python3 tests/test_ds.py` runs the checks that need no worker.
