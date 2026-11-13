@@ -114,11 +114,11 @@ The final report's `tok/s` is decode speed: output tokens per second while the m
 | `ds run -C <dir> --check "<cmd>" "<task>"` | Quick task: the worker explores, ds checks; a pass lands by itself. `--files`, `--source`, `--brief <research id>`, `--fix`. A full brief (GOAL/…/DONE WHEN) also works. |
 | `ds batch -C <dir> plan.md [--steps "1-2,3"]` | Run a plan's steps as parallel jobs, land them, run the integration check; one block back. |
 | `ds reply JOB <a-d or answer>` | Answer a BLOCKED job's question in the same session. |
-| `ds wait JOB` | Result of a job that was still `RUNNING` when `ds run` returned. |
+| `ds wait JOB [--until-done]` | Result of a job that was still `RUNNING` when `ds run` returned. `--until-done` waits without the 540 s limit (ceiling `until_done_max_s`); run it as a background Bash call so Claude gets one notice instead of polling. |
 | `ds init [-C <dir>] [--refresh]` | Start a job that writes or refreshes `AGENTS.md` at the project root. |
 | `ds revise JOB "<points>"` | Send numbered feedback in the same session; shows only this round's diff. |
 | `ds diff JOB [PATH…]` | Re-show the diff, optionally `--full` or for specific paths. |
-| `ds approve JOB` | Accept a job that did not land by itself (no check), or finalize a landed one. |
+| `ds approve JOB [JOB …]` | Accept jobs that did not land by themselves (no check, changes outside `--paths`), or finalize landed ones. Several jobs in one call. |
 | `ds reject JOB [--force]` | Undo only the job's own file changes; files changed since the job are skipped unless `--force`. |
 | `ds list` | List recent jobs with status and round. |
 | `ds stats [--days N \| --all]` | Summarise the ledger: jobs, rounds, worker tokens, Claude's reads and estimated savings. |
@@ -139,7 +139,7 @@ EOF
 ```
 
 - **Quick task.** A few plain lines plus `--check`; the worker finds the exact places itself. `--source` passes the user's words verbatim so the worker can flag where the task and the request disagree; `--brief <id>` hands it a `ds research` answer instead of Claude copying it. A brief with all six sections (GOAL, CONTEXT, FILES, STEPS, DO NOT, DONE WHEN) still works and is linted as before; it is meant for work a check cannot judge, such as visual or creative work.
-- **One blocking call.** `ds run` waits up to `wait_s` (540 s, under the Bash tool's 10-minute limit). A longer job keeps running detached and `ds run` prints `RUNNING <job>; next: ds wait <job>`.
+- **One blocking call.** `ds run` waits up to `wait_s` (540 s, under the Bash tool's 10-minute limit). A longer job keeps running detached and `ds run` prints `RUNNING <job>; next: ds wait <job> --until-done`, which Claude runs once in the background: one notice when the job ends instead of a Claude turn every nine minutes. In delegated chats the discipline hook refuses a foreground `ds wait`.
 - **Auto-land.** A job whose check passed (no worker errors, no changes outside `--paths`, no failed reproduction) lands at once: a private copy is 3-way applied to the project, an in-place job simply stays. If the project changed under it, ds rebuilds the copy, re-applies the change with conflict markers and asks the same worker session to resolve them (one automatic redo) before giving up with `CONFLICT`. `ds reject JOB` undoes a landed job for a day; after that it is finalized. Set `auto_land` to `false` to approve by hand.
 - **The result block.** The first word decides: `OK`, `FAIL`, `BLOCKED`, `CONFLICT`, `PARTIAL`, `PROVIDER` or `ERROR`. Then `summary:`, `changed:` (files with +/-), and only the lines that carry information: `risks:`, `review:` (at most 5 `path:start-end` ranges), `missing:`, `disagree:`, `visual:`, `question:` (with a-d options), `found:`, `error:` (the condensed check failure), notes. The block is capped at `max_block_chars` (1,600). The diff follows only when nothing vouches for the change (no check, or a failure), and a `next:` line names the one action left.
 - **A check that cannot run** (exit 126/127, `command not found`, missing pytest) is reported as `check=env` and skips the fix rounds: no code edit fixes a missing tool.
@@ -165,7 +165,7 @@ done-when: `grep -q "## CLI" README.md`
 needs: 1
 ```
 
-Every step needs `files:` (the job's `--paths`). Groups (`--steps "1-2,3"`, default one per step) run up to `--parallel` at a time; overlapping files run one after another and `needs:` waits for that step to land (a failed dependency skips the step). Each group's backticked `done-when` commands become its check, and passing groups land as they finish. When all have landed, the plan's `check:` (or `--check`) runs on the combined project; if it fails, one fix job gets the failure and the same check. The block shows one headline per group and the full block only for groups that need action.
+Every step needs `files:` (the job's `--paths`). Groups (`--steps "1-2,3"`, default one per step) run up to `--parallel` at a time; overlapping files run one after another and `needs:` waits for that step to land (a failed dependency skips the step). Each group's backticked `done-when` commands become its check, and passing groups land as they finish. A group that passed but could not land (for example it changed files outside its `files:`) is listed as `passed but NOT landed` with the reason, and the block ends with one `ds approve JOB JOB …` line for all of them; changes to git-ignored files (a check's generated output) never block landing. When all have landed, the plan's `check:` (or `--check`) runs on the combined project; if it fails, one fix job gets the failure and the same check. The block shows one headline per group and the full block only for groups that need action.
 
 ### The discipline hook
 
@@ -382,6 +382,7 @@ Optional `~/.config/ds-bridge/config.json` overrides these defaults:
 | `worker_rules` | `"agent"` | Where the worker's rules live: `"agent"` = the OpenCode agent's system prompt (worker-prompt.md); `"message"` = at the top of the first message, for an agent without its own prompt (`worker-lean`), which keeps OpenCode's default system prompt. One-off override: `DS_AGENT=worker-lean DS_WORKER_RULES=message ds run …`. |
 | `auto_land` | `true` | Land a job whose check passed without a separate `ds approve`. |
 | `wait_s` | `540` | How long `ds run` blocks before it detaches the job and prints `RUNNING` (0 = never detach). |
+| `until_done_max_s` | `14400` | Ceiling for `ds wait --until-done` (a job killed hard leaves no result). |
 | `max_block_chars` | `1600` | Cap on the result block (the diff, when shown, comes after it). |
 
 ## Safety

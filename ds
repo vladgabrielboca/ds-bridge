@@ -90,7 +90,7 @@ DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
             "excluded_note": True, "diff_on_pass": "stat", "research_words": 200,
             "research_agent": "researcher", "guard_lines": 20,
             "fallback_model": "", "guard_edits_per_file": 2,
-            "auto_land": True, "wait_s": 540, "max_block_chars": 1600,
+            "auto_land": True, "wait_s": 540, "until_done_max_s": 14400, "max_block_chars": 1600,
             "notify": True, "notify_min_s": 15,
             "outside_ignore": [".git", "__pycache__", "media*", "*.log",
                                "node_modules", ".venv"]}
@@ -156,10 +156,12 @@ def cfg():
 
 
 def env_overrides(c):
-    """DS_AGENT / DS_WORKER_RULES override the config for one invocation (worker A/B tests)."""
+    """DS_AGENT / DS_WORKER_RULES / DS_WAIT_S override the config for one invocation (worker A/B tests)."""
     for env, key in (("DS_AGENT", "agent"), ("DS_WORKER_RULES", "worker_rules")):
         if os.environ.get(env):
             c[key] = os.environ[env]
+    if os.environ.get("DS_WAIT_S", "").isdigit():   # tests: detach sooner
+        c["wait_s"] = int(os.environ["DS_WAIT_S"])
     return c
 
 
@@ -475,17 +477,28 @@ def outside_listing(d, paths):
     return out
 
 
-def outside_changes(before, after):
-    """Return capped lines for files created, changed or deleted outside --paths."""
-    lines = []
-    for rel in sorted(after):
-        if rel not in before:
-            lines.append(f"created {rel}")
-        elif before[rel] != after[rel]:
-            lines.append(f"changed {rel}")
-    for rel in sorted(before):
-        if rel not in after:
-            lines.append(f"deleted {rel}")
+def git_ignored(d, rels):
+    """The subset of rels that d's git ignores (generated files: a check's build output, renders).
+    They never land through the patch, so they must not count as changes outside --paths."""
+    if not rels:
+        return set()
+    try:
+        r = subprocess.run(["git", "-C", d, "check-ignore", "-z", "--stdin"], input="\0".join(rels) + "\0",
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return set(x for x in r.stdout.split("\0") if x) if r.returncode in (0, 1) else set()
+
+
+def outside_changes(before, after, d=None):
+    """Return capped lines for files created, changed or deleted outside --paths (git-ignored
+    files in d excluded)."""
+    found = [(rel, "created") for rel in after if rel not in before]
+    found += [(rel, "changed") for rel in after if rel in before and before[rel] != after[rel]]
+    found += [(rel, "deleted") for rel in before if rel not in after]
+    ignored = git_ignored(d, [rel for rel, _ in found]) if d else set()
+    lines = [f"{what} {rel}" for rel, what in sorted(found, key=lambda x: (x[1] == "deleted", x[0]))
+             if rel not in ignored]
     if len(lines) > 20:
         lines = lines[:19] + [f"… {len(lines) - 19} more"]
     return lines
@@ -930,6 +943,10 @@ def note_jid(jid):
             pass
 
 
+WAIT_NEXT = ("next: ds wait {jid} --until-done  (Bash run_in_background: true; one notice when it ends; "
+             "end your turn meanwhile, don't poll)")
+
+
 def detach_and_wait(argv, wait_s):
     """Run the command in a detached child; wait up to wait_s for it, then print its block, or a
     RUNNING line so Claude can `ds wait JOB` instead of the Bash tool timing out."""
@@ -957,7 +974,7 @@ def detach_and_wait(argv, wait_s):
             return child.returncode
         time.sleep(1)
     jid = open(out + ".jid").read().strip() if os.path.exists(out + ".jid") else "?"
-    print(f"RUNNING {jid} (still working after {int(time.time() - t0)}s); next: ds wait {jid}")
+    print(f"RUNNING {jid} (still working after {int(time.time() - t0)}s); " + WAIT_NEXT.format(jid=jid))
     return 0
 
 
@@ -2658,7 +2675,7 @@ def cmd_run(a):
         res = run_with_check(job, task, session=job["session"], files=a.f or (),
                              budget_s=budget)
         if outside is not None:
-            res["outside"] = outside_changes(outside, outside_listing(work, paths))
+            res["outside"] = outside_changes(outside, outside_listing(work, paths), work)
         if excluded is not None:
             note = excluded_note(excluded, excluded_listing(work, paths), c)
             if note:
@@ -2809,7 +2826,7 @@ def cmd_revise(a):
         res = run_with_check(job, msg, session=job["session"], files=a.f or (),
                              budget_s=budget)
         if outside is not None:
-            res["outside"] = outside_changes(outside, outside_listing(job["dir"], paths))
+            res["outside"] = outside_changes(outside, outside_listing(job["dir"], paths), job["dir"])
         if excluded is not None:
             note = excluded_note(excluded, excluded_listing(job["dir"], paths), c)
             if note:
@@ -2856,18 +2873,23 @@ def cmd_reply(a):
 
 
 def cmd_wait(a):
-    """Block until a detached job finishes (at most --max seconds), then print its result block."""
+    """Block until a detached job finishes (at most --max seconds; no limit with --until-done, which
+    is meant for a background Bash call), then print its result block."""
     jid = a.job
     last = os.path.join(JOBS, jid, "last.txt")
     marker = os.path.join(RUNNING, jid + ".json")
-    limit = a.max if a.max is not None else cfg().get("wait_s", 540)
+    if not os.path.isdir(os.path.join(JOBS, jid)):
+        die(f"no job {jid}")
+    # --until-done still has a ceiling: a child killed hard (SIGKILL, reboot) leaves its .pending file
+    limit = (int(cfg().get("until_done_max_s", 14400)) if a.until_done else
+             a.max if a.max is not None else cfg().get("wait_s", 540))
     t0 = time.time()
     while time.time() - t0 < limit:
         if not os.path.exists(marker) and not os.path.exists(last + ".pending"):
             break
         time.sleep(2)
     if os.path.exists(marker) or os.path.exists(last + ".pending"):
-        print(f"RUNNING {jid} ({int(time.time() - t0)}s more); next: ds wait {jid}")
+        print(f"RUNNING {jid} ({int(time.time() - t0)}s more); " + WAIT_NEXT.format(jid=jid))
         return
     try:
         sys.stdout.write(open(last).read())
@@ -3061,14 +3083,24 @@ def cmd_batch(a):
         out.append(r_["line"])
     if fix_line:
         out.append("fix: " + fix_line)
-    # a settled OK job shows only its headline; anything else its whole block (Claude must act on it)
+    # a landed OK job shows only its headline; anything else its whole block (Claude must act on it)
+    unlanded = []
     for i, r_ in enumerate(results):
-        if r_["status"] not in ("OK", "SKIPPED") and r_["block"]:
+        if r_["status"] == "OK" and not r_.get("landed"):
+            jid = r_["line"].split()[1] if len(r_["line"].split()) > 1 else "?"
+            unlanded.append(jid)
+            why = [l_ for l_ in r_["block"].splitlines() if l_.startswith(("warning:", "conflict:", "note:"))]
+            out.append(f"--- step {labels[i]}: passed but NOT landed ({jid})")
+            out += why[:3] or ["(no check passed, so it was not auto-landed)"]
+        elif r_["status"] not in ("OK", "SKIPPED") and r_["block"]:
             out.append(f"--- step {labels[i]}")
             out.append(r_["block"])
     out += integ_lines
-    if all((r_ or {}).get("status") == "OK" for r_ in results) and integ in ("none", "pass", "pass (after fix job)"):
-        out.append("next: nothing to do (each landed job can be undone with ds reject JOB)")
+    all_ok = all((r_ or {}).get("status") == "OK" for r_ in results)
+    if unlanded:
+        out.append(f"next: review the lines above, then land them in one call: ds approve {' '.join(unlanded)}")
+    elif all_ok and integ in ("none", "pass", "pass (after fix job)"):
+        out.append("next: nothing to do: every step landed (undo one with ds reject JOB)")
     sys.stdout.write("\n".join(out) + "\n")
 
 
@@ -3174,6 +3206,16 @@ def land(job):
 
 
 def cmd_approve(a):
+    if len(a.job) > 1:
+        bad = 0
+        for jid in a.job:
+            r = subprocess.run([sys.executable, os.path.realpath(__file__), "approve", jid],
+                               capture_output=True, text=True)
+            print(((r.stdout or "") + (r.stderr or "")).strip().splitlines()[0] if (r.stdout or r.stderr).strip()
+                  else f"{jid}: no output")
+            bad += r.returncode != 0
+        sys.exit(1 if bad else 0)
+    a.job = a.job[0]
     job = load(a.job)
     if job["status"] == "landed":
         job["status"] = "approved"
@@ -3584,7 +3626,7 @@ def main():
     r.set_defaults(fn=cmd_revise)
     r = s.add_parser("diff"); r.add_argument("job"); r.add_argument("--full", action="store_true")
     r.add_argument("paths", nargs="*"); r.set_defaults(fn=cmd_diff)
-    r = s.add_parser("approve"); r.add_argument("job"); r.set_defaults(fn=cmd_approve)
+    r = s.add_parser("approve"); r.add_argument("job", nargs="+"); r.set_defaults(fn=cmd_approve)
     r = s.add_parser("rebase"); r.add_argument("job"); r.set_defaults(fn=cmd_rebase)
     r = s.add_parser("reply"); r.add_argument("job"); r.add_argument("answer")
     r.add_argument("--check"); r.add_argument("--timeout", type=int); r.add_argument("-f", action="append")
@@ -3593,6 +3635,7 @@ def main():
     r.add_argument("--steps"); r.add_argument("--check"); r.add_argument("--source")
     r.add_argument("--parallel", type=int); r.set_defaults(fn=cmd_batch)
     r = s.add_parser("wait"); r.add_argument("job"); r.add_argument("--max", type=int)
+    r.add_argument("--until-done", action="store_true", help="no time limit; run it with Bash run_in_background")
     r.set_defaults(fn=cmd_wait)
     r = s.add_parser("reject"); r.add_argument("job")
     r.add_argument("--force", action="store_true"); r.set_defaults(fn=cmd_reject)

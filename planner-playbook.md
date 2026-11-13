@@ -13,7 +13,8 @@ Claude turn re-reads the whole chat, so: few turns, short messages, no re-checki
   has no repo (no commit needed), and every job runs in its own git worktree. ds never commits.
 - Model: DeepSeek Flash by default; add `-m muse` (Muse Spark: faster, slightly weaker) when the user
   asks for Muse (`run`, `research`, `batch`).
-- Run ds in the foreground (Bash timeout 600000). If it prints RUNNING, call `ds wait <job>`.
+- Run ds in the foreground (Bash timeout 600000). If it prints RUNNING, run `ds wait <job> --until-done`
+  once with run_in_background: true and end your turn; the notice brings the result. Never poll.
 - `--check`: the one test file or command the step concerns; it gates landing.
 - Bug fix: add `--fix` (the worker writes a reproduction test; ds proves fail→pass).
 - Several independent steps: a plan file and `ds batch -C <dir> plan.md` (one call, parallel, one

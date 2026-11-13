@@ -10,7 +10,8 @@ Adapted from cheap-agent's hook (src/hook.ts, MIT), only for chats with delegati
   * after "notdone": only reads, ds commands, asking the user (AskUserQuestion) and loading tools
     pass; anything else is denied until the user has been asked, then the state clears
     (a FAIL with check=env, where the check could not run at all, is not "notdone").
-- PreToolUse (Bash), always: commands that write project files (redirects, tee, sed -i,
+- PreToolUse (Bash), always: a `ds wait` must be `--until-done` in a background Bash call (one
+  notice when the job ends instead of a Claude turn per 9-minute poll). Commands that write project files (redirects, tee, sed -i,
   scripts opening files for writing) are denied (cp/mv are allowed: no content goes through Claude); /tmp, ~/.claude, ds state and .plan/
   stay free, and a ds brief inside a heredoc is ignored.
 A new user prompt starts fresh (state is keyed by Claude Code's prompt_id, or by our own counter
@@ -44,6 +45,7 @@ BASH_CODE_WRITES = re.compile(r"\b(?:python3?|node)\b[\s\S]*(?:open\([^)]*[\"'][
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\s*(?:\n|$)", re.S)
 FREE_PREFIXES = ("/tmp/", "/dev/", os.path.expanduser("~/.claude/"), os.path.expanduser("~/.local/share/ds-bridge/"),
                  os.path.expanduser("~/.local/state/ds-bridge/"))
+DS_WAIT = re.compile(r"(?:^|[\s;&|/])ds\s+wait\b")
 BATCH_OK = re.compile(r"^BATCH\s+\S+.*\bnot_ok=0\b.*\bintegration=(none|pass)", re.M)
 
 
@@ -182,6 +184,13 @@ def pre(p):
             deny(f"Bash writing {what}: that is editing a project file, which the edit guard covers "
                  "(small edits with Edit/Write are fine). Delegate bigger changes with ds run; "
                  "scratch files belong in /tmp.")
+            return
+    if tool == "Bash" and DS_WAIT.search(cmd):
+        bg = bool((p.get("tool_input") or {}).get("run_in_background"))
+        if not bg or not re.search(r"--until-done\b", cmd):
+            deny("Waiting on a ds job costs a full Claude turn per check. Run it once as "
+                 "`ds wait <job> --until-done` with Bash run_in_background: true, then end your turn: "
+                 "you get one notice with the result when it ends.")
             return
     st = load(sid)
     if st.get("prompt") != prompt:
