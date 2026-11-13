@@ -58,21 +58,25 @@ def cmd_stats(a):
 
 
 COST_W = {"in": 1.0, "cache_write": 1.25, "cache_read": 0.1, "out": 5.0}
+# Characters per token of a file Claude writes, measured on 141 Write calls in real transcripts
+# (context growth after the call; quartiles 1.75 / 2.02 / 2.22). The high quartile is used so the
+# "Claude types it" floor comes out low rather than high.
+CHARS_PER_TOKEN = 2.2
+DS_CMD_RE = re.compile(r"(?:^|[\s;&|/])ds\s+(?!cost\b|stats\b)\w")
 
 
-def cmd_cost(a):
-    """What a Claude Code chat cost, measured from its transcript (API usage per call, nothing
-    estimated), in input-token equivalents (cache read 0.1x, cache write 1.25x, output 5x: the
-    standard price ratios), and what the re-read context was made of."""
-    import glob
-    sid = (a.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
-    if not sid:
-        die("ds cost SESSION_ID (or run it inside a Claude Code chat)")
-    found = glob.glob(os.path.join(HOME, ".claude/projects/*", sid + ".jsonl"))
-    if not found:
-        die(f"no transcript for session {sid}")
+def _iso_ts(s):
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def read_chat(path):
+    """Model calls of one Claude Code transcript: usage, what each call ran, what came back."""
     calls, idx, names, seen = [], {}, {}, set()
-    for line in open(found[0], errors="replace"):
+    for line in open(path, errors="replace"):
         try:
             d = json.loads(line)
         except ValueError:
@@ -82,19 +86,29 @@ def cmd_cost(a):
             continue
         if d.get("type") == "assistant" and "usage" in m:
             mid = m.get("id")
+            u = m["usage"]
+            if not any(u.get(k) for k in ("input_tokens", "cache_read_input_tokens",
+                                          "cache_creation_input_tokens", "output_tokens")):
+                continue   # a synthetic message, not a model call
             if mid not in idx:
-                u = m["usage"]
                 idx[mid] = len(calls)
                 calls.append({"cr": u.get("cache_read_input_tokens") or 0,
                               "cw": u.get("cache_creation_input_tokens") or 0,
                               "inp": u.get("input_tokens") or 0, "out": u.get("output_tokens") or 0,
-                              "add": collections.Counter()})
+                              "add": collections.Counter(), "ts": _iso_ts(d.get("timestamp")),
+                              "ds": 0, "tools": 0, "model": m.get("model")})
+            c = calls[idx[mid]]
+            c["out"] = max(c["out"], m["usage"].get("output_tokens") or 0)
             for b in m.get("content") or []:
-                if b.get("type") == "tool_use":
+                if b.get("type") == "tool_use" and b.get("id") not in names:
                     n = b.get("name") or "tool"
+                    c["tools"] += 1
                     if n == "Bash":
-                        n = "ds output" if re.search(r"(?:^|[\s;&|/])ds\s+\w", str((b.get("input") or {}).get("command"))) \
-                            else "shell output"
+                        if DS_CMD_RE.search(str((b.get("input") or {}).get("command"))):
+                            n = "ds output"
+                            c["ds"] += 1
+                        else:
+                            n = "shell output"
                     names[b.get("id")] = n
         elif d.get("type") == "user" and calls:
             cont = m.get("content")
@@ -111,12 +125,124 @@ def cmd_cost(a):
                         calls[-1]["add"]["user / injected text"] += 1
             elif isinstance(cont, str):
                 calls[-1]["add"]["user / injected text"] += 1
+    return calls
+
+
+def call_cost(c):
+    return (c["inp"] * COST_W["in"] + c["cw"] * COST_W["cache_write"] + c["cr"] * COST_W["cache_read"]
+            + c["out"] * COST_W["out"])
+
+
+def chat_jobs(sid):
+    """Jobs this chat owns that reached the project, with the lines the worker wrote (from the
+    saved diffs) and the worker's own token use (from the ledger)."""
+    worker = collections.defaultdict(lambda: [0, 0, 0])
+    try:
+        for line in open(LEDGER):
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            w = worker[e.get("job")]
+            w[0] += e.get("worker_out") or 0
+            w[1] += e.get("secs") or 0
+            w[2] += 1
+    except OSError:
+        pass
+    out = []
+    for jid in sorted(os.listdir(JOBS)) if os.path.isdir(JOBS) else []:
+        try:
+            job = json.load(open(os.path.join(JOBS, jid, "job.json")))
+        except (OSError, ValueError):
+            continue
+        if job.get("owner") != sid:
+            continue
+        st = job.get("lines")
+        if st is None:
+            st = diff_lines(os.path.join(JOBS, jid, "full.diff"))
+        out.append({"id": jid, "status": job.get("status"), "started": job.get("started") or 0,
+                    "landed": job.get("status") in ("landed", "approved"),
+                    "files": st[0], "added": st[1], "removed": st[2], "chars": st[3],
+                    "worker_out": worker[jid][0], "secs": worker[jid][1], "rounds": worker[jid][2]})
+    return out
+
+
+def diff_lines(path):
+    """(files, added lines, removed lines, added characters) of a saved diff."""
+    files = added = removed = chars = 0
+    try:
+        for l in open(path, errors="replace"):
+            if l.startswith("+++ "):
+                files += 1
+            elif l.startswith("+") and not l.startswith("+++"):
+                added += 1
+                chars += len(l) - 1
+            elif l.startswith("-") and not l.startswith("---"):
+                removed += 1
+    except OSError:
+        pass
+    return [files, added, removed, chars]
+
+
+def delegation_account(calls, jobs):
+    """Measured: what delegating cost Claude in this chat. Stated assumption: the least Claude
+    would have paid to type the landed lines itself. Returns a dict of weighted-token figures."""
+    n = len(calls)
+    ctx = [c["cr"] + c["cw"] + c["inp"] for c in calls]
+    # a context that shrinks by a third was compacted: nothing is carried past that point
+    cuts = [i for i in range(1, n) if ctx[i] < ctx[i - 1] * 0.67]
+    share = [(c["ds"] / c["tools"]) if c["tools"] else 0.0 for c in calls]
+
+    def own_later(i):
+        """Calls after call i that re-read what call i added and are Claude's own work (the ds
+        share of a later call is already counted in full)."""
+        end = next((k for k in cuts if k > i), n)
+        return sum(1 - share[k] for k in range(i + 1, end))
+
+    ds_calls = sum(share[i] * call_cost(calls[i]) for i in range(n))
+    ds_carry = 0.0
+    for i in range(n - 1):
+        if not share[i]:
+            continue
+        delta = ctx[i + 1] - ctx[i]
+        if delta > 0:
+            ds_carry += share[i] * delta * COST_W["cache_read"] * own_later(i)
+    landed = [j for j in jobs if j["landed"] and j["added"]]
+    floor_out = floor_carry = floor_calls = 0.0
+    for j in landed:
+        tok = j["chars"] / CHARS_PER_TOKEN
+        at = max([i for i in range(n) if calls[i]["ts"] and calls[i]["ts"] <= j["started"]] or [0])
+        floor_out += tok * (COST_W["out"] + COST_W["cache_write"])
+        floor_carry += tok * COST_W["cache_read"] * max(own_later(at) - 1, 0)
+        floor_calls += max(j["files"], 1) * ctx[at] * COST_W["cache_read"]
+    return {"ds_calls": ds_calls, "ds_carry": ds_carry, "ds_total": ds_calls + ds_carry,
+            "n_ds_calls": sum(share), "landed": landed,
+            "lines": sum(j["added"] for j in landed), "chars": sum(j["chars"] for j in landed),
+            "files": sum(max(j["files"], 1) for j in landed),
+            "floor_out": floor_out, "floor_carry": floor_carry, "floor_calls": floor_calls,
+            "floor": floor_out + floor_carry + floor_calls}
+
+
+def cmd_cost(a):
+    """What a Claude Code chat cost, measured from its transcript (API usage per call), in
+    input-token equivalents (cache read 0.1x, cache write 1.25x, output 5x: the price ratios),
+    what the re-read context was made of, and whether delegating paid for itself."""
+    import glob
+    sid = (a.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    if not sid:
+        die("ds cost SESSION_ID (or run it inside a Claude Code chat)")
+    found = glob.glob(os.path.join(HOME, ".claude/projects/*", sid + "*.jsonl"))
+    if not found:
+        die(f"no transcript for session {sid}")
+    if len(found) > 1:
+        die(f"{sid} matches {len(found)} chats; give more of the id")
+    sid = os.path.basename(found[0])[:-6]
+    calls = read_chat(found[0])
     if not calls:
         die("the transcript has no model calls yet")
     n = len(calls)
     ctx = [c["cr"] + c["cw"] + c["inp"] for c in calls]
-    total = sum(c["inp"] * COST_W["in"] + c["cw"] * COST_W["cache_write"] + c["cr"] * COST_W["cache_read"]
-                + c["out"] * COST_W["out"] for c in calls)
+    total = sum(call_cost(c) for c in calls)
     grow, cost = collections.Counter(), collections.Counter()
     cost["starting prompt (system, tools, CLAUDE.md, memory)"] = ctx[0] * COST_W["cache_read"] * n
     for i in range(n - 1):
@@ -140,6 +266,32 @@ def cmd_cost(a):
     for k, v in cost.most_common(8):
         print(f"  {k:52} {fmt_num(v):>7}  {100 * v / reread if reread else 0:3.0f}%"
               + (f"  (+{fmt_num(grow[k])} tok)" if grow.get(k) else ""))
+    jobs = chat_jobs(sid)
+    acc = delegation_account(calls, jobs)
+    if not jobs and not acc["n_ds_calls"]:
+        return
+    pct = lambda v: f"{100 * v / total:.0f}%" if total else "0%"
+    print(f"\ndelegation, measured: {len(jobs)} jobs, {len(acc['landed'])} landed with changes: "
+          f"{acc['lines']} lines in {acc['files']} files written by the worker "
+          f"({fmt_num(sum(j['worker_out'] for j in jobs))} worker output tokens, "
+          f"{int(sum(j['secs'] for j in jobs) / 60)} min of worker time)")
+    print(f"  delegating cost Claude {fmt_num(acc['ds_total'])} ({pct(acc['ds_total'])} of the chat): "
+          f"{acc['n_ds_calls']:.0f} calls that ran ds {fmt_num(acc['ds_calls'])} "
+          f"+ re-reading briefs and ds output later {fmt_num(acc['ds_carry'])}")
+    if not acc["lines"]:
+        print("  nothing landed, so nothing was saved")
+        return
+    print(f"least Claude would have paid to type those {acc['lines']} lines itself (assumes no reading, "
+          f"no test runs, no mistakes, one call per file; {CHARS_PER_TOKEN} chars/token):")
+    print(f"  {fmt_num(acc['floor'])} = writing {fmt_num(acc['floor_out'])} + re-reading them for the rest "
+          f"of the chat {fmt_num(acc['floor_carry'])} + {acc['files']} calls {fmt_num(acc['floor_calls'])}")
+    net = acc["floor"] - acc["ds_total"]
+    if net > 0:
+        print(f"=> saved at least {fmt_num(net)} weighted tokens: without ds this chat would have cost "
+              f"{fmt_num(total + net)} or more, {100 * net / (total + net):.0f}% above what it did")
+    else:
+        print(f"=> a saving is not shown: delegating cost {fmt_num(-net)} more than typing the lines. It paid off "
+              f"only if Claude alone would have spent more than that on reading, testing and fixing")
 
 
 def _tool_short(part):
