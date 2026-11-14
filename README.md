@@ -124,6 +124,8 @@ The final report's `tok/s` is measured, not estimated: token counts are the prov
 | `ds status [JOB\|BATCH]` | One line per running job (model, elapsed, step, tools, tokens, last action), or every job of one batch. |
 | `ds stats [--days N \| --all]` | Summarise the ledger: jobs, rounds, worker time, worker tokens (provider-reported), ds output read by Claude, median speeds. |
 | `ds cost [SESSION_ID]` | What a Claude Code chat cost, measured from its transcript: model calls, context growth, weighted tokens, and what the re-read context consisted of. |
+| `ds cost [SESSION_ID] --detail` | Also the single most expensive items (each tool result or piece of Claude's own output, by what re-reading it cost until compaction or the end) and cache rebuilds (calls that had to write an expired context again). |
+| `ds handoff -C DIR - <<'EOF'` | Save notes for a fresh chat (goal, decisions, done, next, key files) to `DIR/.plan/HANDOFF.md`, with this chat's open jobs and delegation state. After `/clear`, the next chat of the same project starts with them. |
 | `ds log JOB [--tools-only]` | Print a readable transcript of the job's OpenCode session. |
 | `ds delegate on\|off\|status [--session ID]` | Per-chat delegation mode (session defaults to `CLAUDE_CODE_SESSION_ID`); `on` prints the planner playbook. |
 | `ds research [-C DIR] [--paths P…] [--words N] "question"` | Read-only answer with refs, no diff. |
@@ -176,6 +178,14 @@ Every step needs `files:` (the job's `--paths`). Groups (`--steps "1-2,3"`, defa
 ### Where the rules live
 
 `~/.claude/CLAUDE.md` holds only a short pointer (delegation is opt-in, `/ds:on` turns it on). The full rules are `planner-playbook.md`: `ds delegate on` prints them, the delegation hook brings them back after a compaction, and a one-line reminder repeats each turn. A chat that never delegates pays for none of it.
+
+### Context cost: handoffs and the read gate
+
+Every Claude call re-sends the whole chat, so a chat's cost grows with the square of its length. In a measured 3 h video chat (05-probe, 125 calls, context 46k -> 387k), re-reading context was 2.5M of the 3.5M weighted tokens. Splitting that chat into 3–4 sessions would have cut 20–35% of the total (simulated with a 5k–40k token reload per new session). There were no cache rebuilds (the cache outlived a 46 min pause).
+
+- `ds handoff` + `/clear`: at a breakpoint Claude writes short notes, and the user types `/clear`. The `SessionStart` hook (matcher `clear`) gives the notes to the new chat of the same project within `handoff_ttl_s` (2 h). It also carries delegation (and its model) over and moves the open jobs to the new chat. After a fresh `claude` instead, say "continue from .plan/HANDOFF.md".
+- Nudge: in a delegated chat, once the context passes `handoff_nudge_tokens` (150k), the per-turn hook asks Claude for a handoff at the next breakpoint. It asks again every `handoff_nudge_step` (75k) more, and starts over after a compaction.
+- Read gate: in a delegated chat, a whole-file `Read` or plain `cat` of more than `read_gate_lines` (400) lines is denied once. The denial points to grep, a ranged read or `ds research`, and the same call sent again passes. Skills, memory, `/tmp` and `.plan/` are exempt. Set the option to 0 to turn the gate off.
 
 ### `ds research`: learn the code without reading it
 

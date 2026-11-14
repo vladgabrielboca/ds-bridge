@@ -21,6 +21,7 @@ DEFAULTS = {"model": "opencode-go/deepseek-v4.1-flash", "agent": "worker",
             "fallback_model": "", "guard_edits_per_file": 2,
             "auto_land": True, "max_parallel": 6, "wait_s": 540, "until_done_max_s": 14400, "max_block_chars": 1600,
             "notify": True, "notify_min_s": 15,
+            "handoff_nudge_tokens": 150000, "handoff_nudge_step": 75000, "handoff_ttl_s": 7200,
             "outside_ignore": [".git", "__pycache__", "media*", "*.log",
                                "node_modules", ".venv"]}
 

@@ -77,9 +77,36 @@ def _iso_ts(s):
         return None
 
 
+def _snip(t, n=70):
+    t = " ".join(str(t or "").split())
+    return t if len(t) <= n else t[:n] + "…"
+
+
+def _use_label(b):
+    """Short name of a tool call: the tool and its command or file."""
+    inp = b.get("input") or {}
+    detail = inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("skill") \
+        or inp.get("description") or ""
+    return f"{b.get('name') or 'tool'}: {_snip(detail, 60)}"
+
+
+IMAGE_CHARS = 2722 * 3.5   # a 1080p frame measured at ~2.7k tokens; counted as text of that size
+
+
+def _result_size(cc):
+    """Rough size of a tool result in characters, so a call's growth can be split between results."""
+    if isinstance(cc, str):
+        return len(cc)
+    n = 0
+    for x in cc or []:
+        if isinstance(x, dict):
+            n += IMAGE_CHARS if x.get("type") == "image" else len(str(x.get("text") or ""))
+    return n
+
+
 def read_chat(path):
     """Model calls of one Claude Code transcript: usage, what each call ran, what came back."""
-    calls, idx, names, seen = [], {}, {}, set()
+    calls, idx, names, seen, labels = [], {}, {}, set(), {}
     for line in open(path, errors="replace"):
         try:
             d = json.loads(line)
@@ -100,7 +127,7 @@ def read_chat(path):
                               "cw": u.get("cache_creation_input_tokens") or 0,
                               "inp": u.get("input_tokens") or 0, "out": u.get("output_tokens") or 0,
                               "add": collections.Counter(), "ts": _iso_ts(d.get("timestamp")),
-                              "ds": 0, "tools": 0, "model": m.get("model")})
+                              "ds": 0, "tools": 0, "model": m.get("model"), "items": [], "made": []})
             c = calls[idx[mid]]
             c["out"] = max(c["out"], m["usage"].get("output_tokens") or 0)
             for b in m.get("content") or []:
@@ -114,6 +141,8 @@ def read_chat(path):
                         else:
                             n = "shell output"
                     names[b.get("id")] = n
+                    labels[b.get("id")] = _use_label(b)
+                    c["made"].append(labels[b.get("id")])
         elif d.get("type") == "user" and calls:
             cont = m.get("content")
             if isinstance(cont, list):
@@ -125,10 +154,14 @@ def read_chat(path):
                         if isinstance(cc, list) and any(isinstance(x, dict) and x.get("type") == "image" for x in cc):
                             n = "images"
                         calls[-1]["add"][n] += 1
+                        calls[-1]["items"].append((n, labels.get(b.get("tool_use_id"), n), _result_size(cc)))
                     elif b.get("type") == "text":
                         calls[-1]["add"]["user / injected text"] += 1
+                        calls[-1]["items"].append(("user / injected text", _snip(b.get("text")),
+                                                   len(b.get("text") or "")))
             elif isinstance(cont, str):
                 calls[-1]["add"]["user / injected text"] += 1
+                calls[-1]["items"].append(("user / injected text", _snip(cont), len(cont)))
     return calls
 
 
@@ -227,6 +260,61 @@ def delegation_account(calls, jobs):
             "floor": floor_out + floor_carry + floor_calls}
 
 
+def item_costs(calls, ctx):
+    """Every single thing that entered the context (a tool result, an injected text, one call's own
+    output), with its size in tokens and what re-reading it cost until the context was compacted.
+    A call's growth is split between its results by their size in characters."""
+    n = len(calls)
+    cuts = [i for i in range(1, n) if ctx[i] < ctx[i - 1] * 0.67]
+    out = []
+    for i in range(n - 1):
+        delta = ctx[i + 1] - ctx[i]
+        if delta <= 0:
+            continue
+        later = next((k for k in cuts if k > i), n) - 1 - i
+        own = min(calls[i]["out"], delta)
+        made = ", ".join(calls[i]["made"]) or "text"
+        out.append(("Claude's own output", f"call {i + 1} Claude wrote: {_snip(made, 60)}", own,
+                    own * COST_W["cache_read"] * later))
+        items = calls[i]["items"] or [("other", "other", 1)]   # results of call i's tool uses
+        size = sum(max(x[2], 1) for x in items)
+        for cat, label, chars in items:
+            tok = (delta - own) * max(chars, 1) / size
+            out.append((cat, f"call {i + 1}: {label}", tok, tok * COST_W["cache_read"] * later))
+    return out
+
+
+def cache_rebuilds(calls, ctx):
+    """Calls that wrote most of an existing context to the cache again (the cache had expired),
+    with the idle gap before them and what the rewrite cost above a cache read."""
+    out = []
+    for i in range(1, len(calls)):
+        cr, prev = calls[i]["cr"], ctx[i - 1]
+        # most of the old context was not read from the cache although it is still there
+        if prev and cr < 0.5 * prev and ctx[i] >= 0.67 * prev:
+            t0, t1 = calls[i - 1]["ts"], calls[i]["ts"]
+            gap = (t1 - t0) if t0 is not None and t1 is not None else None
+            lost = prev - cr
+            out.append((i + 1, gap, lost, lost * (COST_W["cache_write"] - COST_W["cache_read"])))
+    return out
+
+
+def cost_detail(calls, ctx, reread):
+    items = sorted(item_costs(calls, ctx), key=lambda x: -x[3])
+    print("most expensive single items (size, re-reading cost until compaction or the end):")
+    for cat, label, tok, c in items[:12]:
+        print(f"  {fmt_num(c):>7} {100 * c / reread if reread else 0:3.0f}%  {fmt_num(tok):>6} tok  {label}")
+    rb = cache_rebuilds(calls, ctx)
+    if rb:
+        tot = sum(r[3] for r in rb)
+        print(f"cache rebuilds (cache expired, context written again): {len(rb)}, extra {fmt_num(tot)}")
+        for no, gap, cw, extra in rb[:8]:
+            g = f"{gap / 60:.0f} min idle" if gap is not None else "gap unknown"
+            print(f"  call {no}: {g}, {fmt_num(cw)} tok rewritten, +{fmt_num(extra)}")
+    else:
+        print("cache rebuilds: none")
+
+
 def cmd_cost(a):
     """What a Claude Code chat cost, measured from its transcript (API usage per call), in
     input-token equivalents (cache read 0.1x, cache write 1.25x, output 5x: the price ratios),
@@ -270,6 +358,8 @@ def cmd_cost(a):
     for k, v in cost.most_common(8):
         print(f"  {k:52} {fmt_num(v):>7}  {100 * v / reread if reread else 0:3.0f}%"
               + (f"  (+{fmt_num(grow[k])} tok)" if grow.get(k) else ""))
+    if getattr(a, "detail", False):
+        cost_detail(calls, ctx, reread)
     jobs = chat_jobs(sid)
     acc = delegation_account(calls, jobs)
     if not jobs and not acc["n_ds_calls"]:
@@ -477,6 +567,54 @@ def cmd_delegate(a):
         print(playbook_text())
     else:
         print("\n(rules already shown in this chat: ds playbook prints them again)")
+
+
+HANDOFF_DIR = os.path.join(HOME, ".local/state/ds-bridge/handoff")
+
+
+def cmd_handoff(a):
+    """Save Claude's notes for a fresh chat (stdin) to <dir>/.plan/HANDOFF.md with this chat's
+    open jobs and delegation state. The SessionStart hook hands the file to the next chat when the
+    user types /clear, so the long context is dropped instead of re-read on every call."""
+    import glob
+    sid = delegate_session(a)
+    notes = sys.stdin.read().strip() if not sys.stdin.isatty() else ""
+    if len(notes) < 40:
+        die("ds handoff -C <dir> - <<'EOF' … EOF: notes on stdin: goal, decisions made, what is done, "
+            "what is next, files that matter (short; the next chat sees nothing else)")
+    d = os.path.abspath(os.path.expanduser(a.dir or os.getcwd()))
+    path = os.path.join(d, ".plan", "HANDOFF.md")
+    st = read_marker(os.path.join(DELEGATE, sid)) if os.path.exists(os.path.join(DELEGATE, sid)) else None
+    rows, running = [], []
+    for j in chat_jobs(sid):
+        if j["status"] in ("landed", "approved", "rejected"):
+            continue
+        live = False
+        try:
+            live = pid_alive(json.load(open(os.path.join(RUNNING, j["id"] + ".json"))).get("pid"))
+        except (OSError, ValueError):
+            pass
+        (running if live else rows).append(j["id"])
+    auto = ["", "## State (written by ds handoff)",
+            f"- delegation: {'on, model ' + (st.get('model') or 'default') if st is not None else 'off'}"]
+    for jid in running:
+        auto.append(f"- job {jid} still RUNNING: run `ds wait {jid} --until-done` with run_in_background")
+    for jid in rows:
+        auto.append(f"- job {jid} open (not landed): `ds status {jid}`, then approve / revise / reject")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("# Handoff\n\n" + notes + "\n" + "\n".join(auto) + "\n")
+    found = glob.glob(os.path.join(HOME, ".claude/projects/*", sid + ".jsonl"))
+    os.makedirs(HANDOFF_DIR, exist_ok=True)
+    pend = {"path": path, "from": sid, "t": time.time(), "delegate": st,
+            "project": os.path.dirname(found[0]) if found else None, "jobs": rows}
+    with open(os.path.join(HANDOFF_DIR, "pending.json"), "w") as f:
+        json.dump(pend, f)
+    tok = len(open(path).read()) // 4
+    print(f"OK handoff saved: {path} (~{tok} tokens)" + (" — over 1.5k tokens, consider trimming" if tok > 1500 else ""))
+    print("Tell the user: type /clear. The next chat starts with this handoff"
+          + (" and delegation on" if st is not None else "") + " (within "
+          + f"{int(cfg()['handoff_ttl_s']) // 3600} h). After a fresh `claude` instead, say: continue from {path}")
 
 
 def cmd_playbook(a):

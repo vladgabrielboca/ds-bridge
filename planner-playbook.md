@@ -31,6 +31,15 @@ Claude turn re-reads the whole chat, so: few turns, short messages, no re-checki
 - Project files: small edits with Edit/Write only; Bash file writes (redirects, heredocs, `sed -i`)
   count as editing. Plans and scratch files go in /tmp or `.plan/`.
 
+## Context (the biggest cost: every call re-reads the whole chat)
+- Facts come from `ds research` or grep / ranged reads, not whole files; a big whole-file read is
+  stopped once (send it again if you truly need all of it).
+- Keep hard reasoning and debugging yourself; delegate the typing (features with a check,
+  refactors, renders, boilerplate, multi-file mechanical edits).
+- Breakpoints: after a batch lands, after writing a big plan/script, between review rounds. There,
+  if the chat is long, run `ds handoff -C <dir> - <<'EOF'` (goal, decisions, done, next, key files;
+  under 1k tokens) and ask the user to type /clear: the next chat starts from the notes.
+
 ## Reading results (the first word decides)
 - `OK … landed`: done. Don't re-run tests, open the files or read the diff; tell the user.
 - `OK` without landed (no check): review the diff, then `ds approve` / `ds revise JOB "1. ..."` / `ds reject`.

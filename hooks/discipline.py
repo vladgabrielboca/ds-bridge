@@ -18,6 +18,9 @@ Adapted from cheap-agent's hook (src/hook.ts, MIT), only for chats with delegati
   notice when the job ends instead of a Claude turn per 9-minute poll). Commands that write project files (redirects, tee, sed -i,
   scripts opening files for writing) are denied (cp/mv are allowed: no content goes through Claude); /tmp, ~/.claude, ds state and .plan/
   stay free, and a ds brief inside a heredoc is ignored.
+- PreToolUse (Read / Bash cat), always: a whole-file read of more than read_gate_lines (400) lines
+  is denied once with cheaper ways to get the facts (grep, a ranged Read, ds research); the same call
+  again passes. Skills, memory, /tmp and .plan/ files are exempt.
 A new user prompt starts fresh (state is keyed by Claude Code's prompt_id, or by our own counter
 that the UserPromptSubmit event advances when prompt_id is missing). Never breaks the session: any error
 allows the call.
@@ -199,12 +202,99 @@ def bash_write(cmd, cwd):
     return None
 
 
+READ_GATE_FREE = (os.path.expanduser("~/.claude/"), "/tmp/", "/dev/")
+
+
+def conf_int(key, default):
+    try:
+        with open(CONF) as f:
+            v = json.load(f).get(key)
+        return default if v is None else int(v)
+    except (OSError, ValueError, AttributeError, TypeError):
+        return default
+
+
+def count_lines(path, cap=100000):
+    try:
+        with open(path, "rb") as f:
+            return sum(1 for _ in zip(range(cap), f))
+    except OSError:
+        return 0
+
+
+def big_read(tool, ti, cwd):
+    """(lines, files) of a whole-file read: the Read tool without a small range, or plain `cat`
+    of files (not piped into a filter). Skills, memory, scratch and .plan/ files are not counted."""
+    files, lines = [], 0
+    def add(path, n=None):
+        nonlocal lines
+        full = os.path.realpath(path)
+        if full.startswith(READ_GATE_FREE) or "/.plan/" in full or not os.path.isfile(full):
+            return
+        k = count_lines(full)
+        k = min(k, n) if n else k
+        if k:
+            files.append(full)
+            lines += k
+    if tool == "Read":
+        if ti.get("offset") and ti.get("limit"):
+            return 0, []
+        fp = ti.get("file_path") or ""
+        if fp.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".ipynb")):
+            return 0, []
+        add(fp, ti.get("limit"))
+    elif tool == "Bash":
+        cur = cwd or os.getcwd()
+        for part in re.split(r"&&|\|\||;|\n", HEREDOC.sub("\n", ti.get("command") or "")):
+            cd = re.match(r"\s*(?:pushd|cd)\s+(?P<d>[^\s;&|]+)\s*$", part)
+            if cd:
+                cur = os.path.join(cur, os.path.expanduser(cd.group("d").strip("\"'")))
+                continue
+            m = re.match(r"\s*cat\s+([^|<>]+)$", part)
+            if m:
+                for a in m.group(1).split():
+                    if not a.startswith("-"):
+                        add(os.path.join(cur, os.path.expanduser(a.strip("\"'"))))
+    return lines, files
+
+
+def read_gate(p, sid):
+    """Deny a big whole-file read once: it stays in the context and is re-read on every later
+    call. The same call again passes (Claude decided it needs all of it)."""
+    limit = conf_int("read_gate_lines", 400)
+    tool = p.get("tool_name") or ""
+    if limit <= 0 or tool not in ("Read", "Bash"):
+        return False
+    ti = p.get("tool_input") or {}
+    lines, files = big_read(tool, ti, p.get("cwd"))
+    if lines <= limit:
+        return False
+    key = json.dumps([tool, ti.get("file_path"), ti.get("command"), ti.get("offset"), ti.get("limit")])
+    path = state_path(sid) + ".reads"
+    try:
+        seen = json.load(open(path))
+    except (OSError, ValueError):
+        seen = []
+    if key in seen:
+        return False
+    os.makedirs(STATE, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump((seen + [key])[-50:], f)
+    deny(f"This reads {lines} whole lines ({len(files)} file(s), roughly {lines * 12 // 1000 or 1}k tokens) that stay "
+         "in the context and are paid again on every later call. Read only what you need: grep or a ranged "
+         "Read (offset/limit), or ask `ds research -C <dir> \"<question>\"` (the worker reads, you get a short "
+         "answer). If you really need all of it, send the same call again and it passes.")
+    return True
+
+
 def pre(p):
     sid, prompt = p.get("session_id"), prompt_of(p)
     if p.get("agent_id") or not on(sid) or not prompt:
         return
     tool = p.get("tool_name") or ""
     cmd = (p.get("tool_input") or {}).get("command") or "" if tool == "Bash" else ""
+    if read_gate(p, sid):
+        return
     if tool == "Bash" and cmd:
         what = bash_write(cmd, p.get("cwd"))
         if what:

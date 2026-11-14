@@ -240,11 +240,12 @@ if not isinstance(hooks, dict):
     sys.exit(f"install.sh: {path} hooks is not a JSON object")
 # UserPromptSubmit: the per-turn reminder; SessionStart "compact": the playbook again after compaction
 changed = False
-for event, matcher in (("UserPromptSubmit", None), ("SessionStart", "compact")):
+# SessionStart "clear": the handoff notes `ds handoff` left for the next chat
+for event, matcher in (("UserPromptSubmit", None), ("SessionStart", "compact"), ("SessionStart", "clear")):
     lst = hooks.setdefault(event, [])
     if not isinstance(lst, list):
         sys.exit(f"install.sh: {path} hooks.{event} is not a list")
-    if any(isinstance(e, dict) and isinstance(e.get("hooks"), list) and
+    if any(isinstance(e, dict) and isinstance(e.get("hooks"), list) and e.get("matcher") == matcher and
            any(isinstance(h, dict) and h.get("command") == cmd for h in e["hooks"]) for e in lst):
         continue
     e = {"hooks": [dict(ours)]}
