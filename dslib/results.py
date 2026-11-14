@@ -198,7 +198,7 @@ def record_ledger(job, res, claude_chars):
              "dir": proj(job), "worker_in": tk["input"],
              "worker_cache": tk["cache_read"], "worker_out": tk["output"],
              "claude_chars": claude_chars, "secs": res.get("secs"),
-             "tok_s": res.get("tok_s"), "tok_kind": res.get("tok_kind"),
+             "tok_s": res.get("tok_s"), "tok_kind": res.get("tok_kind"), "tok_src": res.get("tok_src"),
              "dec_tok_s": res.get("dec_tok_s"), "thr_tok_s": res.get("thr_tok_s"),
              "ttft_ms": (int(round(ttft_med)) if ttft_med is not None else None),
              "check": (None if not res.get("check")

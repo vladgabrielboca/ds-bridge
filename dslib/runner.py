@@ -158,8 +158,12 @@ def _rate(tokens, ms):
 def set_speeds(res):
     """Measured speeds, from the provider's exact per-step token counts and OpenCode's event
     times (nothing estimated):
-    dec_tok_s  decode speed: tokens / first-to-last streamed event, for steps whose reasoning was
-               streamed (with hidden reasoning the generation time cannot be seen).
+    dec_tok_s  decode speed. OpenCode >= 2.3 sends session.step.first-token and
+               session.step.streamed (server times of the provider's first output event and the
+               end of the response body), so every step counts output + reasoning tokens over
+               streamed - first-token: the same formula as OpenCode's footer and DeepSeek's own
+               harness (tok_src "opencode"). Older OpenCode: tokens / first-to-last streamed SSE
+               event, only for steps whose reasoning was streamed (tok_src "sse").
     thr_tok_s  throughput: all generated tokens (output + reasoning) / model time, from the start
                of each request to its last generation event, so it includes the wait for the
                first token; defined for every model.
@@ -168,13 +172,15 @@ def set_speeds(res):
     thr_t, dec_t = res.get("thr_tokens") or 0, res.get("dec_tokens") or 0
     res["thr_tok_s"] = _rate(thr_t, res.get("thr_ms") or 0)
     res["dec_tok_s"] = _rate(dec_t, res.get("dec_ms") or 0)
-    use_dec = res["dec_tok_s"] is not None and dec_t >= 0.8 * thr_t
+    from_oc = bool(res.get("ft_steps")) and not res.get("sse_steps")
+    use_dec = res["dec_tok_s"] is not None and (from_oc or dec_t >= 0.8 * thr_t)
     res["tok_s"] = res["dec_tok_s"] if use_dec else res["thr_tok_s"]
     res["tok_kind"] = "decode" if use_dec else "throughput" if res["tok_s"] is not None else None
+    res["tok_src"] = ("opencode" if from_oc else "sse") if res["tok_s"] is not None else None
     return res
 
 
-SPEED_KEYS = ("thr_tokens", "thr_ms", "dec_tokens", "dec_ms")
+SPEED_KEYS = ("thr_tokens", "thr_ms", "dec_tokens", "dec_ms", "ft_steps", "sse_steps")
 
 
 def _live_rate(segs, now_ms, cpt):
@@ -216,6 +222,9 @@ class LiveMeter:
         self.done_out = 0               # exact output tokens of finished steps
         self.last_delta_ms = self.last_gen_ms = None
         self.step_start_ms = self.first_gen_ms = self.last_step_gen_ms = None
+        self.first_tok_ms = self.streamed_ms = None   # OpenCode >= 2.3 server times for the step
+        self.ft_seen = False            # the service sends session.step.first-token
+        self.last_step_tok_s = None     # exact decode speed of the last finished step
         self.tools, self.args = {}, {}  # call id -> (since_ms, label)
         self.speed = dict.fromkeys(SPEED_KEYS, 0)
         self.ttft = []
@@ -228,6 +237,7 @@ class LiveMeter:
 
     def feed(self, ty, data, created):
         """Take one event of the session. Returns a label when a tool call started, else None."""
+        ty = re.sub(r"\.\d+$", "", ty or "")    # durable types may carry a version suffix
         if ty in ("session.reasoning.delta", "session.text.delta"):
             n = len(data.get("delta") or "")
             if n:
@@ -248,6 +258,13 @@ class LiveMeter:
             except (TypeError, ValueError):
                 self.step_start_ms = created
             self.first_gen_ms = self.last_step_gen_ms = None
+            self.first_tok_ms = self.streamed_ms = None
+        elif ty == "session.step.first-token":
+            self.ft_seen = True
+            if self.first_tok_ms is None:
+                self.first_tok_ms = created
+        elif ty == "session.step.streamed":
+            self.streamed_ms = created
         elif ty == "session.step.ended":
             self._step_ended(data.get("tokens") if isinstance(data.get("tokens"), dict) else {})
         elif ty == "session.tool.input.started":
@@ -282,7 +299,22 @@ class LiveMeter:
         hidden = (int(tk.get("reasoning") or 0) > 0
                   and self.reason_chars < 0.5 * int(tk.get("reasoning") or 0))
         first, last, start = self.first_gen_ms, self.last_step_gen_ms, self.step_start_ms
-        if out_tok > 0 and last is not None and start is not None:
+        ft, streamed = self.first_tok_ms, self.streamed_ms
+        if out_tok > 0 and ft is not None and streamed is not None:
+            # OpenCode's own server times: counted exactly like its footer (a step whose window
+            # is 0 still adds its tokens, as upstream does)
+            win = max(0, streamed - ft)
+            self.speed["ft_steps"] += 1
+            self.speed["dec_tokens"] += out_tok
+            self.speed["dec_ms"] += win
+            if start is not None:
+                self.speed["thr_tokens"] += out_tok
+                self.speed["thr_ms"] += max(0, streamed - start)
+                self.ttft.append(max(0, ft - start))
+            if win >= 100:
+                self.last_step_tok_s = int(round(out_tok / (win / 1000)))
+        elif out_tok > 0 and last is not None and start is not None:
+            self.speed["sse_steps"] += 1
             if last - start >= 100:
                 self.speed["thr_tokens"] += out_tok
                 self.speed["thr_ms"] += last - start
@@ -297,6 +329,7 @@ class LiveMeter:
         if self.cal_tokens > 0:
             self.cpt = min(8.0, max(1.5, self.cal_chars / self.cal_tokens))
         self.step_start_ms = self.first_gen_ms = self.last_step_gen_ms = None
+        self.first_tok_ms = self.streamed_ms = None
         self.tools.clear()
         self.args.clear()
 
@@ -305,10 +338,14 @@ class LiveMeter:
         return int(round(self.step_chars / self.cpt))
 
     def view(self, now_ms):
-        """(live tok/s, phase, tool_since, args_tool, args_since) for the status line."""
+        """(live tok/s, phase, tool_since, args_tool, args_since) for the status line. With
+        OpenCode >= 2.3 the live number is the exact speed of the last finished step (none until
+        one ends); older services get the character-based estimate of the last 5 s."""
         if not self.available:
             return None, None, None, None, None
         live_tok, self.segs = _live_rate(self.segs, now_ms, self.cpt)
+        if self.ft_seen:
+            live_tok = self.last_step_tok_s
         tool_since = args_since = args_tool = None
         if self.args:
             phase = "args"
@@ -535,7 +572,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
                    # 0 once that step's exact count is in
                    "out_est": meter.estimate() if meter.available and state == "running" else 0,
                    "tok_s": sp["tok_s"], "tok_kind": sp["tok_kind"], "ttft_s": meter.ttft_s(),
-                   "live_tok_s": live_tok, "phase": phase, "tool_since": tool_since,
+                   "live_tok_s": live_tok, "live_kind": "step" if meter.ft_seen else "est", "phase": phase, "tool_since": tool_since,
                    "args_tool": args_tool, "args_since": args_since, "owner": job.get("owner") or ""}
             obj.update(extra)
             try:

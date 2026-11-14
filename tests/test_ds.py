@@ -107,6 +107,46 @@ r = ds.set_speeds(dict(h.speed))
 check("hidden reasoning: no decode figure, no fake first-token time", (r["dec_tok_s"], h.ttft) == (None, []), str(r))
 check("hidden reasoning: throughput = 6450 tok / 86 s = 75, shown as such", (r["tok_s"], r["tok_kind"]) == (75, "throughput"), str(r))
 
+# OpenCode >= 2.3: first-token + streamed server times, same numbers as upstream session-turn.test.ts
+o = ds.LiveMeter()
+o.available = True
+o.feed("session.step.started.1", {"started": 6000}, 6000)
+o.feed("session.step.first-token.1", {}, 8000)
+o.feed("session.text.delta", {"delta": "a" * 40}, 9000)
+check("first-token mode: no live number before a step ends", o.view(9100)[0] is None, str(o.view(9100)))
+o.feed("session.step.streamed", {}, 10000)
+o.feed("session.step.ended", {"tokens": {"output": 20, "reasoning": 5}}, 20000)
+check("first-token mode: live number = last step's exact rate (25 tok / 2 s = 12.5)", o.last_step_tok_s == 12, str(o.last_step_tok_s))
+o.feed("session.step.started", {"started": 24000}, 24000)
+o.feed("session.step.first-token", {}, 25000)
+o.feed("session.step.first-token", {}, 26000)                          # only the first one counts
+o.feed("session.step.streamed", {}, 28000)
+o.feed("session.step.ended", {"tokens": {"output": 30, "reasoning": 10}}, 31000)
+r = ds.set_speeds(dict(o.speed))
+check("first-token mode: 65 tok / 5 s = 13 tok/s, from opencode", (r["tok_s"], r["tok_kind"], r["tok_src"]) == (13, "decode", "opencode"), str(r))
+check("first-token mode: ttft from step start (2 s, 1 s)", o.ttft == [2000, 1000], str(o.ttft))
+
+mh = ds.LiveMeter()                                                    # Muse: hidden reasoning, but the server saw reasoning start
+mh.feed("session.step.started", {"started": 0}, 0)
+mh.feed("session.step.first-token", {}, 1500)
+mh.feed("session.text.delta", {"delta": "z" * 300}, 80000)
+mh.feed("session.step.streamed", {}, 86000)
+mh.feed("session.step.ended", {"tokens": {"output": 700, "reasoning": 5750}}, 86100)
+r = ds.set_speeds(dict(mh.speed))
+check("first-token mode, hidden reasoning: decode 6450 tok / 84.5 s = 76", (r["tok_s"], r["tok_kind"]) == (76, "decode"), str(r))
+
+mx = ds.LiveMeter()                                                    # one step without first-token (upgrade mid-job)
+mx.feed("session.step.started", {"started": 0}, 0)
+mx.feed("session.text.delta", {"delta": "q" * 100}, 1000)
+mx.feed("session.text.delta", {"delta": "q" * 100}, 3000)
+mx.feed("session.step.ended", {"tokens": {"output": 100, "reasoning": 0}}, 3100)
+mx.feed("session.step.started", {"started": 5000}, 5000)
+mx.feed("session.step.first-token", {}, 6000)
+mx.feed("session.step.streamed", {}, 8000)
+mx.feed("session.step.ended", {"tokens": {"output": 100, "reasoning": 0}}, 8100)
+r = ds.set_speeds(dict(mx.speed))
+check("mixed steps are not labelled opencode", r["tok_src"] == "sse", str(r))
+
 t = ds.LiveMeter()
 t.available = True
 lab = t.feed("session.tool.called", {"id": "c1", "tool": "shell", "input": {"command": "pytest -q"}}, 10_000)

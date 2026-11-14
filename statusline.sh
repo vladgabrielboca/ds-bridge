@@ -70,10 +70,10 @@ for f in "${files[@]}"; do
                    (.tok_s // ""), ((.pid // 0) | floor), (.phase // ""),
                    (.live_tok_s // ""), ((.tool_since // 0) | floor),
                    (.args_tool // ""), ((.args_since // 0) | floor),
-                   (.ttft_s // ""), (.owner // ""), (.model // ""), ((.out_est // 0) | floor), (.tok_kind // "")]
+                   (.ttft_s // ""), (.owner // ""), (.model // ""), ((.out_est // 0) | floor), (.tok_kind // ""), (.live_kind // "est")]
                   | map(tostring) | join("\u001f")' "$f" 2>/dev/null) || continue
     [ -n "$data" ] || continue
-    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s pid phase live_tok_s tool_since args_tool args_since ttft_s owner model out_est tok_kind <<< "$data"
+    IFS=$'\x1f' read -r state job round steps tools out_tokens started updated last secs tok_s pid phase live_tok_s tool_since args_tool args_since ttft_s owner model out_est tok_kind live_kind <<< "$data"
     # the worker's model, not a fixed "DeepSeek": Muse, Flash, or the model id
     case "$model" in
         *muse*) wl="Muse" ;;
@@ -134,7 +134,8 @@ for f in "${files[@]}"; do
                     writing)
                         case "$live_tok_s" in
                             ''|*[!0-9]*) live_seg="$tok_s_seg" ;;
-                            *) live_seg=" · ▶ ~${live_tok_s} tok/s" ;;
+                            *) if [ "$live_kind" = step ]; then live_seg=" · ▶ ${live_tok_s} tok/s"
+                               else live_seg=" · ▶ ~${live_tok_s} tok/s"; fi ;;
                         esac
                         ;;
                     waiting)

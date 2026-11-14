@@ -43,13 +43,17 @@ def cmd_stats(a):
     # rows written before 2026-11-13 hold a decode figure that was wrong for hidden-reasoning models
     new = [e for e in rows if "dec_tok_s" in e]
     thr = [e["thr_tok_s"] for e in new if e.get("thr_tok_s") is not None]
-    dec = [e["dec_tok_s"] for e in new if e.get("dec_tok_s") is not None]
+    # OpenCode >= 2.3 rows: decode from the server's first-token time (same formula as its footer)
+    oc = [e["dec_tok_s"] for e in new if e.get("tok_src") == "opencode" and e.get("dec_tok_s") is not None]
+    dec = [e["dec_tok_s"] for e in new if e.get("tok_src") != "opencode" and e.get("dec_tok_s") is not None]
     ttfts = [e["ttft_ms"] for e in new if e.get("ttft_ms") is not None]
     parts = []
     if thr:
         parts.append(f"throughput median {int(round(_median(thr)))} tok/s (incl. first-token wait)")
+    if oc:
+        parts.append(f"decode median {int(round(_median(oc)))} tok/s (OpenCode first-token, {len(oc)} rounds)")
     if dec:
-        parts.append(f"decode median {int(round(_median(dec)))} tok/s (streamed steps)")
+        parts.append(f"decode median {int(round(_median(dec)))} tok/s (older SSE estimate, streamed steps)")
     if ttfts:
         parts.append(f"first token median {_median(ttfts) / 1000:.1f}s")
     if parts:
