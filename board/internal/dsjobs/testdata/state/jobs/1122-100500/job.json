@@ -1,0 +1,22 @@
+{
+ "id": "1122-100500",
+ "dir": "/work/1122-100500",
+ "project": "/home/u/proj",
+ "model": "opencode-go/deepseek-v4.1-flash",
+ "agent": "researcher",
+ "round": 1,
+ "status": "approved",
+ "owner": "sess-a",
+ "task": "WORKSPACE: copy.\n\nQUESTION: where is the config read?\nAnswer in at most 200 words.",
+ "started": 1795300500,
+ "result": "OK",
+ "ended": 1795300542,
+ "steps": 4,
+ "tools": 3,
+ "cost": 0.0123,
+ "tokens": {
+  "in": 11495,
+  "out": 235,
+  "cache": 33152
+ }
+}

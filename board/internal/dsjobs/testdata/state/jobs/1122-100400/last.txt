@@ -1,0 +1,4 @@
+BLOCKED 1122-100400 files=0 30s in-copy
+summary: need a choice
+question: A) keep the API or B) break it?
+next: ds reply 1122-100400 <option letter or short answer>

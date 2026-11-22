@@ -1,0 +1,2 @@
+OK 1122-100200 files=1 +1/-1 check=pass 15s landed
+summary: fixed add()

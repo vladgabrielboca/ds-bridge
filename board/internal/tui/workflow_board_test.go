@@ -753,7 +753,7 @@ func TestPhaseAgentCountsTerminalOnly(t *testing.T) {
 }
 
 // TestWfAgentCardAttemptMarker: a leaf that re-ran on a schema mismatch (Attempt>1) shows a faint
-// "attempt N" in its detail card; a first-attempt leaf shows none.
+// "round N" (ds revise round) in its detail card; a first-attempt leaf shows none.
 func TestWfAgentCardAttemptMarker(t *testing.T) {
 	runs := []dsjobs.WorkflowRun{{
 		RunID: "run-1", Name: "n", SessionID: "sX", StartedAt: "2026-06-01T00:00:00Z", Phases: []dsjobs.RunPhase{{Title: "map"}},
@@ -761,14 +761,14 @@ func TestWfAgentCardAttemptMarker(t *testing.T) {
 	jobs := []dsjobs.Result{{RunID: "run-1", Phase: "map", Label: "m1", Model: "glm-4.6", Status: "done", Attempt: 2, JobID: "j1", NumTurns: 1}}
 	m := drillRun(t, runsModel(t, jobs, runs, nil))
 	m, _ = press(t, m, "enter") // drill into the agent detail card
-	if out := m.View(); !strings.Contains(out, "attempt 2") {
-		t.Fatalf("a re-run leaf (Attempt=2) should show 'attempt 2':\n%s", out)
+	if out := m.View(); !strings.Contains(out, "round 2") {
+		t.Fatalf("a re-run leaf (Attempt=2) should show 'round 2':\n%s", out)
 	}
 
 	jobs[0].Attempt = 1 // first attempt → no marker
 	m = drillRun(t, runsModel(t, jobs, runs, nil))
 	m, _ = press(t, m, "enter")
-	if out := m.View(); strings.Contains(out, "attempt") {
+	if out := m.View(); strings.Contains(out, "round") {
 		t.Fatalf("a first-attempt leaf must show no attempt marker:\n%s", out)
 	}
 }

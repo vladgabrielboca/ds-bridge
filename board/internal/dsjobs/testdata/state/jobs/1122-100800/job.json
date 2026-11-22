@@ -1,0 +1,12 @@
+{
+ "id": "1122-100800",
+ "dir": "/work/1122-100800",
+ "project": "/home/u/proj",
+ "model": "opencode-go/deepseek-v4.1-flash",
+ "agent": "worker",
+ "round": 1,
+ "status": "open",
+ "owner": "sess-a",
+ "task": "WORKSPACE: you work in a copy.\n\nTASK: task of 1122-100800\nCHECK: true\n",
+ "started": 1795300800
+}

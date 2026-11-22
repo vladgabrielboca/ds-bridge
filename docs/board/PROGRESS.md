@@ -79,3 +79,32 @@ What T3 must replace.
 - Entering a session's boxes with the cursor on a run row shows `(loading…)` in the Subagents card until the next 3 s refresh. Not checked whether cc-fleet does the same.
 
 What T5 must replace: `StopRun`, `PurgeRun`, `DeleteJob`, `StopJob`, `DeleteSession`, `ClearFinished`, `SendLeafCommand`, `SendPhaseCommand` all return "not available yet (ticket T5)". `WithRunLock` just calls fn. `KeptWorktreeNotices` returns nil.
+
+## T3 (2026-11-22): real data for single jobs
+
+Same branch and worktree, not committed yet.
+
+What changed.
+
+- `board/internal/dsjobs/read.go` replaces the stub. `ListJobs` reads `jobs/*/job.json` (skips `b*` dirs and any job with `batch`), `progress/<id>.json`, `last.txt`, `last.txt.pending` and `running/<id>.json`. Newest first by `started`.
+- Status follows SPEC 5. Extra rules found while building it.
+  - Progress `state: error` counts only when no result word exists yet, or when it says `interrupted` and is newer than job `ended` (+1 s). A round that ended with an error already has PROVIDER/ERROR/LIMIT in job.json, and its progress `updated` can be a fraction of a second after the int `ended`.
+  - A job with a live `running/<id>.json` pid and no progress file yet shows `running`.
+  - A job with no result word, no pending file and no live pid shows `stopped`, outcome `no result`.
+- New `Result` fields: `Outcome` (`OK · landed`, `OK · approved`, `OK · not landed`, `rejected`, `interrupted`, the word), `Hint` (BLOCKED: the `question:` line of last.txt and `ds reply <id> …`), `Kind` (`research` when answer.txt exists or agent is `researcher`, else `run`).
+- `ReadIO`: prompt is job `task` with the worker-rules and WORKSPACE preamble cut, as `ds list` does. Answer is answer.txt, else report.txt. While a round runs the answer is empty, since report.txt then holds the previous round.
+- `ReadActivity`: `tool(arg)` per tool record, latest usage, torn last line skipped. Paths inside `STATE/work/<id>/` show relative (`edit(calc.py)`); a shell command keeps its `cd /abs/path`.
+- Times are local (`StartedAt` in local RFC3339). Model drops the provider prefix.
+- tui: full job and batch ids (`shortJobID`/`shortRunID` no longer cut), `round N` instead of `attempt N`, Overview `agent  worker · run`, Outcome uses `Outcome` and adds the `Hint` lines for failed jobs, `(no activity recorded)` for jobs without activity.jsonl, `(no prompt or output recorded)` instead of the persist-io note. Refresh cadence unchanged (3 s, 500 ms while a job runs).
+- Tests: `internal/dsjobs/read_test.go` on `testdata/state` (running with the test's pid, dead pid from an exited `true`, landed, open OK round 2, BLOCKED, research, pre-T1, rejected, queued, batch child, b* dir), plus a check that reading changes nothing in the state dir. Two tui tests updated for the new texts.
+
+Live check (job 1122-164659, scratch project with 3 bugs, board in tmux 150x40).
+
+- While running: Activity went 2, 4, 7 tool calls and ↑ ctx 11.1k, 11.4k, 11.9k across captures 4 s apart. Output showed `(empty)`, Outcome `Still running…`.
+- After: `✔ Done`, tokens `↑ 12.3k · ↓ 728`, turns 6, stop OK, Output = the worker's report block, Outcome `OK · landed · 6 turns`.
+
+Left for later.
+
+- Batch children (jobs with `batch`) are not shown at all until T4.
+- ↑ while running is the activity usage `in` (peak context); once done it is job.json `tokens.in`. They were close in the live run (11.9k vs 12.3k), not checked on a long multi-round job.
+- Session cwd for grouping comes from `sessiontitle`; the `Result.Project` fallback from T2 is kept.

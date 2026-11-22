@@ -1,0 +1,22 @@
+{
+ "id": "1122-100200",
+ "dir": "/work/1122-100200",
+ "project": "/home/u/proj",
+ "model": "opencode-go/deepseek-v4.1-flash",
+ "agent": "worker",
+ "round": 1,
+ "status": "landed",
+ "owner": "sess-a",
+ "task": "WORKSPACE: you work in a copy.\n\nTASK: task of 1122-100200\nCHECK: true\n",
+ "started": 1795300200,
+ "result": "OK",
+ "ended": 1795300215,
+ "steps": 4,
+ "tools": 3,
+ "cost": 0.0123,
+ "tokens": {
+  "in": 11495,
+  "out": 235,
+  "cache": 33152
+ }
+}

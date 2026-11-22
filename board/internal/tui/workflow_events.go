@@ -15,7 +15,8 @@ type activitySnapshot struct {
 	sigs          []string // tool-call signatures in arrival order
 	inTok, outTok int
 	hasUsage      bool
-	attempt       int // the leaf's exec ordinal this snapshot belongs to; a restart bumps it and resets the floor
+	attempt       int  // the leaf's exec ordinal this snapshot belongs to; a restart bumps it and resets the floor
+	missing       bool // ds: the job has no activity.jsonl (a job from before the board)
 }
 
 // toolCount is the number of tool calls the leaf has made so far.
@@ -35,7 +36,7 @@ func (s activitySnapshot) lastSigs(n int) []string {
 func readLeafActivity(jobID string) (activitySnapshot, bool) {
 	a, ok := dsjobs.ReadActivity(jobID)
 	if !ok {
-		return activitySnapshot{}, false
+		return activitySnapshot{missing: true}, false
 	}
 	return activitySnapshot{sigs: a.Sigs, inTok: a.InTok, outTok: a.OutTok, hasUsage: a.HasUsage}, true
 }

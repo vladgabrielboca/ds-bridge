@@ -295,8 +295,8 @@ func TestBoardJobCardNotPersistedNote(t *testing.T) {
 		StartedAt: "2026-05-26T01:00:00Z"}
 	m := boardModel(t, []dsjobs.Result{job})
 	m, _ = step(t, m, asDetailMsg{nonce: m.asDetailNonce, epoch: m.boardEpoch, jobID: "j0000000", present: false})
-	if out := m.View(); !strings.Contains(out, "not persisted") {
-		t.Fatalf("an io-less job should show the not-persisted note:\n%s", out)
+	if out := m.View(); !strings.Contains(out, "no prompt or output recorded") {
+		t.Fatalf("an io-less job should show the no-io note:\n%s", out)
 	}
 }
 

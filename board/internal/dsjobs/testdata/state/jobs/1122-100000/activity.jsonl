@@ -1,0 +1,6 @@
+{"seq": 1, "kind": "tool", "tool": "shell", "arg": "ls -la", "round": 1, "ts": "x"}
+{"seq": 2, "kind": "usage", "in": 10950, "out": 49, "cache": 0, "round": 1, "ts": "x"}
+{"seq": 3, "kind": "tool", "tool": "edit", "arg": "calc.py", "round": 1, "ts": "x"}
+{"seq": 4, "kind": "tool", "tool": "todowrite", "arg": "", "round": 1, "ts": "x"}
+{"seq": 5, "kind": "usage", "in": 12000, "out": 180, "cache": 0, "round": 1, "ts": "x"}
+{"seq":6,"kind":"to

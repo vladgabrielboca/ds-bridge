@@ -780,8 +780,8 @@ func (m Model) agentDetailLines(rightW int) []string {
 	snap := m.snapForJob(j)
 	status := statusLabel(j.Status) + faintStyle.Render(" · "+trunc(sessiontitle.CleanTitle(j.Model), 28))
 	if j.Attempt > 1 {
-		// >1 occurs only in records from engines that retried schema mismatches; surface it.
-		status += faintStyle.Render(fmt.Sprintf(" · attempt %d", j.Attempt))
+		// ds: the revise round.
+		status += faintStyle.Render(fmt.Sprintf(" · round %d", j.Attempt))
 	}
 	// ↑ peak input context · ↓ cumulative output (the header sums only output across leaves) · cache-write
 	// tokens when the leaf wrote the prompt cache · tool calls.
@@ -799,7 +799,7 @@ func (m Model) agentDetailLines(rightW int) []string {
 	case m.wfDetailJob.JobID != j.JobID:
 		lines = append(lines, "", faintStyle.Render("(loading…)"))
 	case !m.wfDetailIO:
-		lines = append(lines, "", faintStyle.Render("(prompt/output not persisted — run with default persist-io)"))
+		lines = append(lines, "", faintStyle.Render("(no prompt or output recorded)"))
 	default:
 		lines = append(lines, "")
 		lines = append(lines, promptSection(m.wfDetailPrompt, m.wfPromptExpanded, rightW)...)
@@ -813,7 +813,8 @@ func (m Model) agentDetailLines(rightW int) []string {
 		lines = append(lines, ioLines(m.wfDetailAnswer, rightW, liveStyle)...)
 	}
 	// Outcome last.
-	lines = append(lines, "", faintStyle.Render("Outcome"), " "+m.renderOutcome(j))
+	lines = append(lines, "", faintStyle.Render("Outcome"))
+	lines = append(lines, m.outcomeLines(j, rightW)...)
 	return lines
 }
 
@@ -868,9 +869,13 @@ func promptSection(prompt string, expanded bool, rightW int) []string {
 // activityLines renders a detail card's Activity section: the tool-call header + the last
 // 3 signatures ("(no tool calls)" when none). Shared by all three detail cards.
 func activityLines(snap activitySnapshot, rightW int) []string {
+	if snap.missing {
+		return []string{faintStyle.Render("Activity"), faintStyle.Render(" (no activity recorded)")}
+	}
 	lines := []string{faintStyle.Render(fmt.Sprintf("Activity · last 3 of %d tool calls", snap.toolCount()))}
 	sigs := snap.lastSigs(3)
-	if len(sigs) == 0 {
+	switch {
+	case len(sigs) == 0:
 		lines = append(lines, faintStyle.Render(" (no tool calls)"))
 	}
 	for _, s := range sigs {
@@ -984,8 +989,14 @@ func (m Model) renderOutcome(j dsjobs.Result) string {
 	case j.Status == "running" || j.Status == "queued" || j.Status == "":
 		return faintStyle.Render("Still running…") // queued has OK=true but isn't done — keep it in-progress
 	case j.OK || j.Status == "done":
+		if o := sessiontitle.CleanTitle(j.Outcome); o != "" {
+			return faintStyle.Render(fmt.Sprintf("%s · %d turns", o, j.NumTurns))
+		}
 		return faintStyle.Render(fmt.Sprintf("done · %d turns", j.NumTurns))
 	case j.Status == "stopped":
+		if o := sessiontitle.CleanTitle(j.Outcome); o != "" {
+			return faintStyle.Render(o) // ds: rejected
+		}
 		return faintStyle.Render("stopped") // a `workflow stop` reap — neutral, not a failure
 	default:
 		cls := j.ErrorCode
@@ -994,6 +1005,16 @@ func (m Model) renderOutcome(j dsjobs.Result) string {
 		}
 		return errStyle.Render(sessiontitle.CleanTitle(cls))
 	}
+}
+
+// outcomeLines is the Outcome section body: the outcome line, then ds's hint lines (BLOCKED:
+// the worker's question and the reply command), wrapped to the pane.
+func (m Model) outcomeLines(j dsjobs.Result, rightW int) []string {
+	lines := []string{" " + m.renderOutcome(j)}
+	if strings.TrimSpace(j.Hint) != "" && j.Status == "failed" {
+		lines = append(lines, ioLines(j.Hint, rightW, contentStyle)...)
+	}
+	return lines
 }
 
 // humanTokens compacts a token count: <1000 verbatim, else N.Nk (e.g. 50.7k), else
@@ -1023,13 +1044,8 @@ func (m Model) runLabel(g runGroup) string {
 	return short
 }
 
-// shortRunID trims a run id to its first 8 chars for the run header.
-func shortRunID(id string) string {
-	if len(id) > 8 {
-		return id[:8]
-	}
-	return id
-}
+// shortRunID is the run id as shown: ds batch ids are short and needed whole (b1122-162535).
+func shortRunID(id string) string { return id }
 
 // headerSummaryLine is the chrome's third line: the CURSORED child's label on the left (the
 // live preview context, the slot the wf run header gives its description) + the container
@@ -1754,8 +1770,8 @@ func (m Model) jobDetailLines(j dsjobs.Result, rightW int) []string {
 		status += faintStyle.Render(" · " + trunc(model, 28))
 	}
 	if j.Attempt > 1 {
-		// >1 occurs only in records from engines that retried schema mismatches; surface it.
-		status += faintStyle.Render(fmt.Sprintf(" · attempt %d", j.Attempt))
+		// ds: the revise round.
+		status += faintStyle.Render(fmt.Sprintf(" · round %d", j.Attempt))
 	}
 	lines := []string{status, "", faintStyle.Render("Overview")}
 	// Two fields per line (the status line already carries the model). The job id keeps
@@ -1766,7 +1782,10 @@ func (m Model) jobDetailLines(j dsjobs.Result, rightW int) []string {
 		if d := sessiontitle.CleanTitle(j.SlimDowngrade); d != "" {
 			profile += " (ran full: " + d + ")"
 		}
-		fields = append(fields, detailKV{"profile", profile})
+		if kind := sessiontitle.CleanTitle(j.Kind); kind != "" {
+			profile += " · " + kind
+		}
+		fields = append(fields, detailKV{"agent", profile})
 	}
 	started := sessiontitle.CleanTitle(j.StartedAt)
 	if ts, err := time.Parse(time.RFC3339, j.StartedAt); err == nil {
@@ -1799,7 +1818,7 @@ func (m Model) jobDetailLines(j dsjobs.Result, rightW int) []string {
 	case m.asDetailJobID != j.JobID:
 		lines = append(lines, faintStyle.Render("(loading…)"))
 	case !m.asDetailIO:
-		lines = append(lines, faintStyle.Render("(prompt/output not persisted — run with default persist-io)"))
+		lines = append(lines, faintStyle.Render("(no prompt or output recorded)"))
 	default:
 		lines = append(lines, promptSection(m.asDetailPrompt, m.asPromptExpanded, rightW)...)
 	}
@@ -1811,7 +1830,8 @@ func (m Model) jobDetailLines(j dsjobs.Result, rightW int) []string {
 			lines = append(lines, ioLines(m.asDetailAnswer, rightW, liveStyle)...)
 		}
 	}
-	lines = append(lines, "", faintStyle.Render("Outcome"), " "+m.renderOutcome(j))
+	lines = append(lines, "", faintStyle.Render("Outcome"))
+	lines = append(lines, m.outcomeLines(j, rightW)...)
 	return lines
 }
 
@@ -2080,13 +2100,8 @@ func jobRowLabel(j dsjobs.Result) string {
 	return shortJobID(sessiontitle.CleanTitle(j.JobID))
 }
 
-// shortJobID trims a job UUID to its first 8 chars for the board's job rows.
-func shortJobID(id string) string {
-	if len(id) > 8 {
-		return id[:8]
-	}
-	return id
-}
+// shortJobID is the job id as shown: ds job ids are short and needed whole (1122-162535).
+func shortJobID(id string) string { return id }
 
 // setupOptions are the three choices on the provider-teammates setup nudge, in
 // cursor order (index 0 = "enable it for me", handled specially by updateSetup).
