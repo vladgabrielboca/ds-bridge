@@ -78,8 +78,14 @@ func TestListJobsStatus(t *testing.T) {
 				c.id, j.Status, j.ErrorCode, j.Outcome, c.status, c.errCode, c.outcome)
 		}
 	}
-	if len(jobs) != len(cases) {
-		t.Errorf("got %d jobs, want %d (batch child and b* dir left out)", len(jobs), len(cases))
+	single := 0
+	for _, j := range jobs {
+		if j.RunID == "" {
+			single++
+		}
+	}
+	if single != len(cases) {
+		t.Errorf("got %d single jobs, want %d", single, len(cases))
 	}
 }
 
@@ -87,7 +93,7 @@ func TestListJobsFields(t *testing.T) {
 	fixture(t)
 	jobs := byID(t)
 	js, _ := ListJobs()
-	if js[0].JobID != "1122-100800" || js[len(js)-1].JobID != "1122-100000" {
+	if js[0].JobID != "1122-102200" || js[len(js)-1].JobID != "1122-100000" {
 		t.Errorf("not newest first: %s … %s", js[0].JobID, js[len(js)-1].JobID)
 	}
 	l := jobs["1122-100200"]
@@ -181,4 +187,90 @@ func sameTime(a, b string) bool {
 	ta, e1 := time.Parse(time.RFC3339, a)
 	tb, e2 := time.Parse(time.RFC3339, b)
 	return e1 == nil && e2 == nil && ta.Equal(tb)
+}
+
+func runByID(t *testing.T) (map[string]WorkflowRun, map[string]Result) {
+	t.Helper()
+	jobs, err := ListJobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := ListRuns(jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := map[string]WorkflowRun{}
+	for _, r := range runs {
+		m[r.RunID] = r
+	}
+	j := map[string]Result{}
+	for _, x := range jobs {
+		j[x.JobID] = x
+	}
+	return m, j
+}
+
+func TestBatchChildren(t *testing.T) {
+	fixture(t)
+	_, jobs := runByID(t)
+	want := map[string]string{"1122-101000": "Fix add", "1122-101100": "Fix mul",
+		"1122-102100": "Fix add", "1122-102200": CheckPhase}
+	for id, phase := range want {
+		j := jobs[id]
+		if j.Phase != phase || j.RunID == "" || j.Label != id {
+			t.Errorf("%s: run %q phase %q label %q, want phase %q", id, j.RunID, j.Phase, j.Label, phase)
+		}
+	}
+}
+
+func TestBatchRuns(t *testing.T) {
+	dir := fixture(t)
+	old := time.Now().Add(-time.Hour)
+	os.Chtimes(filepath.Join(dir, "jobs/b1122-103000/batch.json"), old, old)
+	runs, _ := runByID(t)
+	if len(runs) != 3 {
+		t.Fatalf("got %d runs", len(runs))
+	}
+	b := runs["b1122-100950"]
+	if b.Status != "failed" || b.Name != "Split calc" || b.SessionID != "sess-b" || b.Cwd != "/home/u/proj" || b.UpdatedAt == "" {
+		t.Errorf("batch 1: %+v", b)
+	}
+	type ph struct{ title, status, detail string }
+	got := []ph{}
+	for _, p := range b.Phases {
+		got = append(got, ph{p.Title, p.Status, p.Detail})
+	}
+	want := []ph{{"Fix add", "done", ""}, {"Fix mul", "failed", "FAIL"},
+		{"Use both", "stopped", "skipped: needs step 2 (FAIL)"},
+		{CheckPhase, "stopped", "not run (not every step landed)"}}
+	if len(got) != len(want) {
+		t.Fatalf("phases %+v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("phase %d: %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	f := runs["b1122-102000"]
+	last := f.Phases[len(f.Phases)-1]
+	if f.Status != "done" || last.Title != CheckPhase || last.Status != "done" ||
+		last.Detail != "pass (after fix job) · `python3 test_calc.py`" {
+		t.Errorf("batch 2: %+v", f)
+	}
+	k := runs["b1122-103000"]
+	if k.Status != "failed" || k.Description != "interrupted" {
+		t.Errorf("killed batch: %+v", k)
+	}
+	// The same batch, freshly written (fixture mtime is now), still counts as running.
+	os.Chtimes(filepath.Join(dir, "jobs/b1122-103000/batch.json"), time.Now(), time.Now())
+	if runs, _ = runByID(t); runs["b1122-103000"].Status != "running" {
+		t.Errorf("fresh batch: %+v", runs["b1122-103000"])
+	}
+}
+
+func TestPlanStepTitles(t *testing.T) {
+	got := planStepTitles("testdata/state/plan.md")
+	if got["1"] != "Fix add" || got["2"] != "Fix mul" || got["3"] != "Use both" {
+		t.Errorf("%v", got)
+	}
 }

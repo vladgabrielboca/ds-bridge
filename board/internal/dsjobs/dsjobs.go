@@ -57,12 +57,17 @@ type Result struct {
 	Hint    string
 	// Kind is run or research.
 	Kind string
+	// Tools is job.json tools (summed over rounds): the tool count of a finished job.
+	Tools int
 }
 
 // RunPhase is one phase (ds: batch group) of a run.
 type RunPhase struct {
 	Title  string `json:"title"`
 	Detail string `json:"detail,omitempty"`
+	// Status is the phase's own status when the batch knows it (ds: a SKIPPED group is "stopped",
+	// a failed one "failed"); "" or "queued" lets the board derive it from the agents.
+	Status string `json:"status,omitempty"`
 }
 
 // WorkflowRun holds the fields the board reads from cc-fleet's subagent.WorkflowRun (ds: a batch).

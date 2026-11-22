@@ -297,7 +297,7 @@ func loadWfData(jobs []dsjobs.Result) ([]dsjobs.WorkflowRun, map[string]activity
 			activity[j.JobID] = activitySnapshot{attempt: j.Attempt}
 		}
 	}
-	runs, err := dsjobs.ListRuns()
+	runs, err := dsjobs.ListRuns(jobs)
 	return runs, activity, err
 }
 

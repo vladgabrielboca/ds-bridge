@@ -1,1 +1,42 @@
-{"id": "b1122-100950", "groups": []}
+{
+ "id": "b1122-100950",
+ "title": "Split calc",
+ "plan": "testdata/state/plan.md",
+ "project": "/home/u/proj",
+ "owner": "sess-b",
+ "started": 1795300950,
+ "check": "python3 test_calc.py",
+ "ended": 1795301000,
+ "integration": "none",
+ "groups": [
+  {
+   "label": "1",
+   "steps": [
+    "1"
+   ],
+   "needs": [],
+   "job": "1122-101000",
+   "status": "OK"
+  },
+  {
+   "label": "2",
+   "steps": [
+    "2"
+   ],
+   "needs": [],
+   "job": "1122-101100",
+   "status": "FAIL"
+  },
+  {
+   "label": "3",
+   "steps": [
+    "3"
+   ],
+   "needs": [
+    1
+   ],
+   "job": null,
+   "status": "SKIPPED"
+  }
+ ]
+}

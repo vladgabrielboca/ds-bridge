@@ -572,11 +572,12 @@ func (m Model) viewWfPhases() string {
 // Phases drill rail and the Dynamic Workflows box preview.
 func phaseRow(p runPhaseGroup, i int, selected bool) string {
 	done, total := phaseAgentCounts(p)
-	st := phaseStatus(done, total)
+	st := p.state()
 	title := trunc(sessiontitle.CleanTitle(p.title), 28)
 	glyph := fmt.Sprintf("%d", i+1)
-	if st == "done" {
-		glyph = statusDot("done")
+	switch st {
+	case "done", "failed", "stopped":
+		glyph = statusDot(st)
 	}
 	if selected {
 		title = selectedStyle.Render(title)
@@ -598,8 +599,14 @@ func (m Model) phaseAgentLines(width int) (title string, lines []string) {
 		return "agents", []string{faintStyle.Render("Not started yet")}
 	}
 	title = fmt.Sprintf("%s · %d agents", trunc(sessiontitle.CleanTitle(p.title), 20), len(p.jobs))
+	if d := sessiontitle.CleanTitle(p.detail); d != "" {
+		lines = append(lines, labelStyle(p.state()).Render(trunc(d, width)), "")
+	}
 	if len(p.jobs) == 0 {
-		return title, []string{faintStyle.Render("Not started yet")}
+		if p.state() == "" {
+			lines = append(lines, faintStyle.Render("Not started yet"))
+		}
+		return title, lines
 	}
 	for _, j := range p.jobs {
 		lines = append(lines, m.renderAgentRowFull(j, width))
@@ -749,6 +756,9 @@ func (m Model) snapForJob(j dsjobs.Result) activitySnapshot {
 // attempt.
 func (m Model) leafCounts(j dsjobs.Result) (in, out, tools int) {
 	in, out = m.liveTokens(j)
+	if j.Status != "running" {
+		return in, out, j.Tools // ds: job.json tools
+	}
 	return in, out, m.snapForJob(j).toolCount()
 }
 
@@ -1506,7 +1516,7 @@ func (m Model) renderRunsBox(s asSession, bodyH int) string {
 	if ri := m.boxRunIdx(s); ri >= 0 {
 		g := s.runs[ri]
 		done, total := runAgentCounts(g)
-		rightTitle = fmt.Sprintf("%s · %d/%d agents", trunc(m.runLabel(g), 24), done, total)
+		rightTitle = fmt.Sprintf("%s · %d/%d agents", trunc(m.runLabel(g), 48), done, total)
 		for i, p := range g.phases {
 			rightLines = append(rightLines, phaseRow(p, i, false))
 		}
@@ -1871,8 +1881,26 @@ func (g runGroup) elapsed() string {
 
 // runPhaseGroup is one phase of a run with the jobs observed in it.
 type runPhaseGroup struct {
-	title string
-	jobs  []dsjobs.Result
+	title  string
+	jobs   []dsjobs.Result
+	status string // ds: the batch's own phase status ("stopped" for SKIPPED, "failed", "done"); "" = derive
+	detail string // ds: skip reason, needs, or the integration check result
+}
+
+// state is the phase's display status: the batch's own when it says stopped/failed (a SKIPPED group
+// has no agents to derive from; a failed agent must not read as ✔ done), or done for an agent-less
+// phase (the integration check), else derived from the agent counts.
+func (p runPhaseGroup) state() string {
+	done, total := phaseAgentCounts(p)
+	switch {
+	case p.status == "stopped" || p.status == "failed":
+		return p.status
+	case total == 0 && p.status == "done":
+		return "done"
+	case total == 0 && p.status == "running":
+		return "running"
+	}
+	return phaseStatus(done, total)
 }
 
 // groupByRun joins RunID-tagged jobs to their run manifests into a run→phase→job
@@ -1930,7 +1958,8 @@ func groupByRun(jobs []dsjobs.Result, runs []dsjobs.WorkflowRun) []runGroup {
 	for _, r := range runs {
 		g := ensureRun(r.RunID)
 		for _, p := range r.Phases {
-			ensurePhase(g, p.Title)
+			i := ensurePhase(g, p.Title)
+			g.phases[i].status, g.phases[i].detail = p.Status, p.Detail
 		}
 	}
 

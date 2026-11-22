@@ -1,0 +1,23 @@
+{
+ "id": "b1122-102000",
+ "title": "Split calc",
+ "plan": "testdata/state/plan.md",
+ "project": "/home/u/proj",
+ "owner": "sess-b",
+ "started": 1795302000,
+ "check": "python3 test_calc.py",
+ "ended": 1795302100,
+ "integration": "pass (after fix job)",
+ "fix_job": "1122-102200",
+ "groups": [
+  {
+   "label": "1",
+   "steps": [
+    "1"
+   ],
+   "needs": [],
+   "job": "1122-102100",
+   "status": "OK"
+  }
+ ]
+}

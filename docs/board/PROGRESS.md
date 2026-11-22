@@ -108,3 +108,29 @@ Left for later.
 - Batch children (jobs with `batch`) are not shown at all until T4.
 - ↑ while running is the activity usage `in` (peak context); once done it is job.json `tokens.in`. They were close in the live run (11.9k vs 12.3k), not checked on a long multi-round job.
 - Session cwd for grouping comes from `sessiontitle`; the `Result.Project` fallback from T2 is kept.
+
+## T4 (2026-11-22): batches as the workflow tree
+
+Same branch and worktree, not committed yet. The user chose to keep the box title "Dynamic Workflows".
+
+What changed.
+
+- `board/internal/dsjobs/batch.go`: `ListRuns(jobs)` reads `jobs/b*/batch.json` (it now takes the refresh's job list instead of reading jobs again). Batch = run (title, owner as session, project as cwd, `started`, `ended` as UpdatedAt). Group = phase, in batch.json order.
+- Phase title is the plan's step title, read best effort from the `plan` file (`## <id> <title>`, same `step`/`s` prefixes as `parse_plan`). The group label is kept in front only when it differs from the row number (`1-2 Fix a`), since the rail already shows the number. No plan file: the label alone.
+- `ListJobs` now returns batch children with `RunID` = batch, `Phase` = their group's title (from `batch_group`, else the group whose `job` it is), `Label` = job id. A batch job with no group is the integration fix job.
+- `RunPhase.Status` and `Detail` are new. Group `SKIPPED` → `stopped` with `skipped: needs step 2 (FAIL)` (the reason worked out like `batch.py`: the first needed group that did not pass and land). A result word other than OK → `failed` with the word. A group with `needs` shows `needs step 1`. The tui shows Detail as the first line of the phase's right pane, and the rail glyph is the status dot for done, failed and stopped phases (cc-fleet only had ✔ for done, so a failed phase used to read as ✔).
+- Integration check: a last pseudo-phase `integration check`, chosen over the run header's right side because it looks like cc-fleet's phase list and gives the fix job a place as its agent. Detail is `pass · \`cmd\``, `pass (after fix job) · …`, `fail · …`, or `not run (not every step landed)` (stopped look). Only shown when the batch has a check.
+- Run status: `ended` set → done, or failed if any group failed, was skipped, or the check failed. No `ended`: running while a child runs or batch.json was written in the last 30 s; otherwise failed with Description `interrupted` (ds records no batch pid, and group transitions rewrite batch.json at once).
+- Finished agents show job.json `tools` (new `Result.Tools`) instead of 0. The runs box right title fits 48 characters so the batch id isn't cut.
+- Tests: fixtures `b1122-100950` (3 groups: OK, FAIL, SKIPPED needing the failed one), `b1122-102000` (check passed after a fix job), `b1122-103000` (killed: no end, aged batch.json), plus `plan.md`. The T3 count and order checks now allow batch children.
+
+Live check: `ds batch` on a scratch project, plan "Fix area code", 2 steps, step 2 `needs: 1`, check `python3 test_all.py`. Batch b1122-165227, jobs 1122-165227 and 1122-165242, all landed, integration pass, 30 s.
+
+- At 1 s: phase 1 running (`0/1`, `↓ 199 out · 2 tools`), phase 2 and the check queued.
+- At 7 s: phase 1 ✔ `↓ 517 out · 4 tools · 14s`, phase 2 `0/1` running.
+- At 19 s: all three ✔. Phase 2 shows `needs step 1`; the check phase shows `pass · \`python3 test_all.py\``.
+
+Left for later.
+
+- The run header and runs box show no `interrupted` text for a killed batch, only the failed dot (Description isn't rendered anywhere in the ported view).
+- With the cursor on the check phase the header reads `0/0 agents · ↑ 0 · ↓ 0` when no fix job ran.

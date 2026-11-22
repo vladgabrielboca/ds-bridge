@@ -28,7 +28,9 @@ type jobFile struct {
 	Owner   string  `json:"owner"`
 	Started float64 `json:"started"`
 	Batch   string  `json:"batch"`
+	Group   any     `json:"batch_group"`
 	Steps   int     `json:"steps"`
+	Tools   int     `json:"tools"`
 	Cost    float64 `json:"cost"`
 	Tokens  *struct {
 		In    int `json:"in"`
@@ -106,7 +108,8 @@ func exists(path string) bool {
 	return err == nil
 }
 
-// ListJobs returns every single ds job (batch children and batch dirs left out until T4), newest first.
+// ListJobs returns every ds job, newest first. A batch child carries RunID (the batch id) and
+// Phase (its group's phase title).
 func ListJobs() ([]Result, error) {
 	ents, err := os.ReadDir(jobsDir())
 	if err != nil {
@@ -115,12 +118,13 @@ func ListJobs() ([]Result, error) {
 		}
 		return nil, err
 	}
+	batches := readBatches()
 	var out []Result
 	for _, e := range ents {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), "b") {
 			continue
 		}
-		if r, ok := readJob(e.Name()); ok {
+		if r, ok := readJob(e.Name(), batches); ok {
 			out = append(out, r)
 		}
 	}
@@ -134,12 +138,9 @@ func ListJobs() ([]Result, error) {
 }
 
 // readJob builds one job's Result from job.json, progress/<id>.json, last.txt and the marker files.
-func readJob(id string) (Result, bool) {
+func readJob(id string, batches map[string]*batchFile) (Result, bool) {
 	var j jobFile
 	if !readJSON(filepath.Join(jobsDir(), id, "job.json"), &j) {
-		return Result{}, false
-	}
-	if j.Batch != "" {
 		return Result{}, false
 	}
 	if j.ID == "" {
@@ -176,6 +177,7 @@ func readJob(id string) (Result, bool) {
 		StartedAt:     epochRFC3339(j.Started),
 		Attempt:       round,
 		NumTurns:      j.Steps,
+		Tools:         j.Tools,
 		CostUSD:       j.Cost,
 		StopReason:    word,
 	}
@@ -187,6 +189,13 @@ func readJob(id string) (Result, bool) {
 		r.PID = p.PID
 		if p.Started > 0 {
 			r.StartedAt = epochRFC3339(p.Started)
+		}
+	}
+	if j.Batch != "" {
+		// The id is the agent row's label: every child runs the same model.
+		r.RunID, r.Phase, r.Label = j.Batch, "?", r.JobID
+		if b, ok := batches[j.Batch]; ok {
+			r.Phase = b.phaseOf(r.JobID, groupIndex(j.Group))
 		}
 	}
 	setStatus(&r, j, p, hasProg, word, last)
@@ -273,9 +282,6 @@ func markerAlive(id string) bool {
 	}
 	return readJSON(filepath.Join(StateDir, "running", id+".json"), &m) && pidAlive(m.PID)
 }
-
-// ListRuns returns every ds batch as a run. Batches come in T4.
-func ListRuns() ([]WorkflowRun, error) { return nil, nil }
 
 // stripPreamble drops what ds puts before the task: the worker rules (message mode) and the
 // WORKSPACE note, the same cut `ds list` makes.

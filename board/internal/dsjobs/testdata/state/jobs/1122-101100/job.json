@@ -1,0 +1,24 @@
+{
+ "id": "1122-101100",
+ "dir": "/work/1122-101100",
+ "project": "/home/u/proj",
+ "model": "opencode-go/deepseek-v4.1-flash",
+ "agent": "worker",
+ "round": 1,
+ "status": "open",
+ "owner": "sess-b",
+ "task": "WORKSPACE: copy.\n\nplan\n\nYour part: step of 1122-101100",
+ "started": 1795301100,
+ "steps": 3,
+ "tools": 2,
+ "cost": 0.0,
+ "tokens": {
+  "in": 9000,
+  "out": 300,
+  "cache": 0
+ },
+ "batch": "b1122-100950",
+ "batch_group": 1,
+ "result": "FAIL",
+ "ended": 1795301120
+}
