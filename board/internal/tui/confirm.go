@@ -52,7 +52,7 @@ const (
 	confirmStop      = "stop"
 	confirmStopLeaf  = "stop-leaf"
 	confirmStopPhase = "stop-phase"
-	confirmSession   = "session"
+	confirmStopJob   = "stop-job"
 )
 
 // confirmAmber is the modal's confirm-phase accent: the border AND the Cancel/Confirm buttons share
@@ -120,20 +120,16 @@ func (m Model) runConfirmed() (tea.Model, tea.Cmd) {
 		}
 		removed, err := dsjobs.ClearFinished(c.id, pins)
 		if err != nil {
-			c.result, c.resultErr = "clear failed: "+sessiontitle.CleanTitle(err.Error()), true
+			c.result, c.resultErr = fmt.Sprintf("cleared %d; ", removed)+sessiontitle.CleanTitle(err.Error()), true
 			m.confirm = &c
 			return m, loadBoard(m.boardEpoch)
 		}
-		c.result = fmt.Sprintf("cleared %d finished", removed)
+		c.result = fmt.Sprintf("cleared %d", removed)
 		c.result += keptWorktreeNote(dsjobs.KeptWorktreeNotices(""))
 		m.confirm = &c
 		return m, loadBoard(m.boardEpoch) // refresh the board behind the result
-	case confirmSession:
-		// Wipe every record in the session (a live run is stopped first) — runs off the Update
-		// goroutine since PurgeRun can block on an engine stop; the modal holds "deleting…".
-		c.phase, c.busy = modalRunning, "deleting…"
-		m.confirm = &c
-		return m, deleteSessionCmd(c.id, m.boardEpoch)
+	case confirmStopJob:
+		return m.runAsync(c, "stopping…", stopJobCmd(c.id, m.boardEpoch))
 	case confirmStop:
 		return m.runAsync(c, "stopping…", stopRunCmd(c.id, m.boardEpoch))
 	case confirmStopLeaf:

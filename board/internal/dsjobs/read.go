@@ -199,6 +199,7 @@ func readJob(id string, batches map[string]*batchFile) (Result, bool) {
 		}
 	}
 	setStatus(&r, j, p, hasProg, word, last)
+	r.Closed = closedJob(r.Status, j)
 	// Wall-clock of a finished job: job ended (else the progress file's last update) minus started.
 	if r.Status != "running" && r.Status != "queued" {
 		end := j.Ended
@@ -273,6 +274,25 @@ func setStatus(r *Result, j jobFile, p progressFile, hasProg bool, word string, 
 	default:
 		r.Status, r.Outcome = "stopped", "no result"
 	}
+}
+
+// closedJob is ds forget's rule (dslib/jobs.py _why_kept): not running, and landed, approved,
+// rejected, or open with its private copy gone.
+func closedJob(status string, j jobFile) bool {
+	if status == "running" || status == "queued" {
+		return false
+	}
+	switch j.Status {
+	case "landed", "approved", "rejected":
+		return true
+	case "open":
+		if j.Project == "" {
+			return false
+		}
+		st, err := os.Stat(j.Dir)
+		return j.Dir != "" && (err != nil || !st.IsDir())
+	}
+	return false
 }
 
 // markerAlive reports whether running/<id>.json names a live pid.

@@ -684,4 +684,114 @@ def cmd_reject(a):
         print(f"skipped {len(skipped)} changed after the job (use --force): {names}")
 
 
+def _live_pid(path, progress=False):
+    """The pid in a running marker (or a running progress file) when that process is alive."""
+    try:
+        obj = json.load(open(path))
+    except (OSError, ValueError):
+        return None
+    if progress and obj.get("state") != "running":
+        return None
+    pid = obj.get("pid")
+    return pid if pid_alive(pid) else None
+
+
+def _why_kept(jid):
+    """Why job jid can't be forgotten (None when it can): it runs, or it is open with work
+    Claude still has to approve or reject."""
+    try:
+        job = json.load(open(os.path.join(JOBS, jid, "job.json")))
+    except (OSError, ValueError):
+        return "unreadable (no job.json)"
+    pid = (_live_pid(os.path.join(RUNNING, jid + ".json"))
+           or _live_pid(os.path.join(PROGRESS, jid + ".json"), progress=True))
+    if pid:
+        return f"running (pid {pid})"
+    st = job.get("status")
+    if st in ("landed", "approved", "rejected"):
+        return None
+    if st == "open" and job.get("project"):
+        if not os.path.isdir(job.get("dir") or ""):
+            return None    # its private copy is gone: nothing left to land or orphan
+        return f"open, its copy {job.get('dir')} is still there; ds approve or ds reject it first"
+    return f"{st}, its changes are in {job.get('dir')}; ds approve or ds reject it first"
+
+
+def forget_job(jid):
+    """Remove a closed job with ds's own cleanup: snapshot refs and index, a leftover copy,
+    progress file, running marker, pin, job dir."""
+    job = json.load(open(os.path.join(JOBS, jid, "job.json")))
+    job.setdefault("id", jid)
+    cleanup_shadow(job)
+    drop_copy(job)
+    for p in (os.path.join(PROGRESS, jid + ".json"), os.path.join(RUNNING, jid + ".json"),
+              os.path.join(PINS, jid)):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    shutil.rmtree(os.path.join(JOBS, jid), ignore_errors=True)
+
+
+def batch_kids(bid, obj):
+    """Every job of batch bid that still has a job dir: the groups' jobs, the fix job, and any
+    job whose job.json names the batch."""
+    kids = [g_.get("job") for g_ in obj.get("groups") or []] + [obj.get("fix_job")]
+    try:
+        names = os.listdir(JOBS)
+    except OSError:
+        names = []
+    for n in names:
+        if n.startswith("b"):
+            continue
+        try:
+            if json.load(open(os.path.join(JOBS, n, "job.json"))).get("batch") == bid:
+                kids.append(n)
+        except (OSError, ValueError):
+            pass
+    return sorted(set(k for k in kids if k and os.path.isdir(os.path.join(JOBS, k))))
+
+
+def _forget_one(jid):
+    """Forget one job or batch; returns (ok, line)."""
+    if not re.fullmatch(r"b?\d{4}-\d{6}(-\d+)?", jid) or not os.path.isdir(os.path.join(JOBS, jid)):
+        return False, f"keep {jid}: no such job"
+    if not jid.startswith("b"):
+        why = _why_kept(jid)
+        if why:
+            return False, f"keep {jid}: {why}"
+        forget_job(jid)
+        return True, f"forgot {jid}"
+    try:
+        obj = json.load(open(batch_path(jid)))
+    except (OSError, ValueError):
+        obj = {}
+    if not obj.get("ended") and pid_alive(obj.get("pid")):
+        return False, f"keep {jid}: running (pid {obj['pid']})"
+    kids = batch_kids(jid, obj)
+    for k in kids:
+        why = _why_kept(k)
+        if why:
+            return False, f"keep {jid}: job {k} is {why}"
+    for k in kids:
+        forget_job(k)
+    try:
+        os.remove(os.path.join(PINS, jid))
+    except OSError:
+        pass
+    shutil.rmtree(os.path.join(JOBS, jid), ignore_errors=True)
+    return True, f"forgot {jid} and its {len(kids)} jobs"
+
+
+def cmd_forget(a):
+    """Hidden, for the board: remove closed jobs and batches completely, one line per id.
+    Open or running ones are kept, with the reason."""
+    bad = 0
+    for jid in a.job:
+        ok, line = _forget_one(jid)
+        print(line)
+        bad += not ok
+    sys.exit(1 if bad else 0)
+
+
 __all__ = [n for n in globals() if not n.startswith("__")]

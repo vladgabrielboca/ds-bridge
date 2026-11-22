@@ -18,7 +18,7 @@ import (
 const CheckPhase = "integration check"
 
 // batchStaleAfter: a batch with no end, no running child and no write for this long is taken as
-// killed (ds records no batch pid). Group transitions rewrite batch.json at once, so a live batch
+// killed. Only for batches from before T5, which recorded no pid. Group transitions rewrite batch.json at once, so a live batch
 // with nothing running is only ever seconds old.
 const batchStaleAfter = 30 * time.Second
 
@@ -42,6 +42,8 @@ type batchFile struct {
 	Ended       *float64     `json:"ended"`
 	Integration string       `json:"integration"`
 	FixJob      string       `json:"fix_job"`
+	PID         int          `json:"pid"`
+	Stopped     bool         `json:"stopped"`
 
 	mtime  time.Time
 	titles []string // phase title per group
@@ -181,6 +183,9 @@ func (b *batchFile) run(kids []Result) WorkflowRun {
 			job = *g.Job
 		}
 		switch {
+		case g.Status == "STOPPED":
+			p.Status, p.Detail = "stopped", "stopped from the board"
+			bad = true
 		case g.Status == "SKIPPED":
 			p.Status, p.Detail = "stopped", "skipped: "+b.skipReason(i, byID)
 			bad = true
@@ -229,13 +234,22 @@ func (b *batchFile) run(kids []Result) WorkflowRun {
 		if bad {
 			r.Status = "failed"
 		}
-	case anyRunning || time.Since(b.mtime) < batchStaleAfter:
+		if b.Stopped {
+			r.Status, r.Description = "failed", "stopped"
+		}
+	case b.PID > 0 && isDSProcess(b.PID, b.Started):
+		r.Status = "running"
+	case b.PID == 0 && (anyRunning || time.Since(b.mtime) < batchStaleAfter):
 		r.Status = "running"
 	default:
 		// No end written and nothing running: the batch process was killed.
 		r.Status = "failed"
 		r.Description = "interrupted"
 		r.UpdatedAt = b.mtime.Local().Format(time.RFC3339)
+	}
+	r.Closed = r.Status != "running" && !anyRunning
+	for _, k := range kids {
+		r.Closed = r.Closed && k.Closed
 	}
 	return r
 }

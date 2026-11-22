@@ -134,3 +134,36 @@ Left for later.
 
 - The run header and runs box show no `interrupted` text for a killed batch, only the failed dot (Description isn't rendered anywhere in the ported view).
 - With the cursor on the check phase the header reads `0/0 agents · ↑ 0 · ↓ 0` when no fix job ran.
+
+## T5 (2026-11-22): stop, delete, clear, pin
+
+Same branch and worktree, not committed yet.
+
+What changed, Python.
+
+- `ds forget ID...` (hidden; in `dslib/jobs.py`). One line per id, `forgot X` or `keep X: <why>`, exit 1 if any id was kept. Closed means: not running (live pid in `running/<id>.json` or a running progress file), and job.json status landed, approved or rejected, or open with its private copy dir gone. An open in-place job and an open job whose copy exists are kept with "ds approve or ds reject it first". Removal reuses `cleanup_shadow` (refs + index) and `drop_copy`, then removes progress, running marker, pin and the job dir. A batch id needs every child closed (groups' jobs, fix_job, and any job.json naming the batch) and no live batch pid; it then forgets the children and the batch dir.
+- `dslib/batch.py`: batch.json has `pid`. Children run through `Popen` and are tracked. On SIGTERM (or any exit) the batch stops starting groups, SIGTERMs its live children (each child's own handler interrupts its OpenCode session), waits up to 40 s, marks queued/running groups `STOPPED`, and writes `ended` and `stopped: true`. The integration fix job goes through the same tracked path.
+- `ds board` exports `DS_BIN` (the ds copy that started it), so the board's forget calls the same copy.
+- Tests: 5 new in `tests/test_ds.py` (forget of a landed copy job with refs/copy/progress/pin, the keep reasons, batch kept and forgotten, and a real SIGTERM of a `cmd_batch` with a fake child).
+
+What changed, Go.
+
+- `board/internal/dsjobs/actions.go` replaces the T5 stubs. `isDSProcess` is the pid guard: argv is `python… …/ds <run|revise|reply|research|batch|init>`, and the process started no later than the file that names it (progress `updated`, marker mtime, or batch `started`, +2 s), from `/proc/<pid>/stat` starttime + btime. `StopJob`, `StopRun`, `SendLeafCommand` (stop one batch job) and `SendPhaseCommand` (stop a group's job, found by phase title) send SIGTERM. `DeleteJob`, `PurgeRun` and `ClearFinished` run `ds forget`. `ClearIDs` picks the session's closed, unpinned standalone jobs and batches (batch children go with their batch).
+- `Result.Closed` and `WorkflowRun.Closed` (read.go, batch.go), same rule as forget. Batch: with a pid, running means the pid is a live ds batch; the 30 s mtime rule is kept only for batches without a pid. `STOPPED` group → stopped, detail `stopped from the board`; `stopped: true` → run failed, Description `stopped`.
+- tui: `x` on a job row (boxes and entity level) and on a run row; prompts reworded for ds. `d` opens the confirm and shows ds forget's line (green) or the keep reason (red); a running job says "stop it first (x)". `c` counts first ("Clear N closed, unpinned job(s) or batch(es)"), red frame, result `cleared N`, plus the keep reasons if any. The sessions level had cc-fleet's "delete every record" wipe; removed, `c` there clears that session the same way. Footers list `x stop` and `c clear` where they work.
+- Tests: `actions_test.go` (pid guard incl. recycled pid and non-ds argv, StopJob, StopRun, phase stop, stopped batch, Closed, ClearIDs), `TestBoard_StopJob`, the clear modal test un-skipped. Every tui test now runs with `DS_BIN` set to a fake ds, so no test can call the live one.
+
+Live check (board in tmux 150x40, branch ds, scratch project in the session scratchpad).
+
+- Stop: job 1122-171644 running, `x`, Confirm. The card turned `Failed`, Outcome `interrupted`; progress `state: error, last: interrupted`. OpenCode session ses_dsd07906ac99d88ac61590: `outcome: interrupted`, idle at 17:16:57 (the second of the confirm), output tokens 146 and unchanged 15 s later; no `opencode run` left.
+- `d` on that interrupted job: `keep 1122-171644: open, its copy … is still there; ds approve or ds reject it first`.
+- Pin: job 1122-171756 (landed) pinned with `p`, ★ shown. `landed_at` set 2 days back, `gc_landed()` run: still `landed`, both refs kept.
+- `d` on it: `forgot 1122-171756`; job dir, pin, progress file and refs gone.
+- `c` after rejecting 1122-171644: modal said 1 job, result `cleared 1`, job dir gone.
+
+Left for later.
+
+- A batch stop is tested only with a fake child (unit test), not with a live `ds batch`.
+- Batches started by the main ds (no `pid` in batch.json) can't be stopped from the board; it says so.
+- Until the merge, `ds board` from main has no `forget`: delete and clear only work when the board is started by the branch ds.
+- Footers at 150 columns fit; narrower terminals cut them (not checked how cc-fleet handles that).

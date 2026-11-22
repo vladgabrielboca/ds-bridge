@@ -56,9 +56,10 @@ func (m Model) togglePin(kind pinned.Kind, id string) (tea.Model, tea.Cmd) {
 	return m, loadBoard(m.boardEpoch)
 }
 
-// jobCtlMsg carries a job-delete outcome (info modal + reload), epoch-gated.
+// jobCtlMsg carries a job-delete outcome (info modal + reload), epoch-gated; line is ds forget's.
 type jobCtlMsg struct {
 	err   error
+	line  string
 	epoch int
 }
 
@@ -67,6 +68,7 @@ func (jobCtlMsg) owningScreen() screen { return screenSpawn }
 // deleteJobCmd removes a job's files (and its pin) off the Update goroutine.
 func deleteJobCmd(jobID string, epoch int) tea.Cmd {
 	return func() tea.Msg {
-		return jobCtlMsg{err: dsjobs.DeleteJob(jobID), epoch: epoch}
+		line, err := dsjobs.DeleteJob(jobID)
+		return jobCtlMsg{err: err, line: line, epoch: epoch}
 	}
 }

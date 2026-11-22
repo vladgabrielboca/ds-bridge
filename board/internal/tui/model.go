@@ -656,8 +656,13 @@ func phaseCtlCmd(verb, runID, phase string, epoch int) tea.Cmd {
 // accumulate until deleted). Mirrors stopRunCmd's epoch-gated workflowCtlMsg outcome.
 func deleteRunCmd(runID string, epoch int) tea.Cmd {
 	return func() tea.Msg {
-		err := dsjobs.WithRunLock(runID, func() error { return dsjobs.PurgeRun(runID) })
-		return workflowCtlMsg{verb: "delete", runID: runID, err: err, epoch: epoch, kept: keptNotices(runID, err)}
+		var line string
+		err := dsjobs.WithRunLock(runID, func() error {
+			var e error
+			line, e = dsjobs.PurgeRun(runID)
+			return e
+		})
+		return workflowCtlMsg{verb: "delete", runID: runID, err: err, line: line, epoch: epoch, kept: keptNotices(runID, err)}
 	}
 }
 
@@ -690,6 +695,7 @@ type workflowCtlMsg struct {
 	err   error
 	epoch int
 	kept  []string // KeptWorktreeNotices after a successful delete / restart
+	line  string   // ds forget's line for a delete
 }
 
 func (workflowCtlMsg) owningScreen() screen { return screenSpawn }
@@ -705,6 +711,8 @@ func ctlOutcome(verb, runID string, err error) (string, bool) {
 		return "job stop sent", false
 	case "stop-phase":
 		return "group stop sent", false
+	case "stop", "stop-job":
+		return fmt.Sprintf("stop sent to %s: it shows failed · interrupted once ds has stopped its OpenCode session", runID), false
 	}
 	return fmt.Sprintf("%s %s: ok", verb, runID), false
 }
@@ -719,6 +727,8 @@ func runningVerb(kind string) string {
 		return "stop-leaf"
 	case confirmStopPhase:
 		return "stop-phase"
+	case confirmStopJob:
+		return "stop-job"
 	}
 	return ""
 }
@@ -973,6 +983,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// The run id + error are opaque/operator-supplied text, so scrub them before display.
 		runID := shortRunID(sessiontitle.CleanTitle(msg.runID))
 		line, isErr := ctlOutcome(msg.verb, runID, msg.err)
+		if msg.err == nil && msg.line != "" {
+			line = sessiontitle.CleanTitle(msg.line)
+		}
 		line += keptWorktreeNote(msg.kept)
 		// A stop/restart confirmed via the modal waits in modalRunning for exactly this id AND verb —
 		// resolve it in place. Otherwise (a delete/save dispatched on close, or a same-id result for a
@@ -991,27 +1004,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.err != nil {
-			m = m.withInfo("delete job failed: "+sessiontitle.CleanTitle(msg.err.Error()), true)
+			m = m.withInfo(sessiontitle.CleanTitle(msg.err.Error()), true)
 		} else {
-			m = m.withInfo("delete job: ok", false)
-		}
-		return m, loadBoard(m.boardEpoch)
-
-	case sessionDelMsg:
-		if msg.epoch != m.boardEpoch {
-			return m, nil
-		}
-		line, isErr := fmt.Sprintf("deleted %d record(s)", msg.removed), false
-		if msg.err != nil {
-			line, isErr = "delete session failed: "+sessiontitle.CleanTitle(msg.err.Error()), true
-		}
-		// Resolve the running danger modal in place; otherwise (none open) pop an info modal.
-		if m.confirm != nil && m.confirm.phase == modalRunning && m.confirm.kind == confirmSession {
-			c := *m.confirm
-			c.phase, c.result, c.resultErr = modalResult, line, isErr
-			m.confirm = &c
-		} else {
-			m = m.withInfo(line, isErr)
+			m = m.withInfo(sessiontitle.CleanTitle(msg.line), false)
 		}
 		return m, loadBoard(m.boardEpoch)
 
@@ -1125,12 +1120,12 @@ func (m Model) updateAsSessions(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "right", "enter":
 		return m.asDescend()
-	case "d":
-		// Delete EVERY record in the cursored session (a live run is stopped first) — a heavy,
-		// pin-aware wipe behind a red danger confirm. The "(no session)" bucket has no id to target.
+	case "c":
+		// Clear the cursored session's closed, unpinned jobs and batches. The "(no session)"
+		// bucket has no id to target.
 		if ok && m.asSessionCursor >= 0 && m.asSessionCursor < len(p.sessions) {
 			if id := p.sessions[m.asSessionCursor].sessionID; id != "" {
-				return m.openConfirmDanger(confirmSession, id, "Delete EVERY record in this session? Running ones are stopped.")
+				return m.openClear(id)
 			}
 		}
 	case "esc":
@@ -1159,12 +1154,19 @@ func (m Model) updateAsBoxes(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.asBoxCursor = clampIndex(m.asBoxCursor+1, n)
 		return m.focusBoxJobIO()
 	case "d":
-		// A run row confirms a run delete; a job row its delete. Each opens a modal.
+		// A run row confirms a batch delete; a job row its delete. Each opens a modal.
 		if g, onRun := m.boxRun(); onRun {
-			return m.openConfirm(confirmRun, g.runID, "Delete this run and its agents?")
+			return m.openConfirm(confirmRun, g.runID, "Delete batch "+g.runID+" and its jobs? ds forget removes them for good.")
 		}
 		if j, onJob := m.boxJob(); onJob {
-			return m.openConfirm(confirmJob, j.JobID, "Delete this job?")
+			return m.openDeleteJob(j)
+		}
+	case "x":
+		if g, onRun := m.boxRun(); onRun {
+			return m.openStopRun(g.runID, g.status)
+		}
+		if j, onJob := m.boxJob(); onJob {
+			return m.openStopJob(j)
 		}
 	case "p":
 		// Toggle the keep/pin on the cursored row (run / job — any state). A pinned
@@ -1175,7 +1177,7 @@ func (m Model) updateAsBoxes(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "c":
 		// Clear this session's finished (done/failed/stopped) jobs+runs, excluding pinned. Needs a real (non-"(no session)") session.
 		if s, ok := m.focusedSession(); ok && s.sessionID != "" {
-			return m.openConfirm(confirmClear, s.sessionID, "Clear this session's finished tasks?")
+			return m.openClear(s.sessionID)
 		}
 	case "right", "enter":
 		if _, onJob := m.boxJob(); onJob {
@@ -1254,13 +1256,17 @@ func (m Model) updateAsEntity(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "d":
 		if j, ok := m.selectedJob(); ok {
-			return m.openConfirm(confirmJob, j.JobID, "Delete this job?")
+			return m.openDeleteJob(j)
+		}
+	case "x":
+		if j, ok := m.selectedJob(); ok {
+			return m.openStopJob(j)
 		}
 	case "c":
-		// Clear this session's finished records — also reachable here because a single-kind
+		// Clear this session's closed records — also reachable here because a single-kind
 		// session auto-skips the boxes level and lands straight on this entity view.
 		if s, ok := m.focusedSession(); ok && s.sessionID != "" {
-			return m.openConfirm(confirmClear, s.sessionID, "Clear this session's finished tasks?")
+			return m.openClear(s.sessionID)
 		}
 	case "esc":
 		if m.browserOrigin {
@@ -1995,8 +2001,11 @@ func (m Model) stopFocusedPhase() (tea.Model, tea.Cmd) {
 	if g.status != "running" {
 		return m.withInfo("the run is not live — nothing to stop", false), nil
 	}
+	if p.status != "running" {
+		return m.withInfo("this step is not running — nothing to stop", false), nil
+	}
 	m.confirm = &confirmModal{kind: confirmStopPhase, id: g.runID, arg: p.title,
-		prompt: fmt.Sprintf("Stop phase %q? Its agents hold until you restart the phase (one title = one merged target); everything else keeps running.", p.title)}
+		prompt: fmt.Sprintf("Stop step %q? Its job is interrupted and steps that need it are skipped; the other steps keep running.", p.title)}
 	return m, nil
 }
 
@@ -2056,7 +2065,7 @@ func (m Model) stopFocusedLeaf() (tea.Model, tea.Cmd) {
 		return m.withInfo("agent is already held", false), nil
 	case "running", "queued", "":
 		m.confirm = &confirmModal{kind: confirmStopLeaf, id: g.runID, arg: job.JobID,
-			prompt: "Stop just this agent? Its part of the script waits until you restart it; everything else keeps running."}
+			prompt: "Stop job " + job.JobID + "? It is interrupted and steps that need it are skipped; the other steps keep running."}
 		return m, nil
 	default:
 		return m.withInfo("agent already finished", false), nil
@@ -2076,35 +2085,10 @@ func (m Model) wfControl(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.wfBusy(runID) {
 			return m, nil
 		}
-		// There is no per-agent stop — x always stops the WHOLE run; say so plainly (the agent
-		// pane makes it look agent-scoped).
-		return m.openConfirm(confirmStop, runID, "Stop the whole run (all agents)?")
+		g, _ := m.focusedGroup()
+		return m.openStopRun(runID, g.status)
 	}
 	return m, nil
-}
-
-// sessionDelMsg carries the outcome of a whole-session wipe. Owned by screenSpawn; epoch gates a
-// stale result from a prior board visit.
-type sessionDelMsg struct {
-	removed int
-	err     error
-	epoch   int
-}
-
-func (sessionDelMsg) owningScreen() screen { return screenSpawn }
-
-// deleteSessionCmd wipes every record in a session off the Update goroutine (PurgeRun can block on an
-// engine stop). It snapshots pins and fails closed — a pin read error aborts rather than deleting
-// pin-blind — then removes the session's runs/jobs.
-func deleteSessionCmd(sessionID string, epoch int) tea.Cmd {
-	return func() tea.Msg {
-		pins, perr := pinned.Snapshot()
-		if perr != nil {
-			return sessionDelMsg{err: perr, epoch: epoch}
-		}
-		removed, err := dsjobs.DeleteSession(sessionID, pins)
-		return sessionDelMsg{removed: removed, err: err, epoch: epoch}
-	}
 }
 
 // printableRunes drops everything that cannot sit on one line of the box: a bracketed
@@ -2130,4 +2114,56 @@ func Run() error {
 	lipgloss.HasDarkBackground()
 	_, err := tea.NewProgram(NewModel()).Run()
 	return err
+}
+
+// openStopJob is x on a job row: a running job gets the stop confirm (SIGTERM to its ds process,
+// which interrupts the OpenCode session); anything else says why there is nothing to stop.
+func (m Model) openStopJob(j dsjobs.Result) (tea.Model, tea.Cmd) {
+	if j.Status != "running" {
+		return m.withInfo("job "+j.JobID+" is not running — nothing to stop", false), nil
+	}
+	if m.wfBusy(j.JobID) {
+		return m, nil
+	}
+	m.confirm = &confirmModal{kind: confirmStopJob, id: j.JobID,
+		prompt: "Stop job " + j.JobID + "? ds interrupts its OpenCode session; Claude can still revise or reject it."}
+	return m, nil
+}
+
+// openStopRun is x on a batch: only a running one; its running jobs are interrupted and no
+// further step starts.
+func (m Model) openStopRun(runID, status string) (tea.Model, tea.Cmd) {
+	if status != "running" {
+		return m.withInfo("batch "+runID+" is not running — nothing to stop", false), nil
+	}
+	if m.wfBusy(runID) {
+		return m, nil
+	}
+	return m.openConfirm(confirmStop, runID, "Stop batch "+runID+"? Its running jobs are interrupted and no further step starts.")
+}
+
+// openDeleteJob is d on a job row: a closed job gets the delete confirm; an open or running one
+// still goes through ds forget's refusal, so the modal names the reason.
+func (m Model) openDeleteJob(j dsjobs.Result) (tea.Model, tea.Cmd) {
+	if j.Status == "running" || j.Status == "queued" {
+		return m.withInfo("job "+j.JobID+" is running — stop it first (x)", true), nil
+	}
+	return m.openConfirm(confirmJob, j.JobID, "Delete job "+j.JobID+"? ds forget removes it for good.")
+}
+
+// openClear is c: the count of the session's closed, unpinned jobs and batches, then the confirm.
+func (m Model) openClear(sessionID string) (tea.Model, tea.Cmd) {
+	n := len(dsjobs.ClearIDs(m.jobs, m.workflowRuns, sessionID, m.pins))
+	if n == 0 {
+		return m.withInfo("nothing to clear: no closed, unpinned jobs in this session", false), nil
+	}
+	what := fmt.Sprintf("%d closed, unpinned job(s) or batch(es)", n)
+	return m.openConfirmDanger(confirmClear, sessionID, "Clear "+what+" of this session? ds forget removes them for good.")
+}
+
+// stopJobCmd sends the stop off the Update goroutine; the outcome resolves the running modal.
+func stopJobCmd(jobID string, epoch int) tea.Cmd {
+	return func() tea.Msg {
+		return workflowCtlMsg{verb: "stop-job", runID: jobID, err: dsjobs.StopJob(jobID), epoch: epoch}
+	}
 }

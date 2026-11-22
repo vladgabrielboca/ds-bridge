@@ -13,12 +13,21 @@ import (
 	"ds-bridge/board/internal/pinned"
 )
 
-// pinState points the pin registry at a fresh temp state dir for one test.
+// pinState points the pin registry and the data layer at a fresh temp state dir for one test, and
+// DS_BIN at a fake ds that logs its args to STATE/ds-args and prints "forgot ID" per id, so no
+// test ever runs the real ds.
 func pinState(t *testing.T) {
 	t.Helper()
-	old := pinned.StateDir
-	pinned.StateDir = t.TempDir()
-	t.Cleanup(func() { pinned.StateDir = old })
+	oldP, oldD := pinned.StateDir, dsjobs.StateDir
+	dir := t.TempDir()
+	pinned.StateDir, dsjobs.StateDir = dir, dir
+	t.Cleanup(func() { pinned.StateDir, dsjobs.StateDir = oldP, oldD })
+	fake := filepath.Join(dir, "fake-ds")
+	script := "#!/bin/sh\necho \"$@\" >> " + filepath.Join(dir, "ds-args") + "\nshift\nfor id; do echo \"forgot $id\"; done\n"
+	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DS_BIN", fake)
 }
 
 // pinHas point-queries the registry the way production does (Snapshot + Set.Has).
@@ -38,7 +47,7 @@ func TestBoard_ClearFailsClosedOnPinError(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(pinned.StateDir, "pins"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runs := []dsjobs.WorkflowRun{{RunID: "r1", SessionID: "s", Status: "done", StartedAt: "2026-06-01T00:00:20Z"}}
+	runs := []dsjobs.WorkflowRun{{RunID: "r1", SessionID: "s", Status: "done", Closed: true, StartedAt: "2026-06-01T00:00:20Z"}}
 	m := runsModel(t, nil, runs, nil)
 	m, _ = press(t, m, "c")
 	m, _ = press(t, m, "right") // select Confirm
@@ -95,7 +104,7 @@ func TestOverlayCenter_PreservesSides(t *testing.T) {
 // session auto-lands), opening the clear confirm for the focused session.
 func TestBoard_ClearAtEntityLevel(t *testing.T) {
 	pinState(t)
-	jobs := []dsjobs.Result{{OK: true, JobID: "j1", Status: "done", LeadSessionID: "s"}}
+	jobs := []dsjobs.Result{{OK: true, JobID: "j1", Status: "done", LeadSessionID: "s", Closed: true}}
 	m := boardModel(t, jobs)
 	if m.asMode != asModeEntity {
 		t.Fatalf("a jobs-only single session should land at the entity level: mode=%d", m.asMode)
@@ -158,9 +167,14 @@ func TestBoard_PinToggleAndRender(t *testing.T) {
 // TestBoard_ClearFinished_Modal: `c` opens a clear confirm; enter runs the clear in place and shows
 // its green result in the modal; any key then dismisses it; esc cancels from the confirm phase.
 func TestBoard_ClearFinished_Modal(t *testing.T) {
-	t.Skip("T5: dsjobs.ClearFinished is still a stub")
 	pinState(t)
-	runs := []dsjobs.WorkflowRun{{RunID: "r1", SessionID: "s", Status: "done", StartedAt: "2026-06-01T00:00:20Z"}}
+	// on disk: one approved job of session s (cleared) and one open in-place job (kept)
+	for id, st := range map[string]string{"1122-100001": "approved", "1122-100002": "open"} {
+		d := filepath.Join(dsjobs.StateDir, "jobs", id)
+		os.MkdirAll(d, 0o700)
+		os.WriteFile(filepath.Join(d, "job.json"), []byte(`{"id":"`+id+`","status":"`+st+`","owner":"s","dir":"/x","result":"OK","started":1}`), 0o600)
+	}
+	runs := []dsjobs.WorkflowRun{{RunID: "r1", SessionID: "s", Status: "done", Closed: true, StartedAt: "2026-06-01T00:00:20Z"}}
 	m := runsModel(t, nil, runs, nil)
 
 	m, cmd := press(t, m, "c")
@@ -181,8 +195,11 @@ func TestBoard_ClearFinished_Modal(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("Confirm + enter should reload the board behind the result")
 	}
-	if m.confirm == nil || !strings.Contains(m.confirm.result, "cleared") {
-		t.Fatalf("after confirm the modal should show a 'cleared …' result, got %+v", m.confirm)
+	if m.confirm == nil || m.confirm.result != "cleared 1" || m.confirm.resultErr {
+		t.Fatalf("after confirm the modal should show 'cleared 1', got %+v", m.confirm)
+	}
+	if args, _ := os.ReadFile(filepath.Join(dsjobs.StateDir, "ds-args")); string(args) != "forget 1122-100001\n" {
+		t.Fatalf("clear should call ds forget once with the closed job only, got %q", args)
 	}
 	if !strings.Contains(m.View(), "cleared") {
 		t.Fatalf("the cleared result should render in the modal:\n%s", m.View())
@@ -240,5 +257,39 @@ func TestBoard_PinRapidToggle(t *testing.T) {
 	m, _ = press(t, m, "p") // reads the optimistic state → synchronous unpin
 	if pinHas(pinned.Run, "r1") {
 		t.Error("a rapid pin+unpin should end unpinned, not double-pinned")
+	}
+}
+
+// TestBoard_StopJob: x on a running job opens the stop confirm; Confirm holds the modal in its
+// running stage until the stop outcome resolves it. x on a finished job only says why.
+func TestBoard_StopJob(t *testing.T) {
+	pinState(t)
+	jobs := []dsjobs.Result{{JobID: "1122-100001", Status: "running", LeadSessionID: "s"}}
+	m := boardModel(t, jobs)
+	m, cmd := press(t, m, "x")
+	if cmd != nil || m.confirm == nil || m.confirm.kind != confirmStopJob || m.confirm.id != "1122-100001" {
+		t.Fatalf("x on a running job should open the stop confirm: %+v", m.confirm)
+	}
+	m, _ = press(t, m, "right")
+	m, cmd = press(t, m, "enter")
+	if cmd == nil || m.confirm == nil || m.confirm.phase != modalRunning {
+		t.Fatalf("Confirm should dispatch the stop and hold the modal: %+v", m.confirm)
+	}
+	msg, ok := cmd().(workflowCtlMsg)
+	if !ok || msg.verb != "stop-job" || msg.err == nil {
+		// the temp state has no progress file, so StopJob must refuse
+		t.Fatalf("stop outcome: %+v", msg)
+	}
+	next, _ := m.Update(msg)
+	m = next.(Model)
+	if m.confirm == nil || m.confirm.phase != modalResult || !m.confirm.resultErr ||
+		!strings.Contains(m.confirm.result, "not running") {
+		t.Fatalf("the refusal should resolve the modal in red: %+v", m.confirm)
+	}
+
+	done := boardModel(t, []dsjobs.Result{{JobID: "1122-100002", Status: "done", LeadSessionID: "s"}})
+	done, _ = press(t, done, "x")
+	if done.confirm == nil || done.confirm.phase != modalResult || !strings.Contains(done.confirm.result, "not running") {
+		t.Fatalf("x on a finished job should only explain: %+v", done.confirm)
 	}
 }

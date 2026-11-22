@@ -185,10 +185,10 @@ func (m Model) renderAsFooter() string {
 	case asModeProjects:
 		hint = "↑/↓ project · →/⏎ open · ctrl+f find · r refresh · esc/tab/q quit"
 	case asModeSessions:
-		hint = "↑/↓ session · →/⏎ open · d delete · ← back · ctrl+f find · r refresh · esc/tab/q quit"
+		hint = "↑/↓ session · →/⏎ open · c clear · ← back · ctrl+f find · r refresh · esc/tab/q quit"
 	case asModeEntity:
 		// A job IS a record, so it is deletable here.
-		hint = "↑/↓ row · j/k scroll · ⏎ expand · p pin · d delete · c clear · ←/esc back · r refresh · q quit"
+		hint = "↑/↓ row · j/k scroll · ⏎ expand · x stop · p pin · d delete · c clear · ←/esc back · r refresh · q quit"
 	case asModeRunPhases:
 		hint = "↑/↓ phase · → agents · x stop · ←/esc back · r refresh · q quit"
 	case asModeRunAgent:
@@ -199,9 +199,9 @@ func (m Model) renderAsFooter() string {
 	default:
 		_, onJob := m.boxJob()
 		if onJob {
-			hint = "↑/↓ row · j/k scroll · ⏎ expand · p pin · d delete · c clear · ←/esc back · r refresh · q quit"
+			hint = "↑/↓ row · j/k scroll · ⏎ expand · x stop · p pin · d delete · c clear · ←/esc back · r refresh · q quit"
 		} else { // a run row
-			hint = "↑/↓ row · →/⏎ detail · p pin · d delete · c clear · ← back · r refresh · esc/tab/q quit"
+			hint = "↑/↓ row · →/⏎ detail · x stop · p pin · d delete · c clear · ← back · r refresh · esc/tab/q quit"
 		}
 	}
 	return footer(hint)

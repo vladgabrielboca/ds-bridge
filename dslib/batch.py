@@ -127,7 +127,7 @@ def cmd_batch(a):
                     "owner": os.environ.get("CLAUDE_CODE_SESSION_ID", ""), "started": int(t0),
                     "groups": [{"label": labels[i], "steps": [st["id"] for st in g], "needs": needs[i],
                                 "job": None, "status": "queued"} for i, g in enumerate(groups)],
-                    "check": a.check or plan["check"], "ended": None})
+                    "check": a.check or plan["check"], "ended": None, "pid": os.getpid()})
     update_batch(bid, init)
 
     def set_group(i, **kw):
@@ -140,10 +140,31 @@ def cmd_batch(a):
     lock = threading.Lock()
     slots = threading.Semaphore(max(1, int(a.parallel or c.get("max_parallel", 6))))
     done_ev = [threading.Event() for _ in groups]
+    stopping = threading.Event()    # set on SIGTERM (the board's x): start nothing new
+    procs = []                      # the child ds processes, so a stop can pass it on
+
+    def child(argv, task, env):
+        """Run one child ds; (exit code, stdout, stderr). A stop SIGTERMs it, and the child's
+        own handler then interrupts its OpenCode session."""
+        p_ = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, env=env, cwd=d)
+        with lock:
+            procs.append(p_)
+        if stopping.is_set():
+            p_.terminate()
+        so, se = p_.communicate(task)
+        return p_.returncode, so, se
+
+    def stopped(i):
+        results[i] = {"status": "STOPPED", "line": f"STOPPED step {labels[i]}", "block": ""}
+        set_group(i, status="STOPPED")
+        done_ev[i].set()
 
     def run_group(i):
         for j in after[i] + needs[i]:
             done_ev[j].wait()
+        if stopping.is_set():
+            return stopped(i)
         # a step may only build on a dependency that is in the project: OK alone is not enough
         failed_dep = next((j for j in needs[i] if (results[j] or {}).get("status") != "OK"
                            or not (results[j] or {}).get("landed")), None)
@@ -173,11 +194,15 @@ def cmd_batch(a):
             argv += ["--timeout", str(a.timeout)]
         argv += ["--paths", *gfiles[i], "-"]
         with slots:
+            if stopping.is_set():
+                return stopped(i)
             set_group(i, status="running")
             env = dict(os.environ, DS_CHILD="1", DS_BATCH=bid, DS_BATCH_GROUP=str(i))
             env.pop("DS_OUT", None)
-            r = subprocess.run(argv, input=task, capture_output=True, text=True, env=env, cwd=d)
-        out = (r.stdout or "") + (("\n" + r.stderr.strip()) if r.returncode and r.stderr.strip() else "")
+            code, so, se = child(argv, task, env)
+        if stopping.is_set():
+            return stopped(i)
+        out = (so or "") + (("\n" + se.strip()) if code and se.strip() else "")
         first = out.strip().splitlines()[0] if out.strip() else f"ERROR step {labels[i]}: no output"
         status = first.split()[0] if first.split() else "ERROR"
         if status not in ("OK", "FAIL", "BLOCKED", "CONFLICT", "PARTIAL", "PROVIDER", "ERROR", "LIMIT"):
@@ -190,41 +215,66 @@ def cmd_batch(a):
         set_group(i, status=status, job=jid)
         done_ev[i].set()
 
-    threads = [threading.Thread(target=run_group, args=(i,), daemon=True) for i in range(len(groups))]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    integ, integ_lines, fix_line = "none", [], ""
-    check = a.check or plan["check"]
-    landed_any = any((r_ or {}).get("landed") for r_ in results)
-    if check and landed_any and all((r_ or {}).get("status") in ("OK", "SKIPPED") for r_ in results):
-        chk = run_check(d, check, c["check_timeout_s"])
-        integ = "pass" if chk["pass"] else "fail"
-        if not chk["pass"]:
-            tail = error_tail(chk["output"], d)
-            task = (f"Steps {', '.join(labels)} of the plan '{plan['title']}' were done by separate jobs and "
-                    f"have all landed, but together they fail `{check}`:\n" + "\n".join(tail) +
-                    "\nFix the cause so it passes, keeping every step's intent.")
-            env = dict(os.environ, DS_CHILD="1", DS_BATCH=bid)
-            env.pop("DS_OUT", None)
-            r = subprocess.run([sys.executable, DS_BIN, "run", "-C", d, "--check", check,
-                                *(["-m", resolve_model(a.m)] if a.m else []),
-                                "-"], input=task, capture_output=True, text=True, env=env, cwd=d)
-            fix_out = (r.stdout or "").strip()
-            fix_line = fix_out.splitlines()[0] if fix_out else "ERROR fix job: no output"
-            if fix_line.startswith("OK") and " landed" in fix_line:
-                integ = "pass (after fix job)"
-            else:
-                integ_lines = ["integration error:"] + ["  " + l_ for l_ in tail[:12]] + ["fix job:"] + \
-                              ["  " + l_ for l_ in fix_out.splitlines()[:12]]
-    fw = fix_line.split()
-    fix_jid = fw[1] if len(fw) > 1 and re.fullmatch(r"\d{4}-\d{6}(-\d+)?", fw[1]) else None
+    def stop_all():
+        """SIGTERM (the board's x): stop the children, mark what never ran, end the batch."""
+        stopping.set()
+        with lock:
+            live = [p_ for p_ in procs if p_.poll() is None]
+        for p_ in live:
+            p_.terminate()
+        until = time.time() + 40         # a child's own stop waits up to 15 s on OpenCode
+        for p_ in live:
+            try:
+                p_.wait(timeout=max(1, until - time.time()))
+            except subprocess.TimeoutExpired:
+                p_.kill()
 
-    def fin(obj):
-        obj.update({"ended": int(time.time()), "integration": integ,
-                    **({"fix_job": fix_jid} if fix_jid else {})})
-    update_batch(bid, fin)
+        def fn(obj):
+            for g_ in obj.get("groups") or []:
+                if g_.get("status") in ("queued", "running"):
+                    g_["status"] = "STOPPED"
+            obj.update({"ended": int(time.time()), "integration": obj.get("integration") or "none",
+                        "stopped": True})
+        update_batch(bid, fn)
+
+    integ, integ_lines, fix_line = "none", [], ""
+    try:
+        threads = [threading.Thread(target=run_group, args=(i,), daemon=True) for i in range(len(groups))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        check = a.check or plan["check"]
+        landed_any = any((r_ or {}).get("landed") for r_ in results)
+        if check and landed_any and all((r_ or {}).get("status") in ("OK", "SKIPPED") for r_ in results):
+            chk = run_check(d, check, c["check_timeout_s"])
+            integ = "pass" if chk["pass"] else "fail"
+            if not chk["pass"]:
+                tail = error_tail(chk["output"], d)
+                task = (f"Steps {', '.join(labels)} of the plan '{plan['title']}' were done by separate jobs and "
+                        f"have all landed, but together they fail `{check}`:\n" + "\n".join(tail) +
+                        "\nFix the cause so it passes, keeping every step's intent.")
+                env = dict(os.environ, DS_CHILD="1", DS_BATCH=bid)
+                env.pop("DS_OUT", None)
+                _, so, _ = child([sys.executable, DS_BIN, "run", "-C", d, "--check", check,
+                                  *(["-m", resolve_model(a.m)] if a.m else []), "-"], task, env)
+                fix_out = (so or "").strip()
+                fix_line = fix_out.splitlines()[0] if fix_out else "ERROR fix job: no output"
+                if fix_line.startswith("OK") and " landed" in fix_line:
+                    integ = "pass (after fix job)"
+                else:
+                    integ_lines = ["integration error:"] + ["  " + l_ for l_ in tail[:12]] + ["fix job:"] + \
+                                  ["  " + l_ for l_ in fix_out.splitlines()[:12]]
+        fw = fix_line.split()
+        fix_jid = fw[1] if len(fw) > 1 and re.fullmatch(r"\d{4}-\d{6}(-\d+)?", fw[1]) else None
+
+        def fin(obj):
+            obj.update({"ended": int(time.time()), "integration": integ,
+                        **({"fix_job": fix_jid} if fix_jid else {})})
+        update_batch(bid, fin)
+    except BaseException:
+        stop_all()
+        raise
     n_ok = sum(1 for r_ in results if r_ and r_["status"] == "OK")
     out = [f"BATCH {bid} groups={len(groups)} ok={n_ok} not_ok={len(groups) - n_ok} "
            f"integration={integ} {int(time.time() - t0)}s"]

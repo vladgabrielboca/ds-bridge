@@ -3,12 +3,6 @@
 // subagent.WorkflowRun). Jobs are read in read.go; batches come in T4.
 package dsjobs
 
-import (
-	"errors"
-
-	"ds-bridge/board/internal/pinned"
-)
-
 // StateDir is the ds state dir (~/.local/share/ds-bridge, or --state). Set by main.
 var StateDir string
 
@@ -59,6 +53,10 @@ type Result struct {
 	Kind string
 	// Tools is job.json tools (summed over rounds): the tool count of a finished job.
 	Tools int
+	// Closed: not running and nothing left for Claude to approve or reject (job.json status
+	// landed, approved or rejected, or open with its private copy gone). ds forget decides for
+	// real; the board uses this for the clear count.
+	Closed bool
 }
 
 // RunPhase is one phase (ds: batch group) of a run.
@@ -81,46 +79,15 @@ type WorkflowRun struct {
 	Status      string
 	SessionID   string
 	Cwd         string
+	// Closed: the batch is not running and every job of it is Closed.
+	Closed bool
 }
 
 // ErrCodeStopped is the ErrorCode of a job finalized by a stop (a stop, not a failure).
 const ErrCodeStopped = "SUBAGENT_STOPPED"
 
-// errNotYet is what the T5 actions return until they are built.
-var errNotYet = errors.New("not available yet (ticket T5)")
-
-// The actions below come in T5 (stop, delete, clear). Until then they refuse.
-
-// StopRun stops a running batch.
-func StopRun(runID string) (bool, error) { return false, errNotYet }
-
-// PurgeRun deletes a closed batch.
-func PurgeRun(runID string) error { return errNotYet }
-
 // WithRunLock runs fn (ds batches need no lock on the board side).
 func WithRunLock(runID string, fn func() error) error { return fn() }
 
-// DeleteJob deletes a closed job.
-func DeleteJob(jobID string) error { return errNotYet }
-
-// StopJob stops a running job.
-func StopJob(jobID string) error { return errNotYet }
-
-// DeleteSession deletes every closed, unpinned job of a session; returns how many.
-func DeleteSession(sessionID string, pins pinned.Set) (int, error) {
-	return 0, errNotYet
-}
-
-// ClearFinished deletes every closed, unpinned job of a session; returns how many.
-func ClearFinished(sessionID string, pins pinned.Set) (int, error) {
-	return 0, errNotYet
-}
-
 // KeptWorktreeNotices lists worktrees a delete kept (none for ds: the Python side owns them).
 func KeptWorktreeNotices(runID string) []string { return nil }
-
-// SendLeafCommand stops one job of a batch (verb "stop-leaf").
-func SendLeafCommand(runID, verb, leafID string) error { return errNotYet }
-
-// SendPhaseCommand stops one group of a batch (verb "stop-phase").
-func SendPhaseCommand(runID, verb, phase string) error { return errNotYet }

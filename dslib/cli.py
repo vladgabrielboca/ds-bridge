@@ -81,6 +81,8 @@ def cmd_board(args):
     if not os.access(BOARD_BIN, os.X_OK):
         sys.stderr.write("ds-board not built: run ./install.sh (needs go)\n")
         sys.exit(1)
+    # the board's delete and clear call back into this same ds copy
+    os.environ["DS_BIN"] = DS_BIN
     os.execv(BOARD_BIN, [BOARD_BIN] + args)
 
 
@@ -123,6 +125,8 @@ def main():
     r = s.add_parser("wait"); r.add_argument("job"); r.add_argument("--max", type=int)
     r.add_argument("--until-done", action="store_true", help="no time limit; run it with Bash run_in_background")
     r.set_defaults(fn=cmd_wait)
+    r = s.add_parser("forget"); r.add_argument("job", nargs="+")   # hidden: the board's delete
+    r.set_defaults(fn=cmd_forget)
     r = s.add_parser("reject"); r.add_argument("job")
     r.add_argument("--force", action="store_true"); r.set_defaults(fn=cmd_reject)
     r = s.add_parser("cost"); r.add_argument("session", nargs="?")

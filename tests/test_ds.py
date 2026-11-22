@@ -316,5 +316,120 @@ with tempfile.TemporaryDirectory() as st:
     finally:
         R.JOBS, RES.JOBS, RES.PINS, B.JOBS, B.DS_BIN = saved
 
+# board actions (T5): ds forget, and a batch stopped by SIGTERM. Both run ds in a subprocess with
+# HOME in a temp dir, so STATE is there.
+with tempfile.TemporaryDirectory() as h:
+    h = os.path.realpath(h)
+    S = os.path.join(h, ".local/share/ds-bridge")
+    env = dict(os.environ, HOME=h, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@t")
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+
+    def mkjob(jid, **kw):
+        os.makedirs(os.path.join(S, "jobs", jid), exist_ok=True)
+        json.dump({"id": jid, "round": 1, **kw}, open(os.path.join(S, "jobs", jid, "job.json"), "w"))
+
+    def forget(*ids):
+        r = subprocess.run([sys.executable, os.path.join(HERE, "ds"), "forget", *ids],
+                           capture_output=True, text=True, env=env)
+        return r.returncode, r.stdout.strip().splitlines()
+
+    gd = os.path.join(S, "shadow", "x")
+    subprocess.run(["git", "init", "-q", "--bare", gd], check=True)
+    tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    commit = subprocess.run(["git", f"--git-dir={gd}", "commit-tree", tree, "-m", "s"], env=env,
+                            capture_output=True, text=True, check=True).stdout.strip()
+    for jid in ("1122-100001", "1122-100009"):
+        subprocess.run(["git", f"--git-dir={gd}", "update-ref", f"refs/ds/{jid}/base", commit], check=True)
+    copy = os.path.join(S, "work", "1122-100001")
+    os.makedirs(copy)
+    mkjob("1122-100001", status="landed", project=os.path.join(h, "p"), dir=copy, shadow=gd)
+    open(os.path.join(S, "jobs", "1122-100001", "index"), "w").close()
+    for sub in ("progress", "pins"):
+        os.makedirs(os.path.join(S, sub), exist_ok=True)
+    json.dump({"state": "done"}, open(os.path.join(S, "progress", "1122-100001.json"), "w"))
+    open(os.path.join(S, "pins", "1122-100001"), "w").close()
+    code, out = forget("1122-100001")
+    refs = subprocess.run(["git", f"--git-dir={gd}", "for-each-ref", "--format=%(refname)"],
+                          capture_output=True, text=True).stdout.split()
+    check("forget: a landed job goes completely (dir, copy, refs, progress, pin), other refs stay",
+          (code, out) == (0, ["forgot 1122-100001"]) and refs == ["refs/ds/1122-100009/base"]
+          and not any(os.path.exists(p) for p in (os.path.join(S, "jobs", "1122-100001"), copy,
+                      os.path.join(S, "progress", "1122-100001.json"), os.path.join(S, "pins", "1122-100001"))),
+          f"{code} {out} {refs}")
+    mkjob("1122-100002", status="open", dir=os.path.join(h, "p"))                    # in place
+    os.makedirs(os.path.join(S, "work", "1122-100003"))
+    mkjob("1122-100003", status="open", project=os.path.join(h, "p"), dir=os.path.join(S, "work", "1122-100003"))
+    mkjob("1122-100004", status="approved")
+    os.makedirs(os.path.join(S, "running"))
+    json.dump({"pid": os.getpid()}, open(os.path.join(S, "running", "1122-100004.json"), "w"))
+    mkjob("1122-100005", status="open", project=os.path.join(h, "p"), dir=os.path.join(S, "work", "gone"))
+    code, out = forget("1122-100002", "1122-100003", "1122-100004", "1122-100005", "1122-999999", "../x")
+    check("forget: open, running and unknown ids are kept with one line each; an open job whose copy is gone goes",
+          code == 1 and len(out) == 6 and out[0].startswith("keep 1122-100002: open, its changes are in")
+          and out[1].startswith("keep 1122-100003: open, its copy") and "ds reject" in out[1]
+          and out[2] == f"keep 1122-100004: running (pid {os.getpid()})" and out[3] == "forgot 1122-100005"
+          and out[4] == "keep 1122-999999: no such job" and out[5] == "keep ../x: no such job"
+          and os.path.isdir(os.path.join(S, "jobs", "1122-100003")), str(out))
+    bdir = os.path.join(S, "jobs", "b1122-110000")
+    os.makedirs(bdir)
+    json.dump({"id": "b1122-110000", "ended": 5, "pid": os.getpid(),
+               "groups": [{"job": "1122-110001"}, {"job": None}], "fix_job": "1122-110003"},
+              open(os.path.join(bdir, "batch.json"), "w"))
+    mkjob("1122-110001", status="approved", batch="b1122-110000")
+    mkjob("1122-110002", status="open", batch="b1122-110000", dir=os.path.join(h, "p"))   # found by its job.json
+    mkjob("1122-110003", status="landed", batch="b1122-110000")
+    code, out = forget("b1122-110000")
+    check("forget: a batch with an open job is kept, nothing removed",
+          code == 1 and out[0].startswith("keep b1122-110000: job 1122-110002 is open")
+          and os.path.isdir(os.path.join(S, "jobs", "1122-110001")), str(out))
+    mkjob("1122-110002", status="rejected", batch="b1122-110000")
+    open(os.path.join(S, "pins", "b1122-110000"), "w").close()
+    code, out = forget("b1122-110000")
+    check("forget: a closed batch goes with its 3 jobs and its pin",
+          (code, out) == (0, ["forgot b1122-110000 and its 3 jobs"]) and not any(
+              os.path.exists(os.path.join(S, x)) for x in ("jobs/b1122-110000", "jobs/1122-110001",
+                                                           "jobs/1122-110002", "jobs/1122-110003", "pins/b1122-110000")),
+          str(out))
+
+    # a batch stopped with SIGTERM: the running child gets SIGTERM, nothing new starts, batch.json ends
+    fake = os.path.join(h, "fake-ds")
+    open(fake, "w").write("import os, signal, sys, time\nsys.stdin.read()\n"
+                          "def term(*_):\n    open(%r, 'w').close()\n    sys.exit(143)\n"
+                          "signal.signal(signal.SIGTERM, term)\ntime.sleep(30)\n" % os.path.join(h, "got-term"))
+    planf = os.path.join(h, "plan.md")
+    open(planf, "w").write("# T\n\n## a first\nfiles: a.py\ndo: x\n\n## b second\nfiles: b.py\ndo: y\nneeds: a\n")
+    runner = ("import sys, argparse; sys.path.insert(0, %r); import dslib.cli as ds; import dslib.batch as B\n"
+              "B.DS_BIN = %r; ds.install_signal_handlers()\n"
+              "B.cmd_batch(argparse.Namespace(C=%r, plan=%r, steps=None, parallel=2, m=None, check=None,"
+              " source=None, brief=None, timeout=None))\n" % (HERE, fake, h, planf))
+    bp = subprocess.Popen([sys.executable, "-c", runner], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    bj, t0 = {}, time.time()
+    while time.time() - t0 < 10:
+        for n in os.listdir(os.path.join(S, "jobs")):
+            if n.startswith("b1") and n != "b1122-110000":
+                try:
+                    bj = json.load(open(os.path.join(S, "jobs", n, "batch.json")))
+                except (OSError, ValueError):
+                    pass
+        if (bj.get("groups") or [{}])[0].get("status") == "running":
+            break
+        time.sleep(0.1)
+    time.sleep(0.5)       # the fake child sets its handler
+    bp.terminate()
+    try:
+        bp.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        bp.kill()
+    try:
+        bj = json.load(open(os.path.join(S, "jobs", bj.get("id", "?"), "batch.json")))
+    except (OSError, ValueError):
+        pass
+    check("batch stop: pid recorded, child got SIGTERM, every group STOPPED, ended, stopped",
+          bj.get("pid") == bp.pid and os.path.exists(os.path.join(h, "got-term"))
+          and [g_.get("status") for g_ in bj.get("groups") or []] == ["STOPPED", "STOPPED"]
+          and bj.get("ended") and bj.get("stopped") is True and bp.returncode == 128 + 15,
+          json.dumps(bj) + f" rc={bp.returncode} err={bp.stderr.read().decode()[-300:]}")
+
 print("\n%d failed" % len(fails) if fails else "\nall passed")
 sys.exit(1 if fails else 0)
