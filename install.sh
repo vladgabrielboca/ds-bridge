@@ -440,6 +440,19 @@ link_ds() {
     esac
 }
 
+# build_board compiles the Go Agents Board into $BIN_DIR/ds-board when go is on PATH.
+build_board() {
+    if ! command -v go >/dev/null 2>&1; then
+        say "skipped ds-board (go not on PATH; ds board needs it)"
+        return 0
+    fi
+    if (cd "$DIR/board" && go build -o "$BIN_DIR/ds-board" .); then
+        say "built $BIN_DIR/ds-board"
+    else
+        warn "ds-board build failed; ds board stays unavailable"
+    fi
+}
+
 unlink_ds() {
     if [ -L "$LINK" ] && [ "$(readlink -f "$LINK")" = "$DIR/ds" ]; then
         rm -f "$LINK"
@@ -513,6 +526,7 @@ do_install() {
     say "merged worker + researcher agents into $OC"
 
     link_ds
+    build_board
 
     mkdir -p "$CLAUDE_DIR"
     py_set_statusline

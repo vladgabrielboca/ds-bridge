@@ -29,6 +29,7 @@ only ever reads: the worker's short report + a capped diff.
   ds log   JOB [--tools-only]                      readable session transcript
   ds delegate on|off|status [--session ID]         per-chat delegation mode
   ds playbook                                      the planner rules + brief template
+  ds board [--state DIR]                           Agents Board TUI (built by ./install.sh, needs go)
 
 Briefs are linted (config "brief_lint", default true): a run task needs the
 sections GOAL / FILES / STEPS (numbered) / DO NOT / DONE WHEN, at least
@@ -72,7 +73,20 @@ from .batch import *  # noqa: F401,F403
 from .info import *  # noqa: F401,F403
 
 
+BOARD_BIN = os.path.expanduser("~/.local/bin/ds-board")
+
+
+def cmd_board(args):
+    """Exec the Go board binary with the remaining args; it never returns on success."""
+    if not os.access(BOARD_BIN, os.X_OK):
+        sys.stderr.write("ds-board not built: run ./install.sh (needs go)\n")
+        sys.exit(1)
+    os.execv(BOARD_BIN, [BOARD_BIN] + args)
+
+
 def main():
+    if sys.argv[1:2] == ["board"]:
+        cmd_board(sys.argv[2:])  # before argparse: every later arg belongs to ds-board
     install_signal_handlers()
     p = argparse.ArgumentParser(prog="ds", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
