@@ -427,11 +427,95 @@ def watch_session(meter, get_sid, stop, on_label, tick):
             pass
 
 
+# Key-like strings, ported from cc-fleet internal/redact/redact.go (MaskKeyLikeString).
+KEY_PATTERNS = [re.compile(r"(?i)sk-[A-Za-z0-9_\-]{8,}"),
+                re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{8,}"),
+                re.compile(r"(?i)x-api-key\s*[:=]\s*[A-Za-z0-9._\-]{8,}")]
+KEY_REDACTED = "sk-[REDACTED]"
+ACTIVITY_ARG_MAX = 200
+# tools that write files: their activity arg is the path only, never the content
+WRITE_TOOLS = {"edit", "write", "patch", "apply_patch", "multiedit"}
+
+
+def mask_keys(s):
+    for pat in KEY_PATTERNS:
+        s = pat.sub(KEY_REDACTED, s)
+    return s
+
+
+def tool_detail(nm, inp, shells=("shell", "bash")):
+    """The one-line detail of a tool call: shell command, else path or pattern."""
+    if nm in shells:
+        return inp.get("command") or ""
+    return inp.get("path") or inp.get("filePath") or inp.get("pattern") or ""
+
+
+class Activity:
+    """jobs/<id>/activity.jsonl: one line per tool call and per finished step, for the board
+    (same records as cc-fleet's activity sidecar). Append-only across calls and rounds;
+    best-effort, a failed write only drops that line."""
+
+    def __init__(self, job):
+        self.job = job
+        self.path = os.path.join(JOBS, job["id"], "activity.jsonl")
+        self.seq = self.out = 0
+        try:
+            with open(self.path, "rb") as f:
+                lines = f.read().splitlines()
+            for line in reversed(lines):
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not self.seq:
+                    self.seq = int(rec.get("seq") or 0)
+                if rec.get("kind") == "usage":
+                    self.out = int(rec.get("out") or 0)
+                    break
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def emit(self, rec):
+        self.seq += 1
+        rec = {"seq": self.seq, **rec, "round": self.job.get("round", 1),
+               "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        try:
+            with open(self.path, "a") as f:
+                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        except OSError:
+            pass
+
+    def tool(self, nm, inp):
+        if nm in WRITE_TOOLS:
+            arg = inp.get("path") or inp.get("filePath") or ""
+        else:
+            arg = tool_detail(nm, inp)
+        arg = " ".join(mask_keys(str(arg)).split())[:ACTIVITY_ARG_MAX]
+        self.emit({"kind": "tool", "tool": nm, "arg": arg})
+
+    def usage(self, tk):
+        cache = int((tk.get("cache") or {}).get("read") or 0)
+        self.out += int(tk.get("output") or 0) + int(tk.get("reasoning") or 0)
+        self.emit({"kind": "usage", "in": int(tk.get("input") or 0) + cache, "out": self.out,
+                   "cache": cache})
+
+
+def activity_for(job):
+    """The job's activity writer, shared by every call of this process (retries, forks,
+    failover, fix rounds, wrap-up)."""
+    if job is None or not job.get("id"):
+        return None
+    if job.get("_act") is None:
+        job["_act"] = Activity(job)
+    return job["_act"]
+
+
 class Tally:
     """What `opencode run --format json` prints for one call: steps, tool calls, token totals,
     the final text and errors."""
 
-    def __init__(self, session):
+    def __init__(self, session, act=None):
+        self.act = act
         self.sid = session
         self.steps = self.tools = self.n_events = 0
         self.tok = {"input": 0, "output": 0, "cache_read": 0}
@@ -462,9 +546,12 @@ class Tally:
             self.tools += 1
             nm = part.get("tool") or "tool"
             inp = (part.get("state") or {}).get("input") or {}
-            detail = (inp.get("command") or "") if nm == "shell" else \
-                (inp.get("path") or inp.get("filePath") or inp.get("pattern") or "")
-            self.last = " ".join(f"{nm} {detail}".split())[:60]
+            if not isinstance(inp, dict):
+                inp = {}
+            # the progress file's "last" keeps its old shape (only "shell" shows a command)
+            self.last = " ".join(f"{nm} {tool_detail(nm, inp, ('shell',))}".split())[:60]
+            if self.act:
+                self.act.tool(nm, inp)
         elif t == "step_finish":
             self._step_open = False
             tk = part.get("tokens") or {}
@@ -472,6 +559,8 @@ class Tally:
             self.tok["output"] += tk.get("output", 0) + tk.get("reasoning", 0)
             self.tok["cache_read"] += (tk.get("cache") or {}).get("read", 0)
             self.cost += part.get("cost") or 0
+            if self.act:
+                self.act.usage(tk)
         elif t == "error":
             err = ev.get("error") or {}
             self.errors.append(err.get("message") or (err.get("data") or {}).get("message")
@@ -543,7 +632,7 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             "out": int(prev.get("out") or 0), "started": prev.get("started") or t0}
     if job is not None:
         job["_prog"] = dict(base)
-    tally, meter = Tally(session), LiveMeter()
+    tally, meter = Tally(session, activity_for(job)), LiveMeter()
 
     def out_now():
         # stream-side exact count for finished steps + the estimate for the one still streaming;

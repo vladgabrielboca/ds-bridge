@@ -228,5 +228,93 @@ with tempfile.TemporaryDirectory(dir=os.path.expanduser("~/.cache")) as h:   # n
           '"deny"' in a1 and not a2.strip() and not rng.strip() and '"deny"' in cat and not pipe.strip(),
           str([a1[:60], a2, rng, cat[:60], pipe]))
 
+# board data (T1): activity.jsonl, report.txt, job.json round fields, batch.json, pins
+R, RES, B = sys.modules["dslib.runner"], sys.modules["dslib.results"], sys.modules["dslib.batch"]
+saved = (R.JOBS, RES.JOBS, RES.PINS, B.JOBS, B.DS_BIN)
+with tempfile.TemporaryDirectory() as st:
+    jobs_dir, pins_dir = os.path.join(st, "jobs"), os.path.join(st, "pins")
+    R.JOBS = RES.JOBS = B.JOBS = jobs_dir
+    RES.PINS = pins_dir
+    try:
+        os.makedirs(os.path.join(jobs_dir, "J"))
+        job = {"id": "J", "round": 1, "status": "open", "model": "m"}
+        stream = [{"type": "step_start"},
+                  {"type": "tool", "part": {"tool": "bash", "state": {"input": {"command": "curl -H 'x-api-key: abcdefgh1234' sk-abcdef123456 " + "y" * 300}}}},
+                  {"type": "tool", "part": {"tool": "read", "state": {"input": {"filePath": "src/a.py"}}}},
+                  {"type": "step_finish", "part": {"tokens": {"input": 100, "output": 10, "reasoning": 5, "cache": {"read": 900}}, "cost": 0.01}},
+                  {"type": "step_start"},
+                  {"type": "tool", "part": {"tool": "edit", "state": {"input": {"filePath": "src/a.py", "oldString": "SECRET", "newString": "BODY"}}}},
+                  {"type": "text", "part": {"messageID": "m", "text": "STATUS: DONE"}},
+                  {"type": "step_finish", "part": {"tokens": {"input": 50, "output": 20, "reasoning": 0, "cache": {"read": 1000}}, "cost": 0.02}}]
+        y = ds.Tally("s", R.activity_for(job))
+        for ev in stream:
+            y.feed(ev)
+        act_path = os.path.join(jobs_dir, "J", "activity.jsonl")
+        recs = [json.loads(l) for l in open(act_path)]
+        check("activity: 3 tools + 2 usage records, seq 1..5, round 1",
+              [r["kind"] for r in recs] == ["tool", "tool", "usage", "tool", "usage"]
+              and [r["seq"] for r in recs] == [1, 2, 3, 4, 5] and all(r["round"] == 1 and r["ts"].endswith("Z") for r in recs), str(recs))
+        check("activity usage: in = input + cache_read of the step, out cumulative, cache of the step",
+              [(r["in"], r["out"], r["cache"]) for r in recs if r["kind"] == "usage"] == [(1000, 15, 900), (1050, 35, 1000)], str(recs))
+        a0 = recs[0]["arg"]
+        check("activity arg: keys masked, clamped to 200", "abcdef123456" not in a0 and "abcdefgh1234" not in a0
+              and "sk-[REDACTED]" in a0 and len(a0) == 200, a0)
+        check("activity arg: file-writing tool shows the path only", (recs[3]["tool"], recs[3]["arg"]) == ("edit", "src/a.py")
+              and "SECRET" not in open(act_path).read(), str(recs[3]))
+        check("tally last keeps its old shape", y.last == "edit src/a.py", y.last)
+        job2 = {"id": "J", "round": 2}                                    # a revise round: new process, same file
+        R.activity_for(job2).tool("glob", {"pattern": "*.py"})
+        last = json.loads(open(act_path).read().splitlines()[-1])
+        check("activity: a new round appends, seq continues", (last["seq"], last["round"], last["arg"]) == (6, 2, "*.py"), str(last))
+        RES.write_report(job, "STATUS: DONE\nSUMMARY: x")
+        check("report.txt holds the final text", open(os.path.join(jobs_dir, "J", "report.txt")).read() == "STATUS: DONE\nSUMMARY: x")
+        res = {"tokens": {"input": 150, "output": 35, "cache_read": 1900}, "cost": 0.03, "tools": 3}
+        job["_prog"] = {"steps": 2, "tools": 3}
+        RES.end_round(job, res, "OK")
+        job["round"], job["_prog"] = 2, {"steps": 1, "tools": 1}
+        RES.end_round(job, dict(res, cost=0.01), "FAIL")
+        jj = json.load(open(os.path.join(jobs_dir, "J", "job.json")))
+        check("job.json round fields summed over rounds, old fields kept",
+              (jj["steps"], jj["tools"], jj["cost"], jj["tokens"], jj["result"], jj["status"], jj["model"]) ==
+              (3, 4, 0.04, {"in": 300, "out": 70, "cache": 3800}, "FAIL", "open", "m") and jj["ended"] > 0
+              and "_prog" not in jj, str(jj))
+        # pins: a pinned landed job is left alone by gc_landed
+        for jid in ("P", "U"):
+            os.makedirs(os.path.join(jobs_dir, jid))
+            json.dump({"id": jid, "status": "landed", "landed_at": 1}, open(os.path.join(jobs_dir, jid, "job.json"), "w"))
+        os.makedirs(pins_dir)
+        open(os.path.join(pins_dir, "P"), "w").close()
+        RES.gc_landed()
+        check("gc_landed skips a pinned job, cleans an unpinned one",
+              [json.load(open(os.path.join(jobs_dir, j, "job.json")))["status"] for j in ("P", "U")] == ["landed", "approved"])
+        # batch.json from cmd_batch, with a fake ds that prints a landed OK line per group
+        fake = os.path.join(st, "fake-ds")
+        open(fake, "w").write("import os, sys, json\nsys.stdin.read()\n"
+                              "g = os.environ.get('DS_BATCH_GROUP', '')\n"
+                              "b = json.load(open(os.path.join(%r, os.environ['DS_BATCH'], 'batch.json')))\n"
+                              "assert b['groups'][int(g)]['status'] == 'running'\n"
+                              "print('OK 1122-12000' + g + ' 3s landed')\n" % jobs_dir)
+        B.DS_BIN = fake
+        planf = os.path.join(st, "plan.md")
+        open(planf, "w").write("# T\nctx\n\n## a first\nfiles: a.py\ndo: x\n\n## b second\nfiles: b.py\ndo: y\nneeds: a\n")
+        env_sid = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        import argparse, contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            B.cmd_batch(argparse.Namespace(C=st, plan=planf, steps=None, parallel=2, m=None, check=None,
+                                           source=None, brief=None, timeout=None))
+        if env_sid is not None:
+            os.environ["CLAUDE_CODE_SESSION_ID"] = env_sid
+        bid = buf.getvalue().split()[1]
+        bj = json.load(open(os.path.join(jobs_dir, bid, "batch.json")))
+        check("batch.json shape for a 2-group plan",
+              (bj["id"], bj["title"], bj["plan"], bj["project"], bj["check"], bj["integration"]) == (bid, "T", planf, st, None, "none")
+              and bj["ended"] >= bj["started"] > 0
+              and bj["groups"] == [{"label": "a", "steps": ["a"], "needs": [], "job": "1122-120000", "status": "OK"},
+                                   {"label": "b", "steps": ["b"], "needs": [0], "job": "1122-120001", "status": "OK"}],
+              json.dumps(bj))
+    finally:
+        R.JOBS, RES.JOBS, RES.PINS, B.JOBS, B.DS_BIN = saved
+
 print("\n%d failed" % len(fails) if fails else "\nall passed")
 sys.exit(1 if fails else 0)

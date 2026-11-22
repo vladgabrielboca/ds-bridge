@@ -347,6 +347,7 @@ def finish_job(job, res):
     """Decide the status, auto-land a passed job, print the compact result block."""
     c = cfg()
     raw = res["report"] or ""
+    write_report(job, raw)
     rep = parse_report(raw)
     status = job_status(res, rep)
     chk = res.get("check")
@@ -363,6 +364,7 @@ def finish_job(job, res):
             f.write(text)
     except OSError:
         pass
+    end_round(job, res, status)
     sys.stdout.write(text)
     record_ledger(job, res, len(text))
     if not os.environ.get("DS_BATCH"):      # a batch reports once, for all its jobs
@@ -479,6 +481,76 @@ def render_block(job, res, rep, raw, status, landed, conflict):
     return block + "\n" + "\n".join(tail) + "\n"
 
 
+PINS = os.path.join(STATE, "pins")
+
+
+def is_pinned(jid):
+    """Pinned on the board (pins/<id>): no ds cleanup touches the job."""
+    return os.path.exists(os.path.join(PINS, jid))
+
+
+def write_report(job, raw):
+    """jobs/<id>/report.txt: the worker's final text of the latest round."""
+    try:
+        with open(os.path.join(JOBS, job["id"], "report.txt"), "w") as f:
+            f.write(raw or "")
+    except OSError:
+        pass
+
+
+def end_round(job, res, status):
+    """Round totals for the board, added to job.json (sums over rounds)."""
+    prog = job.get("_prog") or {}
+    tk = res.get("tokens") or {}
+    job["steps"] = int(job.get("steps") or 0) + int(prog.get("steps") or 0)
+    job["tools"] = int(job.get("tools") or 0) + int(prog.get("tools") or res.get("tools") or 0)
+    job["cost"] = round(float(job.get("cost") or 0) + float(res.get("cost") or 0), 6)
+    old = job.get("tokens") or {}
+    job["tokens"] = {"in": int(old.get("in") or 0) + int(tk.get("input") or 0),
+                     "out": int(old.get("out") or 0) + int(tk.get("output") or 0),
+                     "cache": int(old.get("cache") or 0) + int(tk.get("cache_read") or 0)}
+    job["result"] = status
+    job["ended"] = int(time.time())
+    try:
+        save(job)
+    except OSError:
+        pass
+
+
+def batch_path(bid):
+    return os.path.join(JOBS, bid, "batch.json")
+
+
+def update_batch(bid, fn):
+    """Read jobs/<bid>/batch.json, let fn change it, write it back atomically (tmp + replace).
+    Locked: the batch and its child jobs both write it. Best-effort."""
+    path = batch_path(bid)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                obj = json.load(open(path))
+            except (OSError, ValueError):
+                obj = {}
+            fn(obj)
+            tmp = path + f".tmp.{os.getpid()}.{threading.get_ident()}"
+            with open(tmp, "w") as f:
+                json.dump(obj, f, indent=1)
+            os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def set_batch_job(bid, i, jid):
+    """A batch child names its job in its group as soon as the job exists."""
+    def fn(obj):
+        groups = obj.get("groups") or []
+        if 0 <= i < len(groups):
+            groups[i]["job"] = jid
+    update_batch(bid, fn)
+
+
 def gc_landed(max_age_s=86400):
     """Landed jobs older than a day become approved and drop their snapshots (no more undo)."""
     try:
@@ -491,6 +563,8 @@ def gc_landed(max_age_s=86400):
         try:
             job = json.load(open(p))
         except (OSError, ValueError):
+            continue
+        if is_pinned(n):
             continue
         if job.get("status") == "landed" and now - float(job.get("landed_at") or 0) > max_age_s:
             job["status"] = "approved"

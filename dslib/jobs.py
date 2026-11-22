@@ -211,13 +211,15 @@ def cmd_run(a):
         try:
             repo, git_note = ensure_repo(d)
         except SystemExit:
-            shutil.rmtree(os.path.join(JOBS, jid), ignore_errors=True)
+            if not is_pinned(jid):
+                shutil.rmtree(os.path.join(JOBS, jid), ignore_errors=True)
             raise
     gd = shadow_for(d)
     try:
         claim_job(jid, d, paths, isolated=want_copy(c, paths, force=getattr(a, "research", False)))
     except SystemExit:
-        shutil.rmtree(os.path.join(JOBS, jid), ignore_errors=True)
+        if not is_pinned(jid):
+            shutil.rmtree(os.path.join(JOBS, jid), ignore_errors=True)
         raise
     job = None
     post_taken = False
@@ -246,6 +248,8 @@ def cmd_run(a):
                "paths": paths, "task": task, "check": a.check,
                "owner": os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
                **({"batch": os.environ["DS_BATCH"]} if os.environ.get("DS_BATCH") else {}),
+               **({"batch_group": int(os.environ["DS_BATCH_GROUP"])}
+                  if os.environ.get("DS_BATCH") and os.environ.get("DS_BATCH_GROUP", "").isdigit() else {}),
                "started": time.time(), "fix": bool(getattr(a, "fix", False)),
                **({"project": d} if work != d else {}),
                **({"repo": repo} if repo else {}),
@@ -253,6 +257,8 @@ def cmd_run(a):
                **({"copy_error": copy_err} if copy_err else {}),
                "fix_tries": a.fix_tries if a.fix_tries is not None else c["fix_tries"]}
         save(job)
+        if job.get("batch_group") is not None:
+            set_batch_job(job["batch"], job["batch_group"], jid)
         outside = outside_listing(work, paths) if paths else None
         want_note = c.get("excluded_note", True)
         excluded = excluded_listing(work, paths) if want_note else None
@@ -323,6 +329,10 @@ def finish_research(job, res, words):
     stat, _ = diff_text(job)
     changed = bool(stat.strip())
     rep = (res["report"] or "(researcher gave no answer)").strip()
+    write_report(job, res["report"])
+    # before the branches below: the in-place reject saves its own copy of the job
+    end_round(job, res, "LIMIT" if res.get("limit") else
+              ("PROVIDER" if is_provider_failure(res["errors"]) else "ERROR") if res["errors"] else "OK")
     try:
         with open(os.path.join(JOBS, job["id"], "answer.txt"), "w") as f:
             f.write(rep)

@@ -122,6 +122,20 @@ def cmd_batch(a):
                         die(f"step {st['id']} needs a later step {x}")
                     n.add(step_group[x])
         needs.append(sorted(n))
+    def init(obj):
+        obj.update({"id": bid, "title": plan["title"], "plan": plan_path, "project": d,
+                    "owner": os.environ.get("CLAUDE_CODE_SESSION_ID", ""), "started": int(t0),
+                    "groups": [{"label": labels[i], "steps": [st["id"] for st in g], "needs": needs[i],
+                                "job": None, "status": "queued"} for i, g in enumerate(groups)],
+                    "check": a.check or plan["check"], "ended": None})
+    update_batch(bid, init)
+
+    def set_group(i, **kw):
+        def fn(obj):
+            if i < len(obj.get("groups") or []):
+                obj["groups"][i].update({k: v for k, v in kw.items() if v is not None or k != "job"})
+        update_batch(bid, fn)
+
     results = [None] * len(groups)
     lock = threading.Lock()
     slots = threading.Semaphore(max(1, int(a.parallel or c.get("max_parallel", 6))))
@@ -138,6 +152,7 @@ def cmd_batch(a):
             why = dep.get("status") if dep.get("status") != "OK" else "passed but did not land"
             results[i] = {"status": "SKIPPED", "line": f"SKIPPED step {labels[i]}: needs step "
                           f"{labels[failed_dep]} ({why})", "block": ""}
+            set_group(i, status="SKIPPED")
             done_ev[i].set()
             return
         g = groups[i]
@@ -158,7 +173,8 @@ def cmd_batch(a):
             argv += ["--timeout", str(a.timeout)]
         argv += ["--paths", *gfiles[i], "-"]
         with slots:
-            env = dict(os.environ, DS_CHILD="1", DS_BATCH=bid)
+            set_group(i, status="running")
+            env = dict(os.environ, DS_CHILD="1", DS_BATCH=bid, DS_BATCH_GROUP=str(i))
             env.pop("DS_OUT", None)
             r = subprocess.run(argv, input=task, capture_output=True, text=True, env=env, cwd=d)
         out = (r.stdout or "") + (("\n" + r.stderr.strip()) if r.returncode and r.stderr.strip() else "")
@@ -169,6 +185,9 @@ def cmd_batch(a):
         with lock:
             results[i] = {"status": status, "line": f"{first}  (step {labels[i]})", "block": out.strip(),
                           "landed": " landed" in first}
+        words = first.split()
+        jid = words[1] if len(words) > 1 and re.fullmatch(r"\d{4}-\d{6}(-\d+)?", words[1]) else None
+        set_group(i, status=status, job=jid)
         done_ev[i].set()
 
     threads = [threading.Thread(target=run_group, args=(i,), daemon=True) for i in range(len(groups))]
@@ -199,6 +218,13 @@ def cmd_batch(a):
             else:
                 integ_lines = ["integration error:"] + ["  " + l_ for l_ in tail[:12]] + ["fix job:"] + \
                               ["  " + l_ for l_ in fix_out.splitlines()[:12]]
+    fw = fix_line.split()
+    fix_jid = fw[1] if len(fw) > 1 and re.fullmatch(r"\d{4}-\d{6}(-\d+)?", fw[1]) else None
+
+    def fin(obj):
+        obj.update({"ended": int(time.time()), "integration": integ,
+                    **({"fix_job": fix_jid} if fix_jid else {})})
+    update_batch(bid, fin)
     n_ok = sum(1 for r_ in results if r_ and r_["status"] == "OK")
     out = [f"BATCH {bid} groups={len(groups)} ok={n_ok} not_ok={len(groups) - n_ok} "
            f"integration={integ} {int(time.time() - t0)}s"]
