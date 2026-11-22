@@ -167,3 +167,41 @@ Left for later.
 - Batches started by the main ds (no `pid` in batch.json) can't be stopped from the board; it says so.
 - Until the merge, `ds board` from main has no `forget`: delete and clear only work when the board is started by the branch ds.
 - Footers at 150 columns fit; narrower terminals cut them (not checked how cc-fleet handles that).
+
+## T6 (2026-11-22): browser, edge states, demo comparison, docs, live run
+
+Same branch and worktree. T1 to T5 are committed on `board` (eb2b9e8 to 9e6ecbf); T6 is committed on `board`; not merged, waiting for T7.
+
+Colors: the user chose to keep cc-fleet's ANSI 256 pairs (SPEC 10 question 1). Nothing changed.
+
+What changed.
+
+- Browser (`ctrl+f`): title `ds · Session browser`. Rows show and filter on the model (cc-fleet's provider slot) and the status word; the filter also matches the kind (`run`, `research`, `batch`). A job row names the job's own project (job.json `project`, else `dir`), not the session's dir; the session's dir still filters. A job with no session and no project names no project (it showed `.`).
+- Empty board (no job and no batch, including a missing state dir): a centered framed `no ds jobs yet` with one faint line, and the footer `r refresh · esc/tab/q quit`. Not an error.
+- A job.json or batch.json that exists but doesn't parse is skipped, and cc-fleet's dim jobs line says `jobs unavailable: skipped unreadable 1122-x/job.json, …`, cut to the board width. ds writes both files with `os.replace`, so a parse failure is a damaged file, not a write in progress. A job dir without job.json yet is skipped silently.
+- Narrow terminals: same as cc-fleet, which has no minimum width. Boxes, titles and footers are cut. Checked at 79, 60, 40 and 20 columns, every level and the browser, no crash.
+- Bug fix: a finished batch job's card (run drill, agent level) said `last 3 of 0 tool calls`. It now reads the job's activity.jsonl with its prompt and output, like the single-job card.
+- Tests: `TestBrowserFilterMatchesModelAndStatus`, `TestBrowserJobProject`, `TestBoardEmptyFrame`, `TestWfAgentCard_DoneLeafActivity` (fails without the fix), `TestListJobsMalformed` (also a missing state dir). Browser tests use `Model:` where they used `Provider:`. `go vet`, `go test ./...` and `python3 tests/test_ds.py` pass.
+- Docs: README section Board (what it shows, keys, `ds board`, go optional), a `ds board` row in Commands, Go in Install, the Apache-2.0 note under License, `board/` in Code layout. The `ds` help line for `board` was already there from T2. History note entry in `~/Work/ds-bridge/.claude/notes/ds-bridge-history.md`.
+
+Differences from cc-fleet's demo frames (`demo-subagent`, `demo-tui`, `demo-workflow`, the three stills). The demos are from 2026-06-14; the code we ported is 2026-10-24.
+
+- From newer cc-fleet code, kept: box corners are rounded (`╭`), the demos have square ones; the session header and box titles start with `claude ·` and session rows carry the short session id; a done phase shows ✔ in the rail.
+- Intended ds changes, kept: title `ds · Agents Board  tab/q quit` (no Model Providers); no Agent Teams box; Overview row `agent worker · run` instead of `profile slim`; cost hidden when 0 (OpenCode Go reports 0), so turns and stop move up a row; tool names are OpenCode's lowercase (`edit(calc.py)`, `shell(…)`) instead of `Read(…)`; `round N` instead of `attempt N`; full job ids; Outcome with ds words (`OK · landed · 6 turns`); footers without restart, save and providers; the integration check as a last phase; batch agent rows show the model before the metrics, as cc-fleet's current `renderAgentRow` does.
+- Unintended, fixed: the finished agent card's `last 3 of 0 tool calls` (above).
+- Unintended, not fixed: the Output wrap collapses runs of spaces (`"a b  c"` shows as `"a b c"`). It comes from cc-fleet's `wrapTo`.
+
+Live run (board in tmux session `dsboard`, 150x42, started with `~/Work/ds-bridge-board/ds board`; jobs started with the branch ds in this session, scratch projects `liveproj` and `otherproj` in the session scratchpad). Frames every 2 s in the scratchpad `live/` folder.
+
+- Jobs: 1122-173913 (calc fix), 1122-173913-1 (text fix), 1122-173913-2 (research), batch b1122-173913 (steps 1122-173913-3 and 1122-173926, step 2 `needs: 1`, integration `python3 test_all.py`), and 1122-173913-4 from outside any session (`CLAUDE_CODE_SESSION_ID=` empty). All OK and landed, integration pass, 42 s for the batch.
+- Start (17:39:17): this session's row with the batch `0/1 agents` and three running subagents.
+- Mid (17:39:29 to 17:39:55): running dots dropped 4, 3, 2, 1, 0 as jobs ended; the batch header went `↑ 12.2k · ↓ 660` to `↑ 24.6k · ↓ 1.3k` while step 2 ran; the research card showed `last 3 of 6 tool calls` and `Still running…`.
+- End: Projects level shows `ds-bridge 3` and `otherproj 1`; otherproj holds `(no session)` with job 1122-173913-4 (Output = its report, Outcome `OK · landed · 4 turns`). The batch drill shows ✔ Fix shapes, ✔ Fix report and ✔ integration check `pass · \`python3 test_all.py\``; step 2's card shows 4 tool calls and its report. The research card shows its ANSWER block. The browser lists 8 records; typing `research` leaves the research job, ⏎ opens its card, esc returns.
+
+Left for later.
+
+- T7 (live worker text in Output): waits for the user's OK (SPEC 10 question 2).
+- A Hyprland key binding to open the board: design with the user first (SPEC 9).
+- The run header reads `0/0 agents · ↑ 0 · ↓ 0` with the cursor on the integration check when no fix job ran (from T4).
+- A killed batch shows no `interrupted` text, only the failed dot (from T4).
+- Batches started by the main ds (no `pid`) can't be stopped from the board (from T5).

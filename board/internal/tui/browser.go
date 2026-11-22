@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"ds-bridge/board/internal/dsjobs"
 	"ds-bridge/board/internal/sessiontitle"
 )
 
@@ -38,12 +39,16 @@ type browserRef struct {
 type browserRow struct {
 	ref      browserRef
 	title    string
-	provider string
+	provider string // ds: the model
+	status   string // queued | running | done | failed | stopped
+	kind     string // ds: run | research | batch (filter only)
 	lane     string
-	project  string // the session's project dir — filterable; its basename shows on the row
-	session  string // the parent session's title
-	when     time.Time
-	hasWhen  bool
+	project  string // ds: the job's or batch's own project dir — filterable; its basename shows on the row
+	// sessionCwd is the parent session's dir (filter only): a ds job can work in another project.
+	sessionCwd string
+	session    string // the parent session's title
+	when       time.Time
+	hasWhen    bool
 
 	// Enter targets.
 	jobID         string
@@ -68,9 +73,12 @@ func (m Model) browserRows() []browserRow {
 		row := browserRow{
 			ref:           browserRef{kind: browserJob, id: j.JobID},
 			title:         jobRowLabel(j),
-			provider:      j.Provider,
+			provider:      j.Model,
+			status:        j.Status,
+			kind:          j.Kind,
 			lane:          "subagent",
-			project:       m.sessionMeta[j.LeadSessionID].Cwd,
+			project:       jobProject(j, m.sessionMeta[j.LeadSessionID].Cwd),
+			sessionCwd:    m.sessionMeta[j.LeadSessionID].Cwd,
 			session:       m.browserSessionTitle(j.LeadSessionID),
 			jobID:         j.JobID,
 			leadSessionID: j.LeadSessionID,
@@ -86,6 +94,8 @@ func (m Model) browserRows() []browserRow {
 			ref:       browserRef{kind: browserRun, id: g.runID},
 			title:     m.runLabel(g),
 			provider:  runProvider(g),
+			status:    g.status,
+			kind:      "batch",
 			lane:      "workflow",
 			project:   g.cwd,
 			session:   m.browserSessionTitle(g.sessionID),
@@ -141,13 +151,23 @@ func browserFirstCodex(rows []browserRow) int {
 	return -1
 }
 
-// runProvider is a run's display provider: the first leaf's provider (a run is usually
+// jobProject is the dir a ds job row names: the job's own project (job.json project, else dir),
+// else its session's cwd. ds jobs often work outside the session's dir, and a job started outside
+// Claude Code has no session cwd at all.
+func jobProject(j dsjobs.Result, sessionCwd string) string {
+	if j.Project != "" {
+		return j.Project
+	}
+	return sessionCwd
+}
+
+// runProvider is a run's display model (ds has no provider column): the first leaf's model (a run is usually
 // single-provider; a mixed run just shows the first, which still feeds the filter).
 func runProvider(g runGroup) string {
 	for _, p := range g.phases {
 		for _, j := range p.jobs {
-			if j.Provider != "" {
-				return j.Provider
+			if j.Model != "" {
+				return j.Model
 			}
 		}
 	}
@@ -162,7 +182,7 @@ func (m Model) browserSessionTitle(id string) string {
 }
 
 // filteredBrowserRows narrows browserRows by a case-insensitive substring over the row's title,
-// provider, lane, project dir, parent-session title, and parent-session id. An empty filter returns
+// model, status, kind, lane, project dir, parent-session title, and parent-session id. An empty filter returns
 // the full list.
 func (m Model) filteredBrowserRows() []browserRow {
 	all := m.browserRows()
@@ -173,7 +193,7 @@ func (m Model) filteredBrowserRows() []browserRow {
 	var out []browserRow
 	for _, r := range all {
 		hay := strings.ToLower(strings.Join([]string{
-			r.title, r.provider, r.lane, r.project, r.session, r.leadSessionID, r.sessionID,
+			r.title, r.provider, r.status, r.kind, r.lane, r.project, r.sessionCwd, r.session, r.leadSessionID, r.sessionID,
 		}, " "))
 		if strings.Contains(hay, q) {
 			out = append(out, r)
@@ -352,7 +372,7 @@ func (m Model) viewBrowser() string {
 	if m.browserFilter != "" {
 		count = fmt.Sprintf("%d / %d", len(rows), len(all))
 	}
-	header := titleStyle.Render("cc-fleet · Session browser") + faintStyle.Render(" · "+count)
+	header := titleStyle.Render("ds · Session browser") + faintStyle.Render(" · "+count)
 
 	glyph := contentStyle.Render("⌕")
 	field := glyph + " " + faintStyle.Render("Search…")
@@ -408,7 +428,7 @@ func (m Model) viewBrowser() string {
 }
 
 // browserEntryLines renders one entry as two lines: the entity label · parent-session title (with a
-// cursor / scroll-edge marker), then a dim "<relative time> · provider · lane · project" line.
+// cursor / scroll-edge marker), then a dim "<relative time> · model · status · lane · project" line.
 func (m Model) browserEntryLines(r browserRow, i, start, end, total int) []string {
 	marker, style := "  ", contentStyle
 	switch {
@@ -434,8 +454,11 @@ func (m Model) browserEntryLines(r browserRow, i, start, end, total int) []strin
 	if p := sessiontitle.CleanTitle(r.provider); p != "" {
 		parts = append(parts, p)
 	}
+	if r.status != "" {
+		parts = append(parts, r.status)
+	}
 	parts = append(parts, r.lane)
-	if p := sessiontitle.CleanTitle(filepath.Base(r.project)); p != "" {
+	if p := sessiontitle.CleanTitle(filepath.Base(r.project)); r.project != "" && p != "" {
 		parts = append(parts, p)
 	}
 	metaLine := "  " + faintStyle.Render(trunc(strings.Join(parts, " · "), m.boardInner()-4))

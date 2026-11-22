@@ -37,8 +37,8 @@ func clearFilter(t *testing.T, m Model) Model {
 // (it belongs to its run); only RunID=="" jobs list as subagent rows.
 func TestBrowserJobRowsStandaloneOnly(t *testing.T) {
 	m := browserModel(t, []dsjobs.Result{
-		{JobID: "job-free", Label: "free", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "s"},
-		{JobID: "job-leaf", Label: "leaf", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", RunID: "run-1", Phase: "p"},
+		{JobID: "job-free", Label: "free", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "s"},
+		{JobID: "job-leaf", Label: "leaf", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", RunID: "run-1", Phase: "p"},
 	},
 		[]dsjobs.WorkflowRun{{RunID: "run-1", Name: "the-run", SessionID: "sR", StartedAt: "2026-06-01T00:00:00Z"}})
 	for _, r := range m.browserRows() {
@@ -63,7 +63,7 @@ func TestBrowserJobRowsStandaloneOnly(t *testing.T) {
 
 // TestBrowserEnterJobSetsFocus: Enter on a job row opens its existing entity detail by id.
 func TestBrowserEnterJobSetsFocus(t *testing.T) {
-	m := browserModel(t, []dsjobs.Result{{JobID: "job-target", Label: "target", Provider: "glm", Status: "done",
+	m := browserModel(t, []dsjobs.Result{{JobID: "job-target", Label: "target", Model: "glm", Status: "done",
 		StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "sess-job"}}, nil)
 	m, _ = press(t, m, "enter")
 	if m.asMode != asModeEntity || !m.asEntitySrc.jobs {
@@ -110,8 +110,8 @@ func TestBrowserEnterRunRootsSession(t *testing.T) {
 // the cursor re-finds its anchored row by identity instead of staying at the same index.
 func TestBrowserCursorReanchorsAcrossRefresh(t *testing.T) {
 	jobs := []dsjobs.Result{
-		{JobID: "job-keep", Label: "keep", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "s"},
-		{JobID: "job-old", Label: "old", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "s"},
+		{JobID: "job-keep", Label: "keep", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "s"},
+		{JobID: "job-old", Label: "old", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "s"},
 	}
 	m := browserModel(t, jobs, nil)
 	// Cursor on the SECOND row (job-old): rows are newest-first, so index 1 is job-old.
@@ -121,7 +121,7 @@ func TestBrowserCursorReanchorsAcrossRefresh(t *testing.T) {
 	}
 	// A refresh inserts a NEWER job above both → job-old shifts from index 1 to index 2.
 	withNew := append([]dsjobs.Result{
-		{JobID: "job-new", Label: "new", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:09Z", LeadSessionID: "s"},
+		{JobID: "job-new", Label: "new", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:09Z", LeadSessionID: "s"},
 	}, jobs...)
 	m, _ = step(t, m, boardMsg{jobs: withNew, epoch: m.boardEpoch})
 	rows := m.filteredBrowserRows()
@@ -135,8 +135,8 @@ func TestBrowserCursorReanchorsAcrossRefresh(t *testing.T) {
 // not drifting to the neighbor that now occupies its old index.
 func TestBrowserEnteredJobEntityReanchors(t *testing.T) {
 	jobs := []dsjobs.Result{
-		{JobID: "job-keep", Label: "keep", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "s"},
-		{JobID: "job-other", Label: "other", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "s"},
+		{JobID: "job-keep", Label: "keep", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "s"},
+		{JobID: "job-other", Label: "other", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "s"},
 	}
 	m := browserModel(t, jobs, nil)
 	// The two jobs share session "s"; entering it lands on the jobs entity list. Filter to the
@@ -150,7 +150,7 @@ func TestBrowserEnteredJobEntityReanchors(t *testing.T) {
 	}
 	// A refresh adds a NEWER job to the same session → s.jobs reorders, job-keep's index shifts.
 	withNew := append([]dsjobs.Result{
-		{JobID: "job-new", Label: "new", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:09Z", LeadSessionID: "s"},
+		{JobID: "job-new", Label: "new", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:09Z", LeadSessionID: "s"},
 	}, jobs...)
 	m, _ = step(t, m, boardMsg{jobs: withNew, epoch: m.boardEpoch})
 	if j, ok := m.selectedJob(); !ok || j.JobID != "job-keep" {
@@ -161,7 +161,7 @@ func TestBrowserEnteredJobEntityReanchors(t *testing.T) {
 // TestBrowserEscReturnsLeftAscends: esc from a browser-entered detail returns to the browser;
 // ← does normal board ascent (and drops the browser-origin link).
 func TestBrowserEscReturnsLeftAscends(t *testing.T) {
-	job := []dsjobs.Result{{JobID: "job-x", Label: "x", Provider: "glm", Status: "done",
+	job := []dsjobs.Result{{JobID: "job-x", Label: "x", Model: "glm", Status: "done",
 		StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "sess-x"}}
 
 	// esc path: detail → browser.
@@ -194,8 +194,8 @@ func TestBrowserEscReturnsLeftAscends(t *testing.T) {
 // to the row it now lands on, instead of holding a dead identity that every later refresh re-fails.
 func TestBrowserAnchorResyncsWhenRowVanishes(t *testing.T) {
 	jobs := []dsjobs.Result{
-		{JobID: "job-a", Label: "a", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:03Z", LeadSessionID: "s"},
-		{JobID: "job-b", Label: "b", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "s"},
+		{JobID: "job-a", Label: "a", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:03Z", LeadSessionID: "s"},
+		{JobID: "job-b", Label: "b", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "s"},
 	}
 	m := browserModel(t, jobs, nil)
 	m, _ = press(t, m, "down") // anchor on job-b (index 1)
@@ -244,8 +244,8 @@ func TestBrowserRunAgentBackKeys(t *testing.T) {
 func TestBrowserEnterJobRootsProject(t *testing.T) {
 	m := boardModel(t, nil)
 	jobs := []dsjobs.Result{
-		{JobID: "job-a", Label: "alpha", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "sA"},
-		{JobID: "job-b", Label: "bravo", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "sB"},
+		{JobID: "job-a", Label: "alpha", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "sA"},
+		{JobID: "job-b", Label: "bravo", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "sB"},
 	}
 	meta := map[string]sessiontitle.Meta{"sA": {Cwd: "/projA"}, "sB": {Cwd: "/projB"}}
 	m, _ = step(t, m, boardMsg{jobs: jobs, sessionMeta: meta, epoch: m.boardEpoch})
@@ -267,8 +267,8 @@ func TestBrowserEnterJobRootsProject(t *testing.T) {
 // the sibling and the browser back-link is dropped — esc must then do normal ascent.
 func TestBrowserOriginClearedWhenEnteredJobVanishesSiblingRemains(t *testing.T) {
 	jobs := []dsjobs.Result{
-		{JobID: "job-a", Label: "alpha", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "s"},
-		{JobID: "job-b", Label: "bravo", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "s"},
+		{JobID: "job-a", Label: "alpha", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "s"},
+		{JobID: "job-b", Label: "bravo", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "s"},
 	}
 	m := browserModel(t, jobs, nil)
 	for _, r := range "bravo" { // enter job-b
@@ -293,7 +293,7 @@ func TestBrowserOriginClearedWhenEnteredJobVanishesSiblingRemains(t *testing.T) 
 // entering a RUN from the browser must keep its back-link across a refresh — the stale entity state
 // must not be read as a live entity focus and clear browserOrigin.
 func TestBrowserEnteredRunKeepsOriginAcrossRefresh(t *testing.T) {
-	jobs := []dsjobs.Result{{JobID: "job-z", Label: "zeta", Provider: "glm", Status: "done",
+	jobs := []dsjobs.Result{{JobID: "job-z", Label: "zeta", Model: "glm", Status: "done",
 		StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "sM"}}
 	runs := []dsjobs.WorkflowRun{{RunID: "run-r", Name: "sweep", SessionID: "sM", Cwd: "/proj",
 		StartedAt: "2026-06-01T00:00:05Z", Phases: []dsjobs.RunPhase{{Title: "map"}}}}
@@ -343,7 +343,7 @@ func TestBrowserShowsBoardWarnings(t *testing.T) {
 // TestBrowserEscReturnsToBoard: esc from the browser list closes back to the board level ctrl+f was
 // opened from — it does NOT exit to the Model Providers hub.
 func TestBrowserEscReturnsToBoard(t *testing.T) {
-	m := browserModel(t, []dsjobs.Result{{JobID: "j", Label: "x", Provider: "glm", Status: "done",
+	m := browserModel(t, []dsjobs.Result{{JobID: "j", Label: "x", Model: "glm", Status: "done",
 		StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "s"}}, nil)
 	want := m.browserReturnMode
 	m, _ = press(t, m, "esc")
@@ -360,8 +360,8 @@ func TestBrowserEscReturnsToBoard(t *testing.T) {
 func TestBrowserFilterMatchesProject(t *testing.T) {
 	m := boardModel(t, nil)
 	jobs := []dsjobs.Result{
-		{JobID: "job-a", Label: "alpha", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "sA"},
-		{JobID: "job-b", Label: "bravo", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "sB"},
+		{JobID: "job-a", Label: "alpha", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "sA"},
+		{JobID: "job-b", Label: "bravo", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "sB"},
 	}
 	meta := map[string]sessiontitle.Meta{"sA": {Cwd: "/home/me/payments"}, "sB": {Cwd: "/home/me/billing"}}
 	m, _ = step(t, m, boardMsg{jobs: jobs, sessionMeta: meta, epoch: m.boardEpoch})
@@ -381,7 +381,7 @@ func TestBrowserFilterMatchesProject(t *testing.T) {
 func TestBrowserRowShowsAndFiltersSession(t *testing.T) {
 	m := boardModel(t, nil)
 	jobs := []dsjobs.Result{ // no label → falls back to a short id, so the session title is the human anchor
-		{JobID: "deadbeef0000", Provider: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "sess-abc"},
+		{JobID: "deadbeef0000", Model: "glm", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "sess-abc"},
 	}
 	meta := map[string]sessiontitle.Meta{"sess-abc": {Cwd: "/proj", Title: "auth refactor"}}
 	m, _ = step(t, m, boardMsg{jobs: jobs, sessionMeta: meta, epoch: m.boardEpoch})
@@ -409,8 +409,8 @@ func TestBrowserRowShowsAndFiltersSession(t *testing.T) {
 // before display (the board's render-time invariant), never emitted raw.
 func TestBrowserSanitizesMetadata(t *testing.T) {
 	m := boardModel(t, nil)
-	jobs := []dsjobs.Result{{JobID: "j", Label: "x", Provider: "gl\am", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "s"}} // \a (BEL) in provider
-	meta := map[string]sessiontitle.Meta{"s": {Cwd: "/home/me/pro\aj"}}                                                                         // and in the cwd basename
+	jobs := []dsjobs.Result{{JobID: "j", Label: "x", Model: "gl\am", Status: "done", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "s"}} // \a (BEL) in model
+	meta := map[string]sessiontitle.Meta{"s": {Cwd: "/home/me/pro\aj"}}                                                                      // and in the cwd basename
 	m, _ = step(t, m, boardMsg{jobs: jobs, sessionMeta: meta, epoch: m.boardEpoch})
 	m, _ = step(t, m, keyMsg("ctrl+f"))
 	if strings.ContainsRune(m.View(), '\a') {
@@ -420,12 +420,63 @@ func TestBrowserSanitizesMetadata(t *testing.T) {
 
 // TestBrowserView renders the flat list with its title/provider/lane metadata + footer.
 func TestBrowserView(t *testing.T) {
-	m := browserModel(t, []dsjobs.Result{{JobID: "job-v", Label: "viewable", Provider: "glm", Status: "done",
+	m := browserModel(t, []dsjobs.Result{{JobID: "job-v", Label: "viewable", Model: "glm", Status: "done",
 		StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "s"}}, nil)
 	out := m.View()
 	for _, want := range []string{"viewable", "glm", "subagent", "type to search"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("browser view missing %q\n---\n%s", want, out)
 		}
+	}
+}
+
+// TestBrowserFilterMatchesModelAndStatus: the ds browser filters on the model and the status
+// word, and shows both on the meta line.
+func TestBrowserFilterMatchesModelAndStatus(t *testing.T) {
+	m := boardModel(t, nil)
+	jobs := []dsjobs.Result{
+		{JobID: "job-a", Label: "alpha", Model: "deepseek-v4-pro", Status: "running", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "s"},
+		{JobID: "job-b", Label: "bravo", Model: "deepseek-v4.1-flash", Status: "failed", StartedAt: "2026-06-01T00:00:01Z", LeadSessionID: "s"},
+	}
+	m, _ = step(t, m, boardMsg{jobs: jobs, epoch: m.boardEpoch})
+	m, _ = step(t, m, keyMsg("ctrl+f"))
+	if out := m.View(); !strings.Contains(out, "deepseek-v4-pro · running") {
+		t.Errorf("meta line must show model · status\n---\n%s", out)
+	}
+	for _, r := range "flash" {
+		m, _ = press(t, m, string(r))
+	}
+	if rows := m.filteredBrowserRows(); len(rows) != 1 || rows[0].ref.id != "job-b" {
+		t.Fatalf("filter 'flash' → %+v, want only job-b", rows)
+	}
+	m = clearFilter(t, m)
+	for _, r := range "running" {
+		m, _ = press(t, m, string(r))
+	}
+	if rows := m.filteredBrowserRows(); len(rows) != 1 || rows[0].ref.id != "job-a" {
+		t.Fatalf("filter %q → %+v, want only job-a; all %+v", m.browserFilter, rows, m.browserRows())
+	}
+}
+
+// TestBrowserJobProject: a ds job row names the job's own project (it can differ from the session's
+// dir), and a job with no session and no project names none (never ".").
+func TestBrowserJobProject(t *testing.T) {
+	m := boardModel(t, nil)
+	jobs := []dsjobs.Result{
+		{JobID: "job-a", Model: "flash", Status: "done", StartedAt: "2026-06-01T00:00:02Z", LeadSessionID: "sA", Project: "/tmp/liveproj"},
+		{JobID: "job-b", Model: "flash", Status: "done", StartedAt: "2026-06-01T00:00:01Z"},
+	}
+	meta := map[string]sessiontitle.Meta{"sA": {Cwd: "/home/me/ds-bridge"}}
+	m, _ = step(t, m, boardMsg{jobs: jobs, sessionMeta: meta, epoch: m.boardEpoch})
+	m, _ = step(t, m, keyMsg("ctrl+f"))
+	out := m.View()
+	if !strings.Contains(out, "subagent · liveproj") || strings.Contains(out, "· .") {
+		t.Errorf("rows must name the job's project and never \".\"\n---\n%s", out)
+	}
+	for _, r := range "ds-bridge" { // the session's dir still filters
+		m, _ = press(t, m, string(r))
+	}
+	if rows := m.filteredBrowserRows(); len(rows) != 1 || rows[0].ref.id != "job-a" {
+		t.Fatalf("filter by session dir → %+v, want job-a", rows)
 	}
 }

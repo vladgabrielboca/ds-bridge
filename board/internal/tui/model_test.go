@@ -606,3 +606,19 @@ func TestRunCleanupOutcomeNamesKeptWorktrees(t *testing.T) {
 		t.Fatalf("keptNotices after a failed op = %q, want nil", got)
 	}
 }
+
+// TestBoardEmptyFrame: with no ds job or batch at all (fresh install, missing state dir) the board
+// shows the centered "no ds jobs yet" frame and a short footer, not an error.
+func TestBoardEmptyFrame(t *testing.T) {
+	m := boardModel(t, nil)
+	m, _ = step(t, m, tea.WindowSizeMsg{Width: 100, Height: 24})
+	out := m.View()
+	for _, want := range []string{"no ds jobs yet", "╭", "r refresh · esc/tab/q quit"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("empty board missing %q\n---\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "error") || strings.Contains(out, "x stop") {
+		t.Errorf("empty board shows an error or job keys\n---\n%s", out)
+	}
+}

@@ -3,9 +3,12 @@
 package tui
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 
 	"ds-bridge/board/internal/dsjobs"
@@ -823,5 +826,43 @@ func TestWfRunOnlySession_ShowsBoxes(t *testing.T) {
 	m = drillRun(t, m)
 	if m.focusedRunID != "run-1" {
 		t.Fatalf("⏎ on the run row should focus run-1, got %q", m.focusedRunID)
+	}
+}
+
+// TestWfAgentCard_DoneLeafActivity: ds keeps activity.jsonl after a job ends, so a finished leaf's
+// card shows its last tool calls (read with its io), not "last 3 of 0".
+func TestWfAgentCard_DoneLeafActivity(t *testing.T) {
+	dir := t.TempDir()
+	old := dsjobs.StateDir
+	dsjobs.StateDir = dir
+	t.Cleanup(func() { dsjobs.StateDir = old })
+	p := filepath.Join(dir, "jobs", "job-m1", "activity.jsonl")
+	os.MkdirAll(filepath.Dir(p), 0o755)
+	os.WriteFile(p, []byte(`{"seq":1,"kind":"tool","tool":"read","arg":"a.py","round":1,"ts":"2026-06-01T00:00:01Z"}
+{"seq":2,"kind":"tool","tool":"edit","arg":"b.py","round":1,"ts":"2026-06-01T00:00:02Z"}
+`), 0o644)
+	jobs, runs := oneRun()
+	m := drillRun(t, runsModel(t, jobs, runs, nil))
+	m, cmd := press(t, m, "enter") // map phase (done leaf m1) → agent detail, loads its io
+	for cmd != nil {
+		msg := cmd()
+		if _, ok := msg.(wfDetailMsg); !ok {
+			if b, ok := msg.(tea.BatchMsg); ok {
+				for _, c := range b {
+					if wm, ok := c().(wfDetailMsg); ok {
+						msg = wm
+						break
+					}
+				}
+			}
+		}
+		if _, ok := msg.(wfDetailMsg); !ok {
+			t.Fatalf("enter did not load the leaf's io, got %T", msg)
+		}
+		m, cmd = step(t, m, msg)
+	}
+	out := m.View()
+	if !strings.Contains(out, "Activity · last 3 of 2 tool calls") || !strings.Contains(out, "edit(b.py)") {
+		t.Fatalf("done leaf card should show its recorded activity:\n%s", out)
 	}
 }

@@ -107,6 +107,31 @@ While a job runs, ds also reads the OpenCode service's event stream (`~/.local/s
 
 The final report's `tok/s` is measured, not estimated: token counts are the provider's exact per-step numbers. With OpenCode 2.3 or newer the times are the service's own: `session.step.first-token` (the provider's first output event, hidden reasoning included) and `session.step.streamed` (end of the response body). Each step counts output + reasoning tokens over `streamed - first-token`, summed before dividing: the same formula as OpenCode's footer and DeepSeek's harness, so Flash and Muse are measured alike. The time to first token follows as `· ttft X.Xs`. While a job runs, `▶ N tok/s` is the exact speed of the last finished step (nothing is shown before the first step ends). Older OpenCode versions don't send first-token, so ds falls back to SSE arrival times: decode between the first and last generation event when the model streams its output, otherwise throughput marked `incl. wait`, and a live rate estimated from characters marked `~`. The ledger keeps `dec_tok_s`, `thr_tok_s` and `tok_src` (`opencode` or `sse`). Without the event stream ds prints no speed.
 
+## Board
+
+`ds board` opens a full-screen board of every ds job, for a tmux split or a second terminal next to Claude Code. It is a port of the Agents Board from [cc-fleet](https://github.com/ethanhq/cc-fleet), changed only where ds differs.
+
+- Projects, then the Claude Code sessions in each project (titles from the Claude transcripts), then a session's two boxes: Dynamic Workflows (batches) and Subagents (single jobs).
+- A job's card: status, model, round, agent and kind, start time, elapsed, tokens, turns, result word; the brief; the last 3 tool calls; the worker's final report (the answer for research); the outcome (`OK · landed`, `rejected`, `interrupted`, BLOCKED's question with the `ds reply` hint).
+- A batch opens as its groups (phases), each with its job, plus the integration check as a last phase.
+- It reads `~/.local/share/ds-bridge` every 3 s, and every 500 ms while a job runs. Tool calls and token counts come from each job's `activity.jsonl`, so they move while the worker works.
+
+| Key | Action |
+| --- | --- |
+| `↑/↓` | move |
+| `→/⏎` | open; on a card, `⏎` expands the brief |
+| `←/esc` | back |
+| `j/k` | scroll a card |
+| `ctrl+f` | find: every job and batch, newest first; type to filter by title, model, status or project |
+| `x` | stop a running job or batch (SIGTERM to its ds process, after a check that the pid is ds) |
+| `p` | pin: ds's cleanup keeps pinned jobs |
+| `d` | delete a closed job or batch (landed, approved, rejected, or its private copy gone), through `ds forget` |
+| `c` | delete every closed, unpinned job of the session |
+| `r` | refresh |
+| `q`, `tab` | quit |
+
+Every action asks first. The board never approves, rejects or revises; those stay Claude's. It is built by `./install.sh` when `go` is on PATH; without go, `ds board` says so and the rest of ds works as before. `ds board --state DIR` reads another state dir.
+
 ## Commands
 
 | Command | Description |
@@ -131,6 +156,7 @@ The final report's `tok/s` is measured, not estimated: token counts are the prov
 | `ds research [-C DIR] [--paths P…] [--words N] "question"` | Read-only answer with refs, no diff. |
 | `ds rebase JOB` | Fresh private copy + the job's changes, conflicts left as markers. |
 | `ds playbook` | Print the planner playbook: Claude's rules for briefs and reviews, with the brief template. |
+| `ds board [--state DIR]` | The live board of jobs and batches (see Board). |
 
 Flags: `-C DIR` sets the project directory (`run` and `init`), `-m MODEL` overrides the model for one job, `-f FILE` attaches a file to the brief (repeatable, also on `revise`; images become reference pictures the worker can see), `--paths P…` limits the job's file scope, `--timeout S` overrides `job_budget_s` for this invocation (`run`, `init`, `revise`), and `--check CMD` / `--fix-tries N` control the acceptance check (also on `revise`), and `--fix` turns on the reproduction-test rule.
 
@@ -338,6 +364,7 @@ Requirements:
 - Claude Code with status-line `refreshInterval` support.
 - OpenCode 2.x with a DeepSeek-capable provider — for example an OpenCode Go subscription, model `opencode-go/deepseek-v4.1-flash`.
 - `python3`, `git` and `jq` (used by the status line).
+- Optional: Go 1.27 or newer, to build the board (`ds board`).
 
 ```bash
 git clone https://github.com/vladgabrielboca/ds-bridge.git
@@ -415,6 +442,8 @@ The worker's `bash` permission denies `git commit`, `git push`, `git reset`, `gi
 
 MIT. This project is not affiliated with Anthropic, DeepSeek or OpenCode.
 
+The board (`board/`) is derived from [cc-fleet](https://github.com/ethanhq/cc-fleet) commit `29262a6` and is under the Apache License 2.0: see `board/LICENSE-cc-fleet` and `board/NOTICE`. Each file taken from cc-fleet keeps a header saying it was modified.
+
 ## Code layout
 
 `ds` only starts the program; the code is the `dslib/` package, each module building on the ones before it:
@@ -429,5 +458,6 @@ MIT. This project is not affiliated with Anthropic, DeepSeek or OpenCode.
 | `batch.py` | `ds batch`: a plan's steps as parallel jobs |
 | `info.py` | `list`, `status`, `stats`, `cost`, `log`, `delegate`, `playbook` |
 | `cli.py` | the argument parser |
+| `board/` | the Go board (`ds board`): `internal/tui` (the ported cc-fleet board), `internal/dsjobs` (reads the ds state dir, stop and forget), `internal/sessiontitle`, `internal/pinned` |
 
-`python3 tests/test_ds.py` runs the checks that need no worker.
+`python3 tests/test_ds.py` runs the checks that need no worker. `cd board && go test ./...` runs the board's.

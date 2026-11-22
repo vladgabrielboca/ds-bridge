@@ -131,6 +131,8 @@ func (m Model) viewSpawn() string {
 		b.WriteString(m.boardFallback("discovering…"))
 	case m.spawnErr != nil:
 		b.WriteString(m.boardFallback(errStyle.Render("error: " + m.spawnErr.Error())))
+	case m.boardEmpty():
+		b.WriteString(m.viewEmpty()) // ds-bridge: fresh install, or every job forgotten
 	case m.asMode == asModeProjects:
 		b.WriteString(m.viewAsProjects())
 	case m.asMode == asModeSessions:
@@ -157,8 +159,8 @@ func (m Model) viewSpawn() string {
 	// results, hide/show, the save-name input) is a modal now; only this warning and the key-legend
 	// footer live at the board's foot.
 	if m.boardJobsErr != nil {
-		b.WriteString("\n" + pad + faintStyle.Render("jobs unavailable: "+
-			sessiontitle.CleanTitle(m.boardJobsErr.Error())))
+		b.WriteString("\n" + pad + faintStyle.Render(trunc("jobs unavailable: "+
+			sessiontitle.CleanTitle(m.boardJobsErr.Error()), max(m.boardInner()-2, 20)))) // ds: many bad files must not wrap
 	}
 	b.WriteString("\n" + pad + m.renderAsFooter())
 	return b.String()
@@ -177,9 +179,38 @@ func (m Model) boardFallback(body string) string {
 	return indentBox(m.spawnTitle()+"\n\n"+body, boardMargin)
 }
 
+// boardEmpty: no ds job or batch at all, so the board shows viewEmpty (the browser keeps its own view).
+func (m Model) boardEmpty() bool {
+	return len(m.jobs) == 0 && len(m.workflowJobs) == 0 && len(m.workflowRuns) == 0 && m.asMode != asModeBrowser
+}
+
+// viewEmpty is the board with no ds jobs at all (ds-bridge): the title, then a framed note centered
+// in the space the boxes would take. A missing state dir lands here too; it is not an error.
+func (m Model) viewEmpty() string {
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderStyle.GetForeground()).
+		Padding(1, 4).
+		Render(lipgloss.JoinVertical(lipgloss.Center,
+			liveStyle.Render("no ds jobs yet"),
+			"",
+			faintStyle.Render("jobs started with ds run, ds research or ds batch show up here")))
+	w, h := m.boardInner(), m.height-4 // title, blank, and the footer below
+	if w <= 0 {
+		w = lipgloss.Width(box)
+	}
+	if h < lipgloss.Height(box) {
+		h = lipgloss.Height(box)
+	}
+	return indentBox(m.spawnTitle()+"\n\n"+lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box), boardMargin)
+}
+
 // renderAsFooter is the contextual footer per asMode; the boxes level swaps in the card
 // keys while the cursor sits on a job row (its card is inline there).
 func (m Model) renderAsFooter() string {
+	if m.boardEmpty() {
+		return footer("r refresh · esc/tab/q quit")
+	}
 	var hint string
 	switch m.asMode {
 	case asModeProjects:
@@ -788,6 +819,9 @@ func (m Model) agentDetailLines(rightW int) []string {
 	}
 	in, out, tools := m.leafCounts(j)
 	snap := m.snapForJob(j)
+	if j.Status != "running" && m.wfDetailJob.JobID == j.JobID {
+		snap = m.wfDetailSnap // ds: a finished leaf's activity.jsonl stays, so show its last calls
+	}
 	status := statusLabel(j.Status) + faintStyle.Render(" · "+trunc(sessiontitle.CleanTitle(j.Model), 28))
 	if j.Attempt > 1 {
 		// ds: the revise round.

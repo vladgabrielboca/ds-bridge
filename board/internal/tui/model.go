@@ -140,6 +140,7 @@ type Model struct {
 	wfDetailPrompt string
 	wfDetailAnswer string
 	wfDetailIO     bool
+	wfDetailSnap   activitySnapshot // ds: the focused leaf's activity, read with its io (finished leaves)
 	wfCardScroll   int
 	wfDetailNonce  int
 	// wfPromptExpanded toggles the inline detail's prompt between a collapsed "N lines · ⏎ expand"
@@ -744,6 +745,7 @@ type wfDetailMsg struct {
 	prompt  string
 	answer  string
 	present bool
+	snap    activitySnapshot // ds: the leaf's activity.jsonl, kept after it ends
 }
 
 func (wfDetailMsg) owningScreen() screen { return screenSpawn }
@@ -757,7 +759,8 @@ func (wfDetailMsg) owningScreen() screen { return screenSpawn }
 func loadLeafIOCmd(job dsjobs.Result, nonce, epoch int) tea.Cmd {
 	return func() tea.Msg {
 		prompt, answer, present := readLeafIO(job.JobID)
-		return wfDetailMsg{nonce: nonce, epoch: epoch, job: job, prompt: prompt, answer: answer, present: present}
+		snap, _ := readLeafActivity(job.JobID)
+		return wfDetailMsg{nonce: nonce, epoch: epoch, job: job, prompt: prompt, answer: answer, present: present, snap: snap}
 	}
 }
 
@@ -1033,6 +1036,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.wfDetailPrompt = msg.prompt
 		m.wfDetailAnswer = msg.answer
 		m.wfDetailIO = msg.present
+		m.wfDetailSnap = msg.snap
 		return m, nil
 
 	case tea.KeyMsg:
@@ -1947,6 +1951,7 @@ func (m Model) focusLeafIO() (tea.Model, tea.Cmd) {
 	job, ok := m.selectedLeaf()
 	if !ok {
 		m.wfDetailJob, m.wfDetailPrompt, m.wfDetailAnswer, m.wfDetailIO = dsjobs.Result{}, "", "", false
+		m.wfDetailSnap = activitySnapshot{}
 		return m, nil
 	}
 	m.wfDetailNonce++ // drop a slow read for a previously-focused leaf

@@ -120,12 +120,21 @@ func ListJobs() ([]Result, error) {
 	}
 	batches := readBatches()
 	var out []Result
+	var bad []string // job.json / batch.json that exist but don't parse: skipped, named in the error
 	for _, e := range ents {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), "b") {
+		if !e.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), "b") {
+			if _, ok := batches[e.Name()]; !ok && malformed(filepath.Join(jobsDir(), e.Name(), "batch.json")) {
+				bad = append(bad, e.Name()+"/batch.json")
+			}
 			continue
 		}
 		if r, ok := readJob(e.Name(), batches); ok {
 			out = append(out, r)
+		} else if malformed(filepath.Join(jobsDir(), e.Name(), "job.json")) {
+			bad = append(bad, e.Name()+"/job.json")
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool {
@@ -134,7 +143,31 @@ func ListJobs() ([]Result, error) {
 		}
 		return out[i].JobID > out[j].JobID
 	})
+	if len(bad) > 0 {
+		sort.Strings(bad)
+		return out, fmt.Errorf("skipped unreadable %s", strings.Join(bad, ", "))
+	}
 	return out, nil
+}
+
+// malformed: the file exists and was read, but is not the JSON the board expects. ds writes
+// job.json and batch.json with os.replace, so this is a damaged file, not a write in progress.
+// A missing file (a job dir being created) is not malformed.
+func malformed(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var v map[string]any
+	if json.Unmarshal(b, &v) != nil {
+		return true
+	}
+	if strings.HasSuffix(path, "batch.json") {
+		var bf batchFile
+		return json.Unmarshal(b, &bf) != nil
+	}
+	var jf jobFile
+	return json.Unmarshal(b, &jf) != nil
 }
 
 // readJob builds one job's Result from job.json, progress/<id>.json, last.txt and the marker files.

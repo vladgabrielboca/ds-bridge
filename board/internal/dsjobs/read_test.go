@@ -274,3 +274,39 @@ func TestPlanStepTitles(t *testing.T) {
 		t.Errorf("%v", got)
 	}
 }
+
+// TestListJobsMalformed: a job.json or batch.json that exists but doesn't parse is skipped and
+// named in the error (the board's dim jobs line); the other jobs still load. A job dir with no
+// job.json yet (being created) is skipped silently. A missing state dir is no error.
+func TestListJobsMalformed(t *testing.T) {
+	dst := fixture(t)
+	want, _ := ListJobs()
+	for name, body := range map[string]string{
+		"1122-999990/job.json":    "{not json",
+		"1122-999991/job.json":    `{"id": "1122-999991", "round": "two"}`,
+		"b1122-999992/batch.json": "[]x",
+	} {
+		p := filepath.Join(dst, "jobs", name)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	os.MkdirAll(filepath.Join(dst, "jobs", "1122-999993"), 0o755)
+	js, err := ListJobs()
+	if len(js) != len(want) {
+		t.Errorf("got %d jobs, want %d (bad ones skipped, rest kept)", len(js), len(want))
+	}
+	wantErr := "skipped unreadable 1122-999990/job.json, 1122-999991/job.json, b1122-999992/batch.json"
+	if err == nil || err.Error() != wantErr {
+		t.Errorf("err = %v, want %q", err, wantErr)
+	}
+
+	StateDir = filepath.Join(dst, "missing")
+	if js, err := ListJobs(); err != nil || len(js) != 0 {
+		t.Errorf("missing state dir: %d jobs, err %v; want none, nil", len(js), err)
+	}
+	if rs, err := ListRuns(nil); err != nil || len(rs) != 0 {
+		t.Errorf("missing state dir: %d runs, err %v; want none, nil", len(rs), err)
+	}
+}
