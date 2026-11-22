@@ -115,13 +115,14 @@ The final report's `tok/s` is measured, not estimated: token counts are the prov
 - A job's card: status, model, round, agent and kind, start time, elapsed, tokens, turns, result word; the brief; the last 3 tool calls; the worker's final report (the answer for research); the outcome (`OK · landed`, `rejected`, `interrupted`, BLOCKED's question with the `ds reply` hint).
 - A batch opens as its groups (phases), each with its job, plus the integration check as a last phase.
 - It reads `~/.local/share/ds-bridge` every 3 s, and every 500 ms while a job runs. Tool calls and token counts come from each job's `activity.jsonl`, so they move while the worker works.
+- While a job runs, its card's Output (`Output · live`) shows the worker's text as it streams, from `jobs/<id>/live.txt` (fed by the OpenCode event stream, capped at 256 KB). The card stays at the bottom as the text grows; `k` holds it, `j` back to the bottom follows again. When the job ends, the final report replaces it.
 
 | Key | Action |
 | --- | --- |
 | `↑/↓` | move |
 | `→/⏎` | open; on a card, `⏎` expands the brief |
 | `←/esc` | back |
-| `j/k` | scroll a card |
+| `j/k` | scroll a card (on a running job, `k` stops following the live text) |
 | `ctrl+f` | find: every job and batch, newest first; type to filter by title, model, status or project |
 | `x` | stop a running job or batch (SIGTERM to its ds process, after a check that the pid is ds) |
 | `p` | pin: ds's cleanup keeps pinned jobs |

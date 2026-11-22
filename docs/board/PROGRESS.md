@@ -10,7 +10,7 @@ One entry per ticket, newest last. Spec: `docs/board/SPEC.md`. Tickets: `docs/bo
 
 ## T1 (2026-11-22): Python writes the board's data
 
-Branch `board` in the worktree `~/Work/ds-bridge-board` (created this session from `main` 9b2a494). Not committed yet.
+Branch `board` in the worktree `~/Work/ds-bridge-board` (created this session from `main` 9b2a494). Committed on `board`; not merged, the user tests it first.
 
 What changed.
 
@@ -200,8 +200,38 @@ Live run (board in tmux session `dsboard`, 150x42, started with `~/Work/ds-bridg
 
 Left for later.
 
-- T7 (live worker text in Output): waits for the user's OK (SPEC 10 question 2).
 - A Hyprland key binding to open the board: design with the user first (SPEC 9).
 - The run header reads `0/0 agents · ↑ 0 · ↓ 0` with the cursor on the integration check when no fix job ran (from T4).
 - A killed batch shows no `interrupted` text, only the failed dot (from T4).
 - Batches started by the main ds (no `pid`) can't be stopped from the board (from T5).
+
+## T7 (2026-11-22): worker text live in Output
+
+Same branch and worktree, on top of T6. The user asked for T7 (SPEC 10 question 2: wanted). Committed on `board`; not merged, the user tests it first.
+
+Finding first: OpenCode 2.3.2's `opencode run --format json` prints one `text` event per finished part (a 332-character answer came as one line at the end), so the text `Tally.feed` collects never grows while a message is written. The streaming text is in the service's event stream: `session.text.delta` with `assistantMessageID`, `ordinal` and `delta` (11 deltas for that answer). ds already reads that stream for the live speed.
+
+What changed, Python (`dslib/runner.py`).
+
+- `LiveText` (`live_for(job)`, shared per job like `activity_for`) appends to `jobs/<id>/live.txt`. `watch_session` passes each `session.text.delta` to it (`on_text`). `Tally.feed` passes stdout's whole `text` part too, written only when that message got no delta (event stream down). A blank line between messages, `── round N ──` before a new round. Past 256 KB the file is cut to its last 192 KB, starting on a whole line (or a whole UTF-8 character), written to a temp file and renamed, so the board never reads half a file. Best-effort: a failed write drops that text.
+- Tests in `tests/test_ds.py`: deltas then a whole message without duplicates, the round header, the cap (4000 lines of 2-byte characters: ≤ 256 KB, tail kept, whole first line), the stdout fallback.
+
+What changed, Go.
+
+- `dsjobs.ReadIO`: while the job runs, the output is the last 16 KB of live.txt (`liveTail`; a cut tail starts after a `…` line, on a whole line); when it ends, answer.txt or report.txt as before.
+- tui: the Output title is `Output · live` while the job runs. `liveDetailCmd` reloads the focused card on the 500 ms chain too (it was 3 s for single jobs), and the run drill's agent card now reloads while its job runs and once when it ends (before, it loaded only when focused). A card whose job runs scrolls to the bottom on each load; `j/k` away from the bottom holds it (`asCardHeld`, `wfCardHeld`), back at the bottom or focusing another job releases it. The load that brings the final report also lands at the bottom when the card was following, so the Outcome shows; a finished job opened fresh starts at the top.
+- Tests: `TestReadIOLive` (live text while running, 16 KB tail cut on a line, report after the end), `TestJobCardLiveOutput` (title, follow, hold with `k`, release with `j`, 500 ms reload, switch to the report at the bottom, fresh open at the top), `TestWfAgentCardLiveOutput` (run drill follow and reload). `go vet`, `go test ./...`, `python3 tests/test_ds.py` pass.
+- README: one Board line on the live Output, the `j/k` row.
+
+Live check (board in tmux 150x42 started with the branch ds; research jobs on `~/Work/ds-bridge-board` itself, so no project changed).
+
+- 1122-175032: live.txt grew 380, 1857, 3247, 4505, 5736 bytes in 3 s steps; the card's range went `13–41 of 41`, `27–55 of 55`, `40–68 of 68`, `59–87 of 87`, the newest text on screen each time (mid-word). Then ✔ and the answer.txt text. That run showed the final load stuck at the old offset with the Outcome value cut off; fixed (above).
+- 1122-175350: following `9–37 of 37`, `17–45 of 45`; `k` three times, then `14–42 of 55`, `14–42 of 65` (held while text grew); `j` to the bottom, `59–87 of 87`; at the end `58–86 of 86` with the Outcome.
+- tmux trap: `send-keys k k k` arrives as one `kkk` key, which the board ignores. Keys must be sent apart.
+
+Left for later.
+
+- Reasoning text (`session.reasoning.delta`) is not shown, only text.
+- Worker text is not key-masked in live.txt (report.txt isn't either); the board scrubs control characters only.
+- A run of the main ds (`~/.local/bin/ds`) writes no live.txt until the merge.
+- Open from T6: Hyprland key for the board (SPEC 9), the `0/0 agents` header, the killed batch's missing `interrupted`, batches without `pid` can't be stopped.

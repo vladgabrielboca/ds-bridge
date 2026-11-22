@@ -2,6 +2,7 @@ package dsjobs
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // This file reads ds jobs from the state dir (SPEC 5 and 6). It never writes there.
@@ -350,9 +352,13 @@ func stripPreamble(task string) string {
 	return strings.TrimSpace(task)
 }
 
-// ReadIO returns a job's prompt (job task) and final output (report.txt, answer.txt for research),
-// and whether either was found. While a round runs the output is empty: report.txt holds the
-// previous round's text then.
+// LiveTailBytes is how much of live.txt the card reads while a job runs.
+const LiveTailBytes = 16 * 1024
+
+// ReadIO returns a job's prompt (job task) and output, and whether either was found. While a
+// round runs the output is the tail of live.txt (the worker's text as it streams; report.txt
+// holds the previous round's text then). Once it ends, the final text: answer.txt for research,
+// else report.txt.
 func ReadIO(jobID string) (prompt, answer string, present bool) {
 	if strings.ContainsAny(jobID, "/\\") || jobID == "" || jobID == "." || jobID == ".." {
 		return "", "", false
@@ -363,7 +369,9 @@ func ReadIO(jobID string) (prompt, answer string, present bool) {
 	}
 	var p progressFile
 	running := readJSON(filepath.Join(StateDir, "progress", jobID+".json"), &p) && p.State == "running" && pidAlive(p.PID)
-	if !running {
+	if running {
+		answer = liveTail(filepath.Join(jobsDir(), jobID, "live.txt"), LiveTailBytes)
+	} else {
 		for _, name := range []string{"answer.txt", "report.txt"} {
 			if b, err := os.ReadFile(filepath.Join(jobsDir(), jobID, name)); err == nil {
 				answer = strings.TrimSpace(string(b))
@@ -424,4 +432,36 @@ func ReadActivity(jobID string) (Activity, bool) {
 		}
 	}
 	return a, true
+}
+
+// liveTail reads the last max bytes of a live.txt. A cut tail starts on a whole line (or at
+// least on a whole UTF-8 character) after a "…" line. A missing file is "".
+func liveTail(path string, max int64) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	off := st.Size() - max
+	if off < 0 {
+		off = 0
+	}
+	b := make([]byte, st.Size()-off)
+	n, _ := f.ReadAt(b, off)
+	b = b[:n]
+	if off > 0 {
+		if i := bytes.IndexByte(b, '\n'); i >= 0 && i < 4096 {
+			b = b[i+1:]
+		} else {
+			for len(b) > 0 && !utf8.RuneStart(b[0]) {
+				b = b[1:]
+			}
+		}
+		return "…\n" + strings.TrimSpace(string(b))
+	}
+	return strings.TrimSpace(string(b))
 }

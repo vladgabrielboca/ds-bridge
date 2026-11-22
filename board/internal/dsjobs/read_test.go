@@ -2,12 +2,14 @@ package dsjobs
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // fixture copies testdata/state into a temp dir, writes the two running progress files (one with
@@ -308,5 +310,38 @@ func TestListJobsMalformed(t *testing.T) {
 	}
 	if rs, err := ListRuns(nil); err != nil || len(rs) != 0 {
 		t.Errorf("missing state dir: %d runs, err %v; want none, nil", len(rs), err)
+	}
+}
+
+// T7: while the job runs, Output is the tail of live.txt; once it ends, report.txt.
+func TestReadIOLive(t *testing.T) {
+	dir := fixture(t)
+	live := filepath.Join(dir, "jobs", "1122-100000", "live.txt")
+	if err := os.WriteFile(live, []byte("Looking at calc.py\n\nadd() returns a-b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, a, _ := ReadIO("1122-100000"); a != "Looking at calc.py\n\nadd() returns a-b" {
+		t.Errorf("running job shows live.txt: %q", a)
+	}
+	// A long live.txt: only the tail is read, cut on a whole line, after a "…" line.
+	var b strings.Builder
+	for i := 0; b.Len() < 3*LiveTailBytes; i++ {
+		fmt.Fprintf(&b, "line %d é\n", i)
+	}
+	b.WriteString("LAST")
+	if err := os.WriteFile(live, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, a, _ := ReadIO("1122-100000")
+	if !strings.HasPrefix(a, "…\nline ") || !strings.HasSuffix(a, "LAST") || len(a) > LiveTailBytes+8 || !utf8.ValidString(a) {
+		t.Errorf("tail: len %d, head %q, tail %q", len(a), a[:20], a[len(a)-10:])
+	}
+	// The job ends: report.txt replaces the live text.
+	pb, _ := json.Marshal(map[string]any{"state": "done", "job": "1122-100000", "pid": os.Getpid()})
+	if err := os.WriteFile(filepath.Join(dir, "progress", "1122-100000.json"), pb, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, a, _ := ReadIO("1122-100000"); strings.Contains(a, "LAST") || a == "" {
+		t.Errorf("done job shows report.txt, not live.txt: %q", a)
 	}
 }

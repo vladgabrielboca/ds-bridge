@@ -6,6 +6,7 @@ package tui
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -105,6 +106,11 @@ type Model struct {
 	asDetailSnap     activitySnapshot
 	asDetailNonce    int
 	asDetailTerminal bool // the focused job was terminal when its io load was issued
+	// asCardHeld is the job whose card the user scrolled up from the bottom with j/k. ds: while
+	// a job runs its card follows the streaming Output (scrolled to the bottom on each load)
+	// unless it is held; scrolling back to the bottom or focusing another job releases it.
+	asCardHeld       string
+	asCardLive       bool // the card's last load was of a running job (its final load still follows)
 	asPromptExpanded bool
 	// boardJobsErr is the last refresh's jobs-scan failure, rendered on its OWN dim line under the
 	// board — a persistent data-availability warning, not a one-shot outcome (those pop as modals).
@@ -143,6 +149,7 @@ type Model struct {
 	wfDetailSnap   activitySnapshot // ds: the focused leaf's activity, read with its io (finished leaves)
 	wfCardScroll   int
 	wfDetailNonce  int
+	wfCardHeld     string // the run drill's asCardHeld
 	// wfPromptExpanded toggles the inline detail's prompt between a collapsed "N lines · ⏎ expand"
 	// summary (default) and the full text; reset to collapsed when the focused leaf changes.
 	wfPromptExpanded bool
@@ -905,24 +912,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// each refresh so its Activity feed climbs, and the load that FIRST sees the job
 		// terminal still runs once, so the final .answer lands after the running→done
 		// flip.
-		var detail tea.Cmd
-		if m.asMode == asModeEntity {
-			if m.asEntitySrc.jobs {
-				if j, ok := m.selectedJob(); ok && m.jobCardStale(j) {
-					m.asDetailNonce++
-					m.asDetailTerminal = isTerminalLeaf(j.Status)
-					detail = loadJobIOCmd(j.JobID, m.asDetailNonce, m.boardEpoch)
-				}
-			}
-		} else if m.asMode == asModeBoxes {
-			// The boxes level always previews a job card (the cursored job, else the
-			// first) — keep it fresh on the same terms as the entity-level card.
-			if j, ok := m.boxPreviewJob(); ok && m.jobCardStale(j) {
-				m.asDetailNonce++
-				m.asDetailTerminal = isTerminalLeaf(j.Status)
-				detail = loadJobIOCmd(j.JobID, m.asDetailNonce, m.boardEpoch)
-			}
-		}
+		detail := m.liveDetailCmd()
 		return m, tea.Batch(detail, m.startWfLive())
 
 	case boardTickMsg:
@@ -964,7 +954,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.browserOrigin = false // the browser-entered entity is gone; the cursor fell to a sibling
 		}
 		m.asCardScroll = m.clampAsCardScroll(m.asCardScroll)
-		return m, m.startWfLive()
+		return m, tea.Batch(m.liveDetailCmd(), m.startWfLive())
 
 	case wfLiveTickMsg:
 		if m.screen == screenSpawn && msg.epoch == m.boardEpoch {
@@ -1024,6 +1014,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.asDetailAnswer = msg.answer
 		m.asDetailIO = msg.present
 		m.asDetailSnap = msg.snap
+		// Follow the live Output, and land the final report at the bottom too (the Outcome).
+		if (!m.asDetailTerminal || m.asCardLive) && m.asCardHeld != msg.jobID {
+			m.asCardScroll = m.clampAsCardScroll(math.MaxInt32)
+		}
+		m.asCardLive = !m.asDetailTerminal
 		return m, nil
 
 	case wfDetailMsg:
@@ -1032,11 +1027,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.nonce != m.wfDetailNonce || msg.epoch != m.boardEpoch {
 			return m, nil
 		}
+		wasLive := m.wfDetailJob.JobID == msg.job.JobID && m.wfDetailJob.Status == "running"
 		m.wfDetailJob = msg.job
 		m.wfDetailPrompt = msg.prompt
 		m.wfDetailAnswer = msg.answer
 		m.wfDetailIO = msg.present
 		m.wfDetailSnap = msg.snap
+		// Follow the live Output, and land the final report at the bottom too (the Outcome).
+		if (msg.job.Status == "running" || wasLive) && m.wfCardHeld != msg.job.JobID {
+			m.wfCardScroll = m.clampCardScroll(math.MaxInt32)
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -1194,12 +1194,14 @@ func (m Model) updateAsBoxes(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m.asDescend()
 	case "j":
-		if _, onJob := m.boxJob(); onJob {
+		if j, onJob := m.boxJob(); onJob {
 			m.asCardScroll = m.clampAsCardScroll(m.asCardScroll + 1)
+			m.asCardHeld = m.heldAt(j.JobID, m.asCardScroll, m.clampAsCardScroll(math.MaxInt32))
 		}
 	case "k":
-		if _, onJob := m.boxJob(); onJob {
+		if j, onJob := m.boxJob(); onJob {
 			m.asCardScroll = m.clampAsCardScroll(m.asCardScroll - 1)
+			m.asCardHeld = m.heldAt(j.JobID, m.asCardScroll, m.clampAsCardScroll(math.MaxInt32))
 		}
 	case "esc":
 		return m.asAscend(true)
@@ -1218,7 +1220,7 @@ func (m Model) focusBoxJobIO() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if _, onJob := m.boxJob(); onJob {
-		m.asCardScroll = 0
+		m.asCardScroll, m.asCardHeld, m.asCardLive = 0, "", false
 		m.asPromptExpanded = false
 	}
 	if !m.jobCardStale(j) {
@@ -1249,10 +1251,15 @@ func (m Model) updateAsEntity(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.asPromptExpanded = !m.asPromptExpanded
 		m.asCardScroll = m.clampAsCardScroll(m.asCardScroll)
 		return m, nil
-	case "j":
-		m.asCardScroll = m.clampAsCardScroll(m.asCardScroll + 1)
-	case "k":
-		m.asCardScroll = m.clampAsCardScroll(m.asCardScroll - 1)
+	case "j", "k":
+		if msg.String() == "j" {
+			m.asCardScroll = m.clampAsCardScroll(m.asCardScroll + 1)
+		} else {
+			m.asCardScroll = m.clampAsCardScroll(m.asCardScroll - 1)
+		}
+		if j, ok := m.selectedJob(); ok {
+			m.asCardHeld = m.heldAt(j.JobID, m.asCardScroll, m.clampAsCardScroll(math.MaxInt32))
+		}
 	case "p":
 		// Pin the focused detail row: a job by id.
 		if j, ok := m.selectedJob(); ok {
@@ -1390,7 +1397,7 @@ func (m Model) focusEntityIO() (tea.Model, tea.Cmd) {
 // into the inline detail, nonce-gated (mirror focusLeafIO). Called whenever the entity
 // cursor lands on a job.
 func (m Model) focusJobIO() (tea.Model, tea.Cmd) {
-	m.asCardScroll = 0
+	m.asCardScroll, m.asCardHeld, m.asCardLive = 0, "", false
 	m.asPromptExpanded = false
 	j, ok := m.selectedJob()
 	if !ok {
@@ -1897,8 +1904,10 @@ func (m Model) updateWfAgent(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "j":
 		m.wfCardScroll = m.clampCardScroll(m.wfCardScroll + 1)
+		m.wfCardHeld = m.leafHeld()
 	case "k":
 		m.wfCardScroll = m.clampCardScroll(m.wfCardScroll - 1)
+		m.wfCardHeld = m.leafHeld()
 	case "left", "esc":
 		// Agent sits below the run's entry level (Phases), so both back keys retrace one level
 		// to Phases, which owns the browser-origin return; the origin survives the retrace.
@@ -1946,7 +1955,7 @@ func (m Model) wfAscend() (tea.Model, tea.Cmd) {
 // detail pane (nonce-gated so a slow read for a prior leaf is dropped). Called whenever the agent
 // cursor lands on a new leaf.
 func (m Model) focusLeafIO() (tea.Model, tea.Cmd) {
-	m.wfCardScroll = 0
+	m.wfCardScroll, m.wfCardHeld = 0, ""
 	m.wfPromptExpanded = false // each newly focused leaf starts with its prompt collapsed
 	job, ok := m.selectedLeaf()
 	if !ok {
@@ -2171,4 +2180,53 @@ func stopJobCmd(jobID string, epoch int) tea.Cmd {
 	return func() tea.Msg {
 		return workflowCtlMsg{verb: "stop-job", runID: jobID, err: dsjobs.StopJob(jobID), epoch: epoch}
 	}
+}
+
+// heldAt is the asCardHeld value after a j/k on job id's card: held unless the scroll sits at the
+// bottom.
+func (m Model) heldAt(id string, scroll, bottom int) string {
+	if scroll >= bottom {
+		return ""
+	}
+	return id
+}
+
+// leafHeld is wfCardHeld after a j/k on the run drill's agent card.
+func (m Model) leafHeld() string {
+	j, ok := m.selectedLeaf()
+	if !ok {
+		return ""
+	}
+	return m.heldAt(j.JobID, m.wfCardScroll, m.clampCardScroll(math.MaxInt32))
+}
+
+// liveDetailCmd re-reads the focused card's io while its job runs, and once more on the refresh
+// that first sees it ended (so the final report replaces the live text). ds: the 500 ms chain
+// calls it too, so the streaming Output moves at that pace; the run drill's agent card had no
+// reload before.
+func (m *Model) liveDetailCmd() tea.Cmd {
+	switch m.asMode {
+	case asModeEntity:
+		if m.asEntitySrc.jobs {
+			if j, ok := m.selectedJob(); ok && m.jobCardStale(j) {
+				m.asDetailNonce++
+				m.asDetailTerminal = isTerminalLeaf(j.Status)
+				return loadJobIOCmd(j.JobID, m.asDetailNonce, m.boardEpoch)
+			}
+		}
+	case asModeBoxes:
+		// The boxes level always previews a job card (the cursored job, else the first).
+		if j, ok := m.boxPreviewJob(); ok && m.jobCardStale(j) {
+			m.asDetailNonce++
+			m.asDetailTerminal = isTerminalLeaf(j.Status)
+			return loadJobIOCmd(j.JobID, m.asDetailNonce, m.boardEpoch)
+		}
+	case asModeRunAgent:
+		j, ok := m.selectedLeaf()
+		if ok && j.JobID == m.wfDetailJob.JobID && (!isTerminalLeaf(j.Status) || !isTerminalLeaf(m.wfDetailJob.Status)) {
+			m.wfDetailNonce++
+			return loadLeafIOCmd(j, m.wfDetailNonce, m.boardEpoch)
+		}
+	}
+	return nil
 }

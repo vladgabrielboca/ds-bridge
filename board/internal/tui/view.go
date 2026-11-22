@@ -853,7 +853,7 @@ func (m Model) agentDetailLines(rightW int) []string {
 	lines = append(lines, activityLines(snap, rightW)...)
 	// Then the Output, when this leaf's io files are loaded.
 	if m.wfDetailJob.JobID == j.JobID && m.wfDetailIO {
-		lines = append(lines, "", faintStyle.Render("Output"))
+		lines = append(lines, "", outputHeader(j))
 		lines = append(lines, ioLines(m.wfDetailAnswer, rightW, liveStyle)...)
 	}
 	// Outcome last.
@@ -1870,7 +1870,7 @@ func (m Model) jobDetailLines(j dsjobs.Result, rightW int) []string {
 		lines = append(lines, "")
 		lines = append(lines, activityLines(m.asDetailSnap, rightW)...)
 		if m.asDetailIO {
-			lines = append(lines, "", faintStyle.Render("Output"))
+			lines = append(lines, "", outputHeader(j))
 			lines = append(lines, ioLines(m.asDetailAnswer, rightW, liveStyle)...)
 		}
 	}
@@ -2202,4 +2202,13 @@ func trunc(s string, n int) string {
 		return string(r[:n])
 	}
 	return string(r[:n-1]) + "…"
+}
+
+// outputHeader is the card's Output section title. ds: while the job runs, the Output is the
+// worker's text as it streams (live.txt), so the title says so.
+func outputHeader(j dsjobs.Result) string {
+	if j.Status == "running" {
+		return faintStyle.Render("Output · live")
+	}
+	return faintStyle.Render("Output")
 }

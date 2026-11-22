@@ -266,6 +266,33 @@ with tempfile.TemporaryDirectory() as st:
         R.activity_for(job2).tool("glob", {"pattern": "*.py"})
         last = json.loads(open(act_path).read().splitlines()[-1])
         check("activity: a new round appends, seq continues", (last["seq"], last["round"], last["arg"]) == (6, 2, "*.py"), str(last))
+        # live.txt (T7): deltas stream in, a message with deltas is not written again from stdout,
+        # one without deltas is, a new round gets a header, and the cap keeps the tail
+        lj = {"id": "J", "round": 1}
+        lv = R.live_for(lj)
+        lv.delta("m1", "Hello ")
+        lv.delta("m1", "world")
+        lv.whole("m1", "Hello world")
+        lv.whole("m2", "second message")
+        live_path = os.path.join(jobs_dir, "J", "live.txt")
+        check("live: deltas, then a whole message with a blank line between, no duplicate",
+              open(live_path).read() == "Hello world\n\nsecond message", repr(open(live_path).read()))
+        lj2 = {"id": "J", "round": 2}
+        R.live_for(lj2).delta("m3", "round two")
+        check("live: a new round appends after a header",
+              open(live_path).read().endswith("second message\n\n── round 2 ──\n\nround two"), repr(open(live_path).read()[-60:]))
+        lv2 = lj2["_live"]
+        line = "é" * 40 + "\n"                                           # 81 bytes, 2-byte chars
+        for i in range(4000):
+            lv2.delta("m4", line)
+        lv2.delta("m4", "THE END")
+        body = open(live_path, "rb").read()
+        check("live: capped at 256 KB, tail kept, starts on a whole line",
+              len(body) <= R.LIVE_CAP and body.endswith(b"THE END") and body.startswith("é".encode())
+              and lv2.size == len(body) and b"Hello" not in body, str(len(body)))
+        y2 = ds.Tally("s", None, R.live_for({"id": "J", "round": 2}))
+        y2.feed({"type": "text", "part": {"messageID": "m5", "text": "from stdout"}})
+        check("live: Tally writes a stdout text part when no deltas came", open(live_path).read().endswith("\n\nfrom stdout"))
         RES.write_report(job, "STATUS: DONE\nSUMMARY: x")
         check("report.txt holds the final text", open(os.path.join(jobs_dir, "J", "report.txt")).read() == "STATUS: DONE\nSUMMARY: x")
         res = {"tokens": {"input": 150, "output": 35, "cache_read": 1900}, "cost": 0.03, "tools": 3}

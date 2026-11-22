@@ -365,9 +365,9 @@ class LiveMeter:
         return round(med / 1000, 1) if med is not None else None
 
 
-def watch_session(meter, get_sid, stop, on_label, tick):
+def watch_session(meter, get_sid, stop, on_label, tick, on_text=None):
     """Thread body: read the service's event stream, feed this session's events to the meter,
-    and call tick() at most once a second."""
+    pass the text deltas to on_text(message_id, delta), and call tick() at most once a second."""
     resp = open_event_stream()
     if resp is None:
         return
@@ -409,6 +409,8 @@ def watch_session(meter, get_sid, stop, on_label, tick):
                 created = int(time.time() * 1000)
             with meter.lock:
                 label = meter.feed(ev.get("type"), data, created)
+            if on_text and re.sub(r"\.\d+$", "", ev.get("type") or "") == "session.text.delta":
+                on_text(data.get("assistantMessageID"), data.get("delta") or "")
             if label:
                 on_label(label)
             if stop.is_set():
@@ -500,6 +502,82 @@ class Activity:
                    "cache": cache})
 
 
+LIVE_CAP = 256 * 1024
+LIVE_KEEP = 192 * 1024     # what a trim keeps, so the file is not rewritten on every delta
+
+
+class LiveText:
+    """jobs/<id>/live.txt: the worker's text as it streams, for the board's Output while a job
+    runs. Fed by the service's session.text.delta events; a message that got no delta (event
+    stream down) is written whole from stdout's text part. Append-only across calls and rounds,
+    a header line before each new round, capped at LIVE_CAP (the tail is kept). Best-effort."""
+
+    def __init__(self, job):
+        self.job = job
+        self.path = os.path.join(JOBS, job["id"], "live.txt")
+        self.lock = threading.Lock()
+        self.streamed = set()       # message ids that got deltas
+        self.msg = self.round = None
+        try:
+            self.size = os.path.getsize(self.path)
+        except OSError:
+            self.size = 0
+
+    def delta(self, msg, text):
+        if text:
+            with self.lock:
+                self.streamed.add(msg)
+                self._write(msg, text)
+
+    def whole(self, msg, text):
+        with self.lock:
+            if text and msg not in self.streamed:
+                self._write(msg, text)
+
+    def _write(self, msg, text):
+        rnd = self.job.get("round", 1)
+        head = ""
+        if self.size and rnd != self.round:
+            head = f"\n\n── round {rnd} ──\n\n"
+        elif self.size and msg != self.msg:
+            head = "\n\n"
+        self.msg, self.round = msg, rnd
+        data = (head + text).encode("utf-8")
+        try:
+            with open(self.path, "ab") as f:
+                f.write(data)
+            self.size += len(data)
+            if self.size > LIVE_CAP:
+                self._trim()
+        except OSError:
+            pass
+
+    def _trim(self):
+        with open(self.path, "rb") as f:
+            f.seek(max(0, self.size - LIVE_KEEP))
+            tail = f.read()
+        nl = tail.find(b"\n")
+        if 0 <= nl < 4096:
+            tail = tail[nl + 1:]            # start on a whole line
+        else:
+            while tail and (tail[0] & 0xC0) == 0x80:
+                tail = tail[1:]             # never start inside a UTF-8 character
+        tmp = self.path + f".tmp.{os.getpid()}"
+        with open(tmp, "wb") as f:
+            f.write(tail)
+        os.replace(tmp, self.path)          # the board never reads a half-written file
+        self.size = len(tail)
+
+
+def live_for(job):
+    """The job's live-text writer, shared like activity_for's."""
+    if job is None or not job.get("id"):
+        return None
+    if job.get("_live") is None:
+        job["_live"] = LiveText(job)
+    return job["_live"]
+
+
 def activity_for(job):
     """The job's activity writer, shared by every call of this process (retries, forks,
     failover, fix rounds, wrap-up)."""
@@ -514,8 +592,8 @@ class Tally:
     """What `opencode run --format json` prints for one call: steps, tool calls, token totals,
     the final text and errors."""
 
-    def __init__(self, session, act=None):
-        self.act = act
+    def __init__(self, session, act=None, live=None):
+        self.act, self.live = act, live
         self.sid = session
         self.steps = self.tools = self.n_events = 0
         self.tok = {"input": 0, "output": 0, "cache_read": 0}
@@ -542,6 +620,8 @@ class Tally:
                 self._msg, self._text = part.get("messageID"), []
                 self.texts.append(self._text)
             self._text.append(part.get("text", ""))
+            if self.live:
+                self.live.whole(part.get("messageID"), part.get("text", ""))
         elif t in ("tool_use", "tool"):
             self.tools += 1
             nm = part.get("tool") or "tool"
@@ -632,7 +712,8 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
             "out": int(prev.get("out") or 0), "started": prev.get("started") or t0}
     if job is not None:
         job["_prog"] = dict(base)
-    tally, meter = Tally(session, activity_for(job)), LiveMeter()
+    live = live_for(job)
+    tally, meter = Tally(session, activity_for(job), live), LiveMeter()
 
     def out_now():
         # stream-side exact count for finished steps + the estimate for the one still streaming;
@@ -695,7 +776,8 @@ def run_opencode(d, msg, model, agent, session=None, files=(), job=None,
         tally.last = label
 
     live_thread = threading.Thread(target=watch_session, daemon=True, args=(
-        meter, lambda: tally.sid, stop_live, _set_last, lambda: write_progress("running")))
+        meter, lambda: tally.sid, stop_live, _set_last, lambda: write_progress("running"),
+        live.delta if live else None))
     live_thread.start()
     timed_out = soft_hit = stopped_by_ds = False
     last_tick = 0.0
